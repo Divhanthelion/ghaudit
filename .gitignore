@@ -1,1 +1,9 @@
 /target
+
+# Local settings
+.claude/
+
+# Research notes
+*.md
+!README.md
+!SECURITY_AUDIT.md
