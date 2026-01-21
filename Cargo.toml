@@ -1,0 +1,117 @@
+[package]
+name = "sec_auditor"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance Rust security analysis engine for GitHub repositories"
+license = "MIT"
+
+[dependencies]
+# Async runtime and concurrency
+tokio = { version = "1.42", features = ["full"] }
+rayon = "1.10"
+futures = "0.3"
+
+# GitHub API
+octocrab = "0.41"
+
+# Git operations
+git2 = "0.19"
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# Tree-sitter for SAST
+tree-sitter = "0.24"
+streaming-iterator = "0.1"
+tree-sitter-rust = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-go = "0.23"
+
+# Tree-sitter graph construction for taint analysis
+tree-sitter-graph = "0.12"
+
+# Stack-graphs for cross-file name resolution
+stack-graphs = "0.13"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# OSV vulnerability database
+osv = "0.2"
+
+# Sigstore verification with Rekor v2 tile support
+sigstore-verification = { version = "0.2", default-features = false, features = ["rustls"] }
+
+# Persistent cache for Rekor tiles
+redb = "2.4"
+
+# File system traversal
+walkdir = "2.5"
+ignore = "0.4"
+globset = "0.4"
+
+# Cargo.lock parsing
+cargo-lock = "10.0"
+
+# SARIF output
+serde-sarif = "0.6"
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Async channels
+async-channel = "2.3"
+
+# URL handling
+url = "2.5"
+
+# Regex for pattern matching
+regex = "1.11"
+
+# Entropy calculation for secret detection
+entropy = "0.4"
+
+# Temp directories for cloning
+tempfile = "3.14"
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Semantic versioning
+semver = "1.0"
+
+# Ecosystem-specific version parsers
+node-semver = "2.2"       # npm-compatible semver parsing
+pep440_rs = "0.7"         # Python PEP 440 version parsing
+
+# Base64 for encoding
+base64 = "0.22"
+
+# SHA hashing
+sha2 = "0.10"
+
+# UUID generation
+uuid = { version = "1.11", features = ["v4"] }
+
+# CPU detection for core partitioning
+num_cpus = "1.16"
+
+# Fast mutex for AIMD controller
+parking_lot = "0.12"
+
+# URL encoding for API requests
+urlencoding = "2.1"
+
+[dev-dependencies]
+tokio-test = "0.4"
