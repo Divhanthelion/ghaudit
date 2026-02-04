@@ -191,6 +191,12 @@ pub enum SastCategory {
     /// Denial of service
     Dos,
 
+    /// Unbounded resource consumption
+    UnboundedResource,
+
+    /// Prototype pollution (JavaScript-specific)
+    PrototypePollution,
+
     /// Other/uncategorized
     Other,
 }

@@ -442,12 +442,18 @@ fn categorize_finding(query_id: &str) -> SastCategory {
         SastCategory::Crypto
     } else if query_id.contains("auth") || query_id.contains("password") || query_id.contains("secret") {
         SastCategory::Auth
-    } else if query_id.contains("race") || query_id.contains("toctou") {
+    } else if query_id.contains("race") || query_id.contains("toctou") || query_id.contains("mktemp") {
         SastCategory::RaceCondition
-    } else if query_id.contains("dos") || query_id.contains("redos") {
+    } else if query_id.contains("dos") || query_id.contains("redos") || query_id.contains("timeout") {
         SastCategory::Dos
     } else if query_id.contains("memory") || query_id.contains("transmute") || query_id.contains("pointer") {
         SastCategory::MemorySafety
+    } else if query_id.contains("panic") || query_id.contains("refcell") {
+        SastCategory::MemorySafety
+    } else if query_id.contains("unbounded") || query_id.contains("defer-in-loop") {
+        SastCategory::UnboundedResource
+    } else if query_id.contains("prototype") || query_id.contains("pollution") {
+        SastCategory::PrototypePollution
     } else {
         SastCategory::Other
     }

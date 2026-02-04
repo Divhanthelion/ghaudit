@@ -226,33 +226,58 @@ High-entropy string detection only matches strings 20+ characters, potentially m
 
 ---
 
-## Security Query Coverage Gaps
+## New Security Queries Added (2026-01-31)
 
-The following vulnerability patterns are NOT currently detected:
+Added 16 new security queries across all supported languages to address previously identified coverage gaps:
 
-### Rust
-- `panic!` in library code (availability DoS)
-- `lazy_static` initialization races
-- `RefCell` borrow violations at runtime
-- Unbounded `Vec::push` in loops (memory DoS)
+| Language | Query ID | Severity | Description |
+|----------|----------|----------|-------------|
+| Rust | `rust/panic-in-library` | Medium | Panic in library code (DoS) |
+| Rust | `rust/lazy-static-race` | Low | Lazy static initialization races |
+| Rust | `rust/refcell-usage` | Low | RefCell dynamic borrow violations |
+| Rust | `rust/unbounded-vec-push` | Medium | Unbounded Vec growth in loops |
+| Python | `python/requests-no-timeout` | Medium | HTTP requests without timeout |
+| Python | `python/tempfile-mktemp` | High | Insecure temporary file creation |
+| Python | `python/logging-format-injection` | Medium | Logging format string injection |
+| Python | `python/dynamic-import` | High | Dynamic import with user input |
+| JavaScript | `js/prototype-pollution` | High | Prototype pollution via Object.assign |
+| JavaScript | `js/dynamic-require` | Medium | Dynamic module loading |
+| JavaScript | `js/mutable-exports` | Low | Mutable exported constants |
+| JavaScript | `js/unhandled-json-parse` | Low | Unhandled JSON parsing |
+| Go | `go/defer-in-loop` | Medium | Defer inside loop |
+| Go | `go/sync-map-assertion` | Low | Sync.Map type assertion panic |
+| Go | `go/unbuffered-channel` | Low | Potential channel deadlock |
+| Go | `go/context-no-timeout` | Low | Context without timeout |
 
-### Python
-- `requests` without timeout parameter (connection DoS)
-- `tempfile.mktemp` race conditions
-- `logging.basicConfig` format string injection
-- `__import__` with user input
+---
 
-### JavaScript
-- Prototype pollution via `Object.assign`/spread
-- `require()` with dynamic/user-controlled paths
-- Missing `Object.freeze` on exported constants
-- `JSON.parse` without try-catch
+## Security Query Coverage
 
-### Go
-- `defer` in loops (resource exhaustion)
-- `sync.Map` type assertion panics
-- Unbuffered channel deadlocks
-- `context.Background()` without timeout
+The following vulnerability patterns are now detected:
+
+### Rust ✅
+- `panic!` in library code (availability DoS) - `rust/panic-in-library`
+- `lazy_static` initialization races - `rust/lazy-static-race`
+- `RefCell` borrow violations at runtime - `rust/refcell-usage`
+- Unbounded `Vec::push` in loops (memory DoS) - `rust/unbounded-vec-push`
+
+### Python ✅
+- `requests` without timeout parameter (connection DoS) - `python/requests-no-timeout`
+- `tempfile.mktemp` race conditions - `python/tempfile-mktemp`
+- `logging.basicConfig` format string injection - `python/logging-format-injection`
+- `__import__` with user input - `python/dynamic-import`
+
+### JavaScript ✅
+- Prototype pollution via `Object.assign`/spread - `js/prototype-pollution`
+- `require()` with dynamic/user-controlled paths - `js/dynamic-require`
+- Missing `Object.freeze` on exported constants - `js/mutable-exports`
+- `JSON.parse` without try-catch - `js/unhandled-json-parse`
+
+### Go ✅
+- `defer` in loops (resource exhaustion) - `go/defer-in-loop`
+- `sync.Map` type assertion panics - `go/sync-map-assertion`
+- Unbuffered channel deadlocks - `go/unbuffered-channel`
+- `context.Background()` without timeout - `go/context-no-timeout`
 
 ---
 

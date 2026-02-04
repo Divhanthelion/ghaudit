@@ -230,6 +230,77 @@ pub fn rust_queries() -> Vec<SecurityQuery> {
             cwes: &["CWE-327", "CWE-328"],
             remediation: "Use strong cryptography: SHA-256+, AES-GCM, ChaCha20-Poly1305.",
         },
+        // NEW: Detect panic! in library code (availability DoS)
+        SecurityQuery {
+            id: "rust/panic-in-library",
+            name: "Panic in Library Code",
+            description: "Detects panic! macro calls in library code which can cause denial of service",
+            query: r#"
+            (macro_invocation
+              macro: (identifier) @macro_name
+              (#eq? @macro_name "panic")
+            ) @panic_call
+            "#,
+            language: Language::Rust,
+            severity: Severity::Medium,
+            cwes: &["CWE-400", "CWE-755"],
+            remediation: "Return Result::Err instead of panicking in library code. Panic should be reserved for unrecoverable errors.",
+        },
+        // NEW: Detect lazy_static usage (potential initialization races)
+        SecurityQuery {
+            id: "rust/lazy-static-race",
+            name: "Lazy Static Initialization Race",
+            description: "Detects lazy_static usage which may have initialization race conditions in multi-threaded contexts",
+            query: r#"
+            (macro_invocation
+              macro: (identifier) @macro_name
+              (#eq? @macro_name "lazy_static")
+            ) @lazy_static_usage
+            "#,
+            language: Language::Rust,
+            severity: Severity::Low,
+            cwes: &["CWE-362", "CWE-362"],
+            remediation: "Consider using std::sync::LazyLock (Rust 1.80+) or once_cell for safer lazy initialization.",
+        },
+        // NEW: Detect RefCell usage (runtime borrow violations)
+        SecurityQuery {
+            id: "rust/refcell-usage",
+            name: "RefCell Dynamic Borrow",
+            description: "Detects RefCell usage which can cause runtime panic on borrow violations",
+            query: r#"
+            (call_expression
+              function: (scoped_identifier
+                path: (identifier) @cell (#eq? @cell "RefCell")
+                name: (identifier) @new (#eq? @new "new")
+              )
+            ) @refcell_usage
+            "#,
+            language: Language::Rust,
+            severity: Severity::Low,
+            cwes: &["CWE-400"],
+            remediation: "Use RefCell carefully. Consider alternatives like Mutex or RwLock for thread-safe interior mutability.",
+        },
+        // NEW: Detect unbounded Vec::push in loops (memory DoS)
+        SecurityQuery {
+            id: "rust/unbounded-vec-push",
+            name: "Unbounded Vec Growth in Loop",
+            description: "Detects unbounded Vec::push operations in loops that can lead to memory exhaustion",
+            query: r#"
+            (for_expression
+              body: (block
+                (call_expression
+                  function: (field_expression
+                    field: (field_identifier) @push (#eq? @push "push")
+                  ) @vec_push
+                )
+              )
+            ) @unbounded_push
+            "#,
+            language: Language::Rust,
+            severity: Severity::Medium,
+            cwes: &["CWE-400", "CWE-770"],
+            remediation: "Add bounds checking or capacity limits before pushing to vectors in loops.",
+        },
     ]
 }
 
@@ -367,6 +438,84 @@ pub fn python_queries() -> Vec<SecurityQuery> {
             cwes: &["CWE-327"],
             remediation: "Use strong algorithms: SHA-256+, AES-GCM.",
         },
+        // NEW: Detect requests without timeout (connection DoS)
+        SecurityQuery {
+            id: "python/requests-no-timeout",
+            name: "HTTP Request Without Timeout",
+            description: "Detects requests library calls without timeout parameter which can cause connection DoS",
+            query: r#"
+            (call
+              function: (attribute
+                object: (identifier) @requests (#eq? @requests "requests")
+                attribute: (identifier) @method
+                (#match? @method "^(get|post|put|delete|patch|head|options|request)$")
+              )
+              arguments: (argument_list) @args
+              (#not-match? @args "timeout")
+            ) @no_timeout_request
+            "#,
+            language: Language::Python,
+            severity: Severity::Medium,
+            cwes: &["CWE-400"],
+            remediation: "Always specify a timeout parameter for HTTP requests to prevent indefinite hanging.",
+        },
+        // NEW: Detect tempfile.mktemp race condition
+        SecurityQuery {
+            id: "python/tempfile-mktemp",
+            name: "Insecure Temporary File Creation",
+            description: "Detects tempfile.mktemp usage which is vulnerable to race conditions",
+            query: r#"
+            (call
+              function: (attribute
+                object: (identifier) @tempfile (#eq? @tempfile "tempfile")
+                attribute: (identifier) @mktemp (#eq? @mktemp "mktemp")
+              )
+            ) @mktemp_race
+            "#,
+            language: Language::Python,
+            severity: Severity::High,
+            cwes: &["CWE-377", "CWE-362"],
+            remediation: "Use tempfile.mkstemp() or NamedTemporaryFile instead of mktemp to avoid race conditions.",
+        },
+        // NEW: Detect logging format string injection
+        SecurityQuery {
+            id: "python/logging-format-injection",
+            name: "Logging Format String Injection",
+            description: "Detects logging calls that may be vulnerable to format string injection",
+            query: r#"
+            (call
+              function: (attribute
+                object: (identifier) @logger (#match? @logger "^(logging|logger|log)$")
+                attribute: (identifier) @method
+                (#match? @method "^(debug|info|warning|error|critical|exception)$")
+              )
+              arguments: (argument_list
+                (string) @msg
+                (#match? @msg "%")
+              )
+            ) @format_injection
+            "#,
+            language: Language::Python,
+            severity: Severity::Medium,
+            cwes: &["CWE-134"],
+            remediation: "Use %-style formatting with a tuple or use f-strings (Python 3.6+) instead of passing user data to log messages.",
+        },
+        // NEW: Detect __import__ with user input
+        SecurityQuery {
+            id: "python/dynamic-import",
+            name: "Dynamic Import with User Input",
+            description: "Detects __import__ or importlib usage which can execute arbitrary code",
+            query: r#"
+            (call
+              function: (identifier) @import
+              (#eq? @import "__import__")
+            ) @dynamic_import
+            "#,
+            language: Language::Python,
+            severity: Severity::High,
+            cwes: &["CWE-94", "CWE-95"],
+            remediation: "Avoid dynamic imports with user-controlled input. Use a whitelist of allowed modules if necessary.",
+        },
     ]
 }
 
@@ -503,6 +652,91 @@ pub fn javascript_queries() -> Vec<SecurityQuery> {
             cwes: &["CWE-352"],
             remediation: "Include CSRF tokens in state-changing requests.",
         },
+        // NEW: Detect prototype pollution via Object.assign
+        SecurityQuery {
+            id: "js/prototype-pollution",
+            name: "Prototype Pollution Risk",
+            description: "Detects Object.assign or spread operator that may allow prototype pollution",
+            query: r#"
+            (call_expression
+              function: (member_expression
+                object: (identifier) @obj (#eq? @obj "Object")
+                property: (property_identifier) @method
+                (#eq? @method "assign")
+              )
+              arguments: (arguments
+                (identifier) @target (#match? @target "^(target|dst|dest|destination)$")
+              )
+            ) @prototype_pollution
+            "#,
+            language: Language::JavaScript,
+            severity: Severity::High,
+            cwes: &["CWE-915", "CWE-1321"],
+            remediation: "Use Object.assign with an empty object as target, or use structuredClone. Validate property keys to block __proto__ and constructor.",
+        },
+        // NEW: Detect dynamic require with user-controlled paths
+        SecurityQuery {
+            id: "js/dynamic-require",
+            name: "Dynamic Module Loading",
+            description: "Detects require() with dynamic or potentially user-controlled paths",
+            query: r#"
+            (call_expression
+              function: (identifier) @require (#eq? @require "require")
+              arguments: (arguments
+                [
+                  (identifier) @dynamic
+                  (template_string) @template
+                  (binary_expression) @concat
+                ]
+              )
+            ) @dynamic_require
+            "#,
+            language: Language::JavaScript,
+            severity: Severity::Medium,
+            cwes: &["CWE-94", "CWE-95"],
+            remediation: "Avoid dynamic require paths. Use a whitelist of allowed modules if dynamic loading is necessary.",
+        },
+        // NEW: Detect missing Object.freeze on exported constants
+        SecurityQuery {
+            id: "js/mutable-exports",
+            name: "Mutable Exported Constants",
+            description: "Detects exported objects/arrays that are not frozen, allowing external mutation",
+            query: r#"
+            (export_statement
+              (lexical_declaration
+                (variable_declarator
+                  name: (identifier) @const_name
+                  value: [
+                    (object) @obj_value
+                    (array) @arr_value
+                  ]
+                )
+              )
+            ) @mutable_export
+            "#,
+            language: Language::JavaScript,
+            severity: Severity::Low,
+            cwes: &["CWE-665"],
+            remediation: "Use Object.freeze() on exported constants to prevent external mutation: export const CONFIG = Object.freeze({...}).",
+        },
+        // NEW: Detect JSON.parse without try-catch
+        SecurityQuery {
+            id: "js/unhandled-json-parse",
+            name: "Unhandled JSON Parsing",
+            description: "Detects JSON.parse calls that may throw on invalid input",
+            query: r#"
+            (call_expression
+              function: (member_expression
+                object: (identifier) @json (#eq? @json "JSON")
+                property: (property_identifier) @parse (#eq? @parse "parse")
+              )
+            ) @json_parse
+            "#,
+            language: Language::JavaScript,
+            severity: Severity::Low,
+            cwes: &["CWE-755", "CWE-248"],
+            remediation: "Wrap JSON.parse in a try-catch block to handle malformed JSON gracefully.",
+        },
     ]
 }
 
@@ -637,6 +871,82 @@ pub fn go_queries() -> Vec<SecurityQuery> {
             severity: Severity::Low,
             cwes: &["CWE-755"],
             remediation: "Handle errors appropriately instead of ignoring them.",
+        },
+        // NEW: Detect defer in loops (resource exhaustion)
+        SecurityQuery {
+            id: "go/defer-in-loop",
+            name: "Defer Inside Loop",
+            description: "Detects defer statements inside loops that can cause resource exhaustion",
+            query: r#"
+            (for_statement
+              body: (block
+                (defer_statement) @defer
+              )
+            ) @defer_in_loop
+            "#,
+            language: Language::Go,
+            severity: Severity::Medium,
+            cwes: &["CWE-400", "CWE-770"],
+            remediation: "Move defer outside the loop or use an anonymous function to execute and release resources immediately.",
+        },
+        // NEW: Detect sync.Map type assertions
+        SecurityQuery {
+            id: "go/sync-map-assertion",
+            name: "Sync.Map Type Assertion Panic",
+            description: "Detects type assertions on sync.Map values that can panic at runtime",
+            query: r#"
+            (call_expression
+              function: (selector_expression
+                operand: (call_expression
+                  function: (selector_expression
+                    operand: (identifier) @sm (#eq? @sm "sync")
+                    field: (field_identifier) @map (#eq? @map "Map")
+                  )
+                )
+                field: (field_identifier) @load (#eq? @load "Load")
+              )
+            ) @sync_map_load
+            "#,
+            language: Language::Go,
+            severity: Severity::Low,
+            cwes: &["CWE-400", "CWE-754"],
+            remediation: "Use the two-value form of type assertion (value, ok := ...) to handle type mismatches gracefully.",
+        },
+        // NEW: Detect unbuffered channel operations that may deadlock
+        SecurityQuery {
+            id: "go/unbuffered-channel",
+            name: "Potential Channel Deadlock",
+            description: "Detects unbuffered channel operations within the same function that may cause deadlock",
+            query: r#"
+            (call_expression
+              function: (identifier) @make (#eq? @make "make")
+              arguments: (argument_list
+                (channel_type)
+              )
+            ) @unbuffered_channel
+            "#,
+            language: Language::Go,
+            severity: Severity::Low,
+            cwes: &["CWE-833", "CWE-662"],
+            remediation: "Use buffered channels or ensure proper goroutine coordination to prevent deadlocks.",
+        },
+        // NEW: Detect context.Background without timeout
+        SecurityQuery {
+            id: "go/context-no-timeout",
+            name: "Context Without Timeout",
+            description: "Detects context.Background() usage which lacks cancellation/timeout",
+            query: r#"
+            (call_expression
+              function: (selector_expression
+                operand: (identifier) @ctx (#eq? @ctx "context")
+                field: (field_identifier) @bg (#eq? @bg "Background")
+              )
+            ) @context_background
+            "#,
+            language: Language::Go,
+            severity: Severity::Low,
+            cwes: &["CWE-400"],
+            remediation: "Use context.WithTimeout() or context.WithDeadline() instead of context.Background() for operations that should not run indefinitely.",
         },
     ]
 }
