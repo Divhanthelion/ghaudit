@@ -55,12 +55,6 @@ pub enum AuditorError {
 
     #[error("Invalid Cargo.lock format: {0}")]
     CargoLock(String),
-
-    #[error("Channel send error")]
-    ChannelSend,
-
-    #[error("Channel receive error")]
-    ChannelRecv,
 }
 
 /// Result type alias for auditor operations.
@@ -75,17 +69,5 @@ impl From<octocrab::Error> for AuditorError {
 impl From<cargo_lock::Error> for AuditorError {
     fn from(err: cargo_lock::Error) -> Self {
         AuditorError::CargoLock(err.to_string())
-    }
-}
-
-impl<T> From<async_channel::SendError<T>> for AuditorError {
-    fn from(_: async_channel::SendError<T>) -> Self {
-        AuditorError::ChannelSend
-    }
-}
-
-impl From<async_channel::RecvError> for AuditorError {
-    fn from(_: async_channel::RecvError) -> Self {
-        AuditorError::ChannelRecv
     }
 }

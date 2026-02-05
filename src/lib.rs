@@ -1,54 +1,14 @@
-#![recursion_limit = "1024"]
 //! sec_auditor - High-Performance Rust Security Analysis Engine
-//!
-//! A comprehensive security analysis application for GitHub repositories,
-//! combining SAST, SCA, and AI-driven vulnerability detection.
-//!
-//! # Features
-//!
-//! - **SAST (Static Application Security Testing)**: Tree-sitter based code analysis
-//! - **SCA (Software Composition Analysis)**: OSV database integration for dependency vulnerabilities
-//! - **Secret Detection**: High-entropy and pattern-based secret detection
-//! - **Provenance Verification**: SLSA/Sigstore supply chain verification
-//! - **AI Analysis**: Optional LLM-powered vulnerability detection
-//! - **SARIF Output**: Industry-standard reporting format
-//!
-//! # Architecture
-//!
-//! The application uses a hybrid concurrency model:
-//! - **Tokio** for async I/O operations (GitHub API, network requests)
-//! - **Rayon** for parallel CPU-bound analysis (parsing, pattern matching)
-//!
-//! # Example Usage
-//!
-//! ```no_run
-//! use sec_auditor::{Config, Scanner};
-//!
-//! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let config = Config::default();
-//!     let scanner = Scanner::new(config)?;
-//!
-//!     let result = scanner.scan_repository("owner/repo").await?;
-//!     println!("Found {} findings", result.findings.len());
-//!
-//!     Ok(())
-//! }
-//! ```
 
 pub mod ai;
 pub mod analyzer;
-pub mod concurrency;
 pub mod config;
 pub mod crawler;
-pub mod crosslang;
 pub mod error;
 pub mod models;
-pub mod privacy;
 pub mod provenance;
 pub mod reporter;
 
-// Re-export commonly used types
 pub use config::{Config, OutputFormat};
 pub use error::{AuditorError, Result};
 pub use models::{Finding, Repository, ScanResult, Severity, Vulnerability};
@@ -64,35 +24,19 @@ use tracing::{debug, error, info, warn};
 
 /// Main scanner orchestrating all analysis components.
 pub struct Scanner {
-    /// Configuration
     config: Config,
-
-    /// GitHub client
     github: Option<GitHubClient>,
-
-    /// Git operations handler
     git: GitOperations,
-
-    /// SAST engine
     sast: SastEngine,
-
-    /// SCA engine
     sca: ScaEngine,
-
-    /// Secret detector
     secrets: SecretDetector,
-
-    /// SLSA verifier
     slsa: SlsaVerifier,
-
-    /// AI analyzer
     ai: ai::AiAnalyzer,
 }
 
 impl Scanner {
     /// Create a new scanner with the given configuration.
     pub fn new(config: Config) -> Result<Self> {
-        // Initialize GitHub client if token is available
         let github = if config.github.token.is_some() {
             Some(GitHubClient::new(config.github.clone())?)
         } else {
@@ -100,18 +44,13 @@ impl Scanner {
             None
         };
 
-        // Initialize Git operations
         let temp_dir = config
             .analysis
             .temp_dir
             .clone()
             .unwrap_or_else(|| std::env::temp_dir().join("sec_auditor"));
         let git = GitOperations::new(temp_dir);
-
-        // Initialize SAST engine
         let sast = SastEngine::new(config.analysis.clone())?;
-
-        // Initialize other components
         let sca = ScaEngine::new();
         let secrets = SecretDetector::new(config.analysis.entropy_threshold);
         let slsa = SlsaVerifier::new();
@@ -149,7 +88,6 @@ impl Scanner {
 
         let mut result = ScanResult::new(&repo.full_name);
 
-        // Get repository metadata if we have a GitHub client
         if let Some(ref github) = self.github {
             match github.get_repository(&repo.owner, &repo.name).await {
                 Ok(metadata) => {
@@ -162,21 +100,15 @@ impl Scanner {
             }
         }
 
-        // Clone the repository
         let local_path = self.git.clone_repository(&mut repo)?;
-
-        // Perform the scan
         let scan_result = self.scan_local_path(&local_path).await?;
 
-        // Merge results
         result.findings = scan_result.findings;
         result.stats = scan_result.stats;
         result.completed_at = chrono::Utc::now();
         result.stats.duration_ms = start_time.elapsed().as_millis() as u64;
 
-        // Clean up if configured
         if self.config.analysis.temp_dir.is_none() {
-            // Only clean up if using system temp dir
             if let Err(e) = self.git.cleanup(&repo) {
                 warn!("Failed to clean up cloned repository: {}", e);
             }
@@ -192,19 +124,16 @@ impl Scanner {
 
         let mut result = ScanResult::new(path.display().to_string());
 
-        // Get commit SHA if it's a git repository
         if let Ok(sha) = GitOperations::get_head_sha(path) {
             result.commit_sha = Some(sha);
         }
 
-        // Get source files
         let traverser = RepoTraverser::new(path);
         let mut files = traverser.get_source_files(path)?;
 
         result.stats.files_scanned = files.len();
-        result.stats.lines_analyzed = files.iter().map(|f| f.size as usize / 40).sum(); // Rough estimate
+        result.stats.lines_analyzed = files.iter().map(|f| f.size as usize / 40).sum();
 
-        // Run SAST analysis
         if self.config.analysis.enable_sast {
             info!("Running SAST analysis on {} files", files.len());
             match self.sast.analyze_files(&mut files) {
@@ -220,7 +149,6 @@ impl Scanner {
             }
         }
 
-        // Run secret detection
         if self.config.analysis.enable_secrets {
             info!("Running secret detection");
             for file in &mut files {
@@ -237,7 +165,6 @@ impl Scanner {
             }
         }
 
-        // Run SCA analysis
         if self.config.analysis.enable_sca {
             info!("Running SCA analysis");
             match self.sca.analyze_repository(path).await {
@@ -253,7 +180,6 @@ impl Scanner {
             }
         }
 
-        // Run AI analysis if enabled
         if self.config.analysis.enable_ai && self.ai.is_available() {
             info!("Running AI-driven analysis");
             for file in &mut files {
@@ -281,7 +207,6 @@ impl Scanner {
             }
         }
 
-        // Run provenance verification if enabled
         if self.config.analysis.enable_provenance {
             info!("Running provenance verification");
             match self.verify_provenance(path).await {
@@ -370,7 +295,6 @@ impl Scanner {
                     combined_result.stats.secrets_found += result.stats.secrets_found;
 
                     for mut finding in result.findings {
-                        // Prefix finding location with repo name
                         finding.location.file = std::path::PathBuf::from(&repo.full_name)
                             .join(&finding.location.file);
                         combined_result.add_finding(finding);
@@ -381,7 +305,6 @@ impl Scanner {
                 }
             }
 
-            // Rate limiting
             if let Some(ref github) = self.github {
                 github.rate_limit_delay().await;
             }
