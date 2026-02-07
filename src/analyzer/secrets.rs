@@ -33,7 +33,7 @@ impl Default for EntropyThresholds {
         Self {
             hex: 3.0,          // ~75% of max (4.0)
             base64: 4.5,       // ~75% of max (6.0)
-            alphanumeric: 3.7, // ~62% of max (5.95)
+            alphanumeric: 4.2, // ~71% of max (5.95) — raised to reduce FP on identifiers
             default: 4.0,
         }
     }
@@ -153,9 +153,11 @@ impl CharSet {
 }
 
 impl SecretDetector {
-    /// Create a new secret detector with default thresholds.
-    pub fn new(_entropy_threshold: f64) -> Self {
-        Self::with_thresholds(EntropyThresholds::default())
+    /// Create a new secret detector with a custom alphanumeric threshold.
+    pub fn new(entropy_threshold: f64) -> Self {
+        let mut thresholds = EntropyThresholds::default();
+        thresholds.alphanumeric = entropy_threshold.max(3.0).min(6.0);
+        Self::with_thresholds(thresholds)
     }
 
     /// Create a new secret detector with custom thresholds.
@@ -178,10 +180,10 @@ impl SecretDetector {
         ).unwrap();
 
         // Keywords that indicate a potential secret in context
+        // Removed overly common words (key, token, auth, private, access) that cause FPs
         let suspicious_keywords = vec![
-            "key", "secret", "token", "password", "passwd", "pwd",
-            "auth", "credential", "api", "private", "access",
-            "bearer", "jwt", "session", "encryption", "signing",
+            "secret", "password", "passwd", "pwd",
+            "credential", "bearer", "jwt", "encryption", "signing",
         ];
 
         Self {
@@ -210,7 +212,7 @@ impl SecretDetector {
         }
     }
 
-    /// Check if a string is a false positive (UUID, git hash, etc.).
+    /// Check if a string is a false positive (UUID, git hash, identifier, etc.).
     fn is_false_positive(&self, s: &str) -> bool {
         // Check for UUID pattern
         if self.uuid_pattern.is_match(s) {
@@ -233,6 +235,24 @@ impl SecretDetector {
             return true;
         }
 
+        // Filter CamelCase identifiers (e.g., "ChatCompletionRequest")
+        if Self::is_camel_case_identifier(s) {
+            debug!("Filtered CamelCase identifier: {}", s);
+            return true;
+        }
+
+        // Filter snake_case identifiers (e.g., "chat_completion_request")
+        if Self::is_snake_case_identifier(s) {
+            debug!("Filtered snake_case identifier: {}", s);
+            return true;
+        }
+
+        // Filter pure-alpha strings with no digits (real secrets almost always have digits)
+        if s.len() < 32 && s.chars().all(|c| c.is_ascii_alphabetic()) {
+            debug!("Filtered pure-alpha string: {}", s);
+            return true;
+        }
+
         // Check for common non-secret patterns
         if self.is_common_non_secret(s) {
             return true;
@@ -241,14 +261,45 @@ impl SecretDetector {
         false
     }
 
+    /// Check if a string is a CamelCase identifier (e.g., "ChatCompletionRequest").
+    fn is_camel_case_identifier(s: &str) -> bool {
+        if s.len() < 4 || !s.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return false;
+        }
+        // Must start with uppercase and have at least one lowercase->uppercase transition
+        let chars: Vec<char> = s.chars().collect();
+        if !chars[0].is_ascii_uppercase() {
+            return false;
+        }
+        let mut has_transition = false;
+        for window in chars.windows(2) {
+            if window[0].is_ascii_lowercase() && window[1].is_ascii_uppercase() {
+                has_transition = true;
+                break;
+            }
+        }
+        has_transition
+    }
+
+    /// Check if a string is a snake_case identifier (e.g., "chat_completion_request").
+    fn is_snake_case_identifier(s: &str) -> bool {
+        if !s.contains('_') {
+            return false;
+        }
+        s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            && !s.starts_with('_')
+            && !s.ends_with('_')
+            && !s.contains("__")
+    }
+
     /// Check for common non-secret patterns.
     fn is_common_non_secret(&self, s: &str) -> bool {
-        // Check for repeated characters (unlikely to be a real secret)
+        // Check for low character diversity (unlikely to be a real secret)
         if s.len() > 10 {
             let chars: Vec<char> = s.chars().collect();
             let unique_chars: std::collections::HashSet<_> = chars.iter().collect();
-            if unique_chars.len() <= 3 {
-                return true; // Too few unique characters
+            if unique_chars.len() < s.len() / 3 {
+                return true; // Too few unique characters relative to length
             }
         }
 
@@ -307,8 +358,8 @@ impl SecretDetector {
         let base_threshold = self.get_threshold_for_string(s);
         let context_weight = self.calculate_context_weight(context);
 
-        // Lower the threshold if suspicious keywords are present
-        let adjusted_threshold = base_threshold - (context_weight * 0.5);
+        // Lower the threshold if suspicious keywords are present (capped at 0.2 reduction)
+        let adjusted_threshold = base_threshold - (context_weight * 0.3).min(0.2);
 
         entropy >= adjusted_threshold
     }
@@ -591,8 +642,8 @@ impl SecretDetector {
     ) -> Vec<Finding> {
         let mut findings = Vec::new();
 
-        // Pattern to find quoted strings (minimum 16 chars for meaningful secrets)
-        let string_pattern = Regex::new(r#"['"]([a-zA-Z0-9+/=_-]{16,})['"]"#).unwrap();
+        // Pattern to find quoted strings (minimum 20 chars, must contain at least one digit or special char)
+        let string_pattern = Regex::new(r#"['"]([a-zA-Z0-9+/=_-]{20,})['"]"#).unwrap();
 
         for mat in string_pattern.find_iter(content) {
             let matched = mat.as_str();
@@ -739,8 +790,8 @@ mod tests {
         // Base64 threshold should be 4.5
         assert_eq!(detector.get_threshold_for_charset(CharSet::Base64), 4.5);
 
-        // Alphanumeric threshold should be 3.7
-        assert_eq!(detector.get_threshold_for_charset(CharSet::Alphanumeric), 3.7);
+        // Alphanumeric threshold should match what was passed to new() (4.5)
+        assert_eq!(detector.get_threshold_for_charset(CharSet::Alphanumeric), 4.5);
     }
 
     #[test]

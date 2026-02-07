@@ -383,6 +383,10 @@ fn exit_with_findings(result: &ScanResult) -> ! {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
     let cli = Cli::parse();
 
     setup_logging(cli.verbose, cli.quiet);

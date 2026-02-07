@@ -155,6 +155,23 @@ impl Scanner {
                 let file_path = file.path.clone();
                 let language = file.language;
 
+                // Skip test/fixture/example directories for secret detection (high FP rate)
+                let path_str = file_path.to_string_lossy().to_lowercase();
+                if path_str.contains("/test/")
+                    || path_str.contains("/tests/")
+                    || path_str.contains("/__tests__/")
+                    || path_str.contains("/fixtures/")
+                    || path_str.contains("/test_")
+                    || path_str.ends_with("_test.py")
+                    || path_str.ends_with("_test.go")
+                    || path_str.ends_with(".test.js")
+                    || path_str.ends_with(".test.ts")
+                    || path_str.ends_with(".spec.js")
+                    || path_str.ends_with(".spec.ts")
+                {
+                    continue;
+                }
+
                 if let Ok(content) = file.load_content() {
                     let content = content.to_string();
                     let secret_findings = self.secrets.detect(&content, &file_path, language);

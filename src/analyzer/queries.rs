@@ -404,7 +404,7 @@ pub fn python_queries() -> Vec<SecurityQuery> {
             ) @assert
             "#,
             language: Language::Python,
-            severity: Severity::Medium,
+            severity: Severity::Low,
             cwes: &["CWE-617"],
             remediation: "Use proper if/raise for security checks, not assert.",
         },
@@ -648,7 +648,7 @@ pub fn javascript_queries() -> Vec<SecurityQuery> {
             ) @http_call
             "#,
             language: Language::JavaScript,
-            severity: Severity::Medium,
+            severity: Severity::Low,
             cwes: &["CWE-352"],
             remediation: "Include CSRF tokens in state-changing requests.",
         },

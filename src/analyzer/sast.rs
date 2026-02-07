@@ -1,7 +1,6 @@
 //! Static Application Security Testing (SAST) engine using tree-sitter.
 
 use crate::analyzer::queries::{get_queries_for_language, SecurityQuery};
-use crate::analyzer::taint::{analyze_taint, SinkCategory, TaintAnalysisResult};
 use crate::config::AnalysisConfig;
 use crate::error::{AuditorError, Result};
 use crate::models::{
@@ -25,57 +24,31 @@ thread_local! {
 pub struct SastEngine {
     /// Analysis configuration
     config: AnalysisConfig,
-
-    /// Parsers for each language
-    parsers: HashMap<Language, Parser>,
-
-    /// Whether to use taint analysis for FP reduction
-    enable_taint_analysis: bool,
 }
 
 impl SastEngine {
     /// Create a new SAST engine.
     pub fn new(config: AnalysisConfig) -> Result<Self> {
-        let mut parsers = HashMap::new();
-
-        // Initialize parsers for supported languages
-        if config.languages.iter().any(|l| l == "rust") {
-            if let Ok(parser) = Self::create_parser(Language::Rust) {
-                parsers.insert(Language::Rust, parser);
+        // Verify parsers can be created for configured languages
+        let mut parser_count = 0;
+        for lang_str in &config.languages {
+            let lang = match lang_str.as_str() {
+                "rust" => Some(Language::Rust),
+                "python" => Some(Language::Python),
+                "javascript" | "typescript" => Some(Language::JavaScript),
+                "go" => Some(Language::Go),
+                _ => None,
+            };
+            if let Some(l) = lang {
+                if Self::create_parser(l).is_ok() {
+                    parser_count += 1;
+                }
             }
         }
 
-        if config.languages.iter().any(|l| l == "python") {
-            if let Ok(parser) = Self::create_parser(Language::Python) {
-                parsers.insert(Language::Python, parser);
-            }
-        }
+        info!("SAST engine initialized with {} language parsers", parser_count);
 
-        if config.languages.iter().any(|l| l == "javascript" || l == "typescript") {
-            if let Ok(parser) = Self::create_parser(Language::JavaScript) {
-                parsers.insert(Language::JavaScript, parser);
-            }
-        }
-
-        if config.languages.iter().any(|l| l == "go") {
-            if let Ok(parser) = Self::create_parser(Language::Go) {
-                parsers.insert(Language::Go, parser);
-            }
-        }
-
-        info!("SAST engine initialized with {} language parsers", parsers.len());
-
-        Ok(Self {
-            config,
-            parsers,
-            enable_taint_analysis: true, // Enable by default for FP reduction
-        })
-    }
-
-    /// Enable or disable taint analysis for false positive reduction.
-    pub fn with_taint_analysis(mut self, enable: bool) -> Self {
-        self.enable_taint_analysis = enable;
-        self
+        Ok(Self { config })
     }
 
     /// Create a parser for a specific language.
@@ -150,28 +123,6 @@ impl SastEngine {
         // Parse the file using thread-local cached parser
         let tree = Self::parse_with_cache(language, &content)?;
 
-        // Run taint analysis if enabled (for FP reduction)
-        let taint_result = if self.enable_taint_analysis {
-            match analyze_taint(language, &tree, &content) {
-                Ok(result) => {
-                    debug!(
-                        "Taint analysis for {}: {} sources, {} sinks, {} flows",
-                        file_path.display(),
-                        result.source_count,
-                        result.sink_count,
-                        result.flows.len()
-                    );
-                    Some(result)
-                }
-                Err(e) => {
-                    warn!("Taint analysis failed for {}: {}", file_path.display(), e);
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
         // Get queries for this language
         let queries = get_queries_for_language(language);
         let mut findings = Vec::new();
@@ -180,13 +131,7 @@ impl SastEngine {
         for security_query in queries {
             match self.run_query(&security_query, &tree, &content, &file_path) {
                 Ok(query_findings) => {
-                    // Filter findings using taint analysis results
-                    let filtered = if let Some(ref taint) = taint_result {
-                        self.filter_with_taint(query_findings, taint, &security_query)
-                    } else {
-                        query_findings
-                    };
-                    findings.extend(filtered);
+                    findings.extend(query_findings);
                 }
                 Err(e) => {
                     warn!(
@@ -199,113 +144,12 @@ impl SastEngine {
             }
         }
 
-        // Add taint flow findings for confirmed data flow vulnerabilities
-        if let Some(ref taint) = taint_result {
-            for flow in &taint.flows {
-                let location = Location::new(
-                    file_path.clone(),
-                    flow.sink_line,
-                    1,
-                )
-                .with_language(language);
-
-                let severity = match flow.sink.category {
-                    SinkCategory::SqlQuery | SinkCategory::CommandExec | SinkCategory::CodeEval => {
-                        Severity::Critical
-                    }
-                    SinkCategory::HtmlOutput | SinkCategory::FilePath => Severity::High,
-                    SinkCategory::Deserialization | SinkCategory::LdapQuery | SinkCategory::XPathQuery => {
-                        Severity::High
-                    }
-                    SinkCategory::LogOutput => Severity::Medium,
-                };
-
-                let category = match flow.sink.category {
-                    SinkCategory::SqlQuery => SastCategory::Injection,
-                    SinkCategory::CommandExec => SastCategory::Injection,
-                    SinkCategory::CodeEval => SastCategory::Injection,
-                    SinkCategory::HtmlOutput => SastCategory::Xss,
-                    SinkCategory::FilePath => SastCategory::PathTraversal,
-                    _ => SastCategory::Other,
-                };
-
-                let mut finding = Finding::sast(
-                    &format!("taint-flow-{:?}", flow.sink.category),
-                    &format!("Taint flow to {:?} sink", flow.sink.category),
-                    &format!(
-                        "Untrusted data flows from {} (line {}) to {} (line {}) without sanitization",
-                        flow.source.pattern, flow.source_line, flow.sink.pattern, flow.sink_line
-                    ),
-                    location,
-                    severity,
-                )
-                .with_sast_category(category)
-                .with_confidence(Confidence::High) // Taint-confirmed findings have high confidence
-                .with_metadata("taint_source", serde_json::json!(flow.source.pattern))
-                .with_metadata("taint_sink", serde_json::json!(flow.sink.pattern))
-                .with_metadata("source_line", serde_json::json!(flow.source_line))
-                .with_metadata("sink_line", serde_json::json!(flow.sink_line));
-
-                findings.push(finding);
-            }
-        }
-
         debug!(
             "Found {} findings in {}",
             findings.len(),
             file_path.display()
         );
         Ok(findings)
-    }
-
-    /// Filter findings using taint analysis to reduce false positives.
-    ///
-    /// If a finding is about a potential injection but taint analysis
-    /// shows no data flow from untrusted sources, reduce its confidence.
-    fn filter_with_taint(
-        &self,
-        findings: Vec<Finding>,
-        taint: &TaintAnalysisResult,
-        query: &SecurityQuery,
-    ) -> Vec<Finding> {
-        findings
-            .into_iter()
-            .filter_map(|mut finding| {
-                // Check if this is an injection-related finding
-                let is_injection = query.id.contains("injection")
-                    || query.id.contains("sql")
-                    || query.id.contains("cmd")
-                    || query.id.contains("eval")
-                    || query.id.contains("xss");
-
-                if is_injection {
-                    // Check if taint analysis found any flows to this location
-                    let line = finding.location.start_line;
-                    let has_taint_flow = taint.flows.iter().any(|f| {
-                        f.sink_line == line
-                            || (f.sink_line.saturating_sub(2) <= line && line <= f.sink_line + 2)
-                    });
-
-                    if !has_taint_flow && taint.source_count > 0 {
-                        // No taint flow detected but sources exist - lower confidence
-                        finding = finding.with_confidence(Confidence::Low);
-                        debug!(
-                            "Lowered confidence for {} at line {} (no taint flow)",
-                            query.id, line
-                        );
-                    } else if has_taint_flow {
-                        // Taint flow confirmed - high confidence
-                        finding = finding.with_confidence(Confidence::High);
-                        debug!(
-                            "Confirmed taint flow for {} at line {}",
-                            query.id, line
-                        );
-                    }
-                }
-
-                Some(finding)
-            })
-            .collect()
     }
 
     /// Run a security query on a parsed tree.
@@ -327,6 +171,9 @@ impl SastEngine {
         let query = Query::new(&ts_language, security_query.query)
             .map_err(|e| AuditorError::Parse(format!("Invalid query {}: {}", security_query.id, e)))?;
 
+        let is_hardcoded_query = security_query.id.contains("hardcoded");
+        let capture_names: Vec<String> = query.capture_names().iter().map(|s| s.to_string()).collect();
+
         let mut cursor = QueryCursor::new();
         let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
 
@@ -335,6 +182,21 @@ impl SastEngine {
         while let Some(match_) = matches.next() {
             // Get the primary capture (usually the main node of interest)
             if let Some(capture) = match_.captures.first() {
+                // For hardcoded-secret/password queries, validate the value isn't a sentinel
+                if is_hardcoded_query {
+                    let value_text = match_.captures.iter()
+                        .find(|c| capture_names.get(c.index as usize).map(|n| n.as_str()) == Some("value"))
+                        .and_then(|c| c.node.utf8_text(source.as_bytes()).ok());
+
+                    if let Some(value) = value_text {
+                        let inner = value.trim_matches(|c: char| c == '"' || c == '\'');
+                        if !Self::looks_like_real_secret(inner) {
+                            debug!("Filtered hardcoded FP: {} = {:?}", security_query.id, inner);
+                            continue;
+                        }
+                    }
+                }
+
                 let node = capture.node;
                 let start = node.start_position();
                 let end = node.end_position();
@@ -382,6 +244,49 @@ impl SastEngine {
         Ok(findings)
     }
 
+    /// Check if a string value looks like a real hardcoded secret vs a sentinel/marker.
+    fn looks_like_real_secret(value: &str) -> bool {
+        // Too short to be a real secret
+        if value.len() < 8 {
+            return false;
+        }
+
+        // Known non-secret patterns: XML/HTML tags, bracket markers, BOS/EOS tokens
+        let lower = value.to_lowercase();
+        if lower.starts_with('<') || lower.starts_with('[') || lower.starts_with('{') {
+            return false;
+        }
+
+        // Common sentinel values
+        let sentinels = [
+            "none", "null", "true", "false", "undefined", "n/a",
+            "changeme", "replace_me", "your_", "example", "test",
+        ];
+        for sentinel in sentinels {
+            if lower.contains(sentinel) {
+                return false;
+            }
+        }
+
+        // Must have some character diversity (real secrets aren't all the same char class)
+        let has_digit = value.chars().any(|c| c.is_ascii_digit());
+        let has_alpha = value.chars().any(|c| c.is_ascii_alphabetic());
+        let has_special = value.chars().any(|c| !c.is_ascii_alphanumeric());
+
+        // Real secrets typically mix character classes
+        // A string like "TOOL_CALLS" (all caps + underscore) with no digits is unlikely a secret
+        if !has_digit && !has_special {
+            return false;
+        }
+
+        // If it's short and only alpha+underscore, not a secret
+        if value.len() < 16 && !has_digit {
+            return false;
+        }
+
+        has_alpha || has_digit
+    }
+
     /// Analyze multiple files in parallel with bounded parallelism.
     ///
     /// Files are processed in batches to control memory usage, which is
@@ -392,7 +297,7 @@ impl SastEngine {
         let mut all_findings = Vec::new();
 
         // Process files in batches to control memory usage
-        let batch_size = self.config.max_file_size.min(500); // Default to 500 if not configured
+        let batch_size = 500; // Files per parallel batch
         let total_batches = (files.len() + batch_size - 1) / batch_size;
 
         for (batch_idx, batch) in files.chunks_mut(batch_size).enumerate() {
@@ -419,12 +324,14 @@ impl SastEngine {
 
     /// Check if the SAST engine supports a language.
     pub fn supports_language(&self, language: Language) -> bool {
-        self.parsers.contains_key(&language)
-    }
-
-    /// Get supported languages.
-    pub fn supported_languages(&self) -> Vec<Language> {
-        self.parsers.keys().copied().collect()
+        let lang_str = match language {
+            Language::Rust => "rust",
+            Language::Python => "python",
+            Language::JavaScript | Language::TypeScript => "javascript",
+            Language::Go => "go",
+            _ => return false,
+        };
+        self.config.languages.iter().any(|l| l == lang_str)
     }
 }
 
@@ -508,22 +415,6 @@ fn determine_confidence(
     }
 
     confidence
-}
-
-/// Helper extension trait for AnalysisConfig to avoid Option handling.
-trait AnalysisConfigExt {
-    fn include_snippets(&self) -> Option<bool>;
-    fn snippet_lines(&self) -> Option<usize>;
-}
-
-impl AnalysisConfigExt for AnalysisConfig {
-    fn include_snippets(&self) -> Option<bool> {
-        Some(true) // Default to true
-    }
-
-    fn snippet_lines(&self) -> Option<usize> {
-        Some(3) // Default context lines
-    }
 }
 
 #[cfg(test)]

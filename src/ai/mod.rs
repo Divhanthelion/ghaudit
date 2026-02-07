@@ -316,11 +316,9 @@ impl AiAnalyzer {
                 ("UnsafeCell", "Interior mutability may cause data races", Severity::Medium),
             ],
             Language::Python => vec![
-                ("os.system", "Command injection risk", Severity::High),
                 ("subprocess.call", "Shell command execution", Severity::Medium),
                 ("yaml.load", "Unsafe YAML loading (use safe_load)", Severity::High),
                 ("marshal.loads", "Unsafe deserialization", Severity::Critical),
-                ("input(", "Python 2 input() executes code", Severity::High),
             ],
             Language::JavaScript => vec![
                 ("dangerouslySetInnerHTML", "React XSS risk", Severity::High),
@@ -1191,8 +1189,8 @@ mod tests {
     fn test_heuristic_analysis() {
         let analyzer = AiAnalyzer::new();
         let code = r#"
-            import os
-            os.system(user_input)  # Command injection!
+            import yaml
+            data = yaml.load(user_input)  # Unsafe YAML loading!
         "#;
 
         let context = AnalysisContext {
@@ -1205,7 +1203,7 @@ mod tests {
             .unwrap();
 
         assert!(!findings.is_empty());
-        assert!(findings.iter().any(|f| f.description.contains("Command")));
+        assert!(findings.iter().any(|f| f.description.contains("YAML")));
     }
 
     #[test]

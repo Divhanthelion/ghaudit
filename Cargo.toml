@@ -19,6 +19,7 @@ git2 = "0.19"
 
 # HTTP client
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+rustls = { version = "0.23", features = ["ring"] }
 
 # Tree-sitter for SAST
 tree-sitter = "0.24"
