@@ -2,7 +2,7 @@
 
 use super::{Language, Severity, Vulnerability};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Represents a security finding discovered during analysis.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +76,21 @@ impl Finding {
 
     /// Create a new SCA finding.
     pub fn sca(vulnerability: Vulnerability, dependency: &str, version: &str) -> Self {
+        Self::sca_with_source(vulnerability, dependency, version, None)
+    }
+
+    /// Create a new SCA finding with source file information.
+    pub fn sca_with_source(
+        vulnerability: Vulnerability,
+        dependency: &str,
+        version: &str,
+        source_file: Option<&Path>,
+    ) -> Self {
+        // Determine the appropriate lock file name based on the source
+        let lock_file = source_file
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("Cargo.lock"));
+
         Self {
             id: uuid_v4(),
             category: FindingCategory::Sca,
@@ -86,7 +101,7 @@ impl Finding {
             ),
             description: vulnerability.summary.clone(),
             location: Location {
-                file: PathBuf::from("Cargo.lock"),
+                file: lock_file,
                 start_line: 0,
                 end_line: 0,
                 start_column: 0,

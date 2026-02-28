@@ -12,6 +12,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tracing::{error, info, warn, Level};
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 /// Maximum allowed output path depth to prevent path traversal.
 const MAX_OUTPUT_DEPTH: usize = 5;
@@ -66,8 +68,6 @@ fn validate_output_path(path: &Path) -> anyhow::Result<PathBuf> {
 
     Ok(canonical)
 }
-use tracing::{error, info, warn, Level};
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 /// Parse a severity string into a Severity enum.
 fn parse_severity(s: &str) -> Severity {

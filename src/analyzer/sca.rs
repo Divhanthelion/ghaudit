@@ -740,7 +740,7 @@ impl ScaEngine {
             match self.query_osv(&dep.name, &dep.version, "crates.io").await {
                 Ok(vulns) => {
                     for vuln in vulns {
-                        let finding = Finding::sca(vuln.clone(), &dep.name, &dep.version);
+                        let finding = Finding::sca_with_source(vuln.clone(), &dep.name, &dep.version, Some(lock_path));
                         findings.push(finding);
                     }
                 }
@@ -996,7 +996,7 @@ impl ScaEngine {
                     match self.query_osv(name, clean_version, "npm").await {
                         Ok(vulns) => {
                             for vuln in vulns {
-                                findings.push(Finding::sca(vuln, name, clean_version));
+                                findings.push(Finding::sca_with_source(vuln, name, clean_version, Some(path)));
                             }
                         }
                         Err(e) => {
@@ -1017,7 +1017,7 @@ impl ScaEngine {
                     match self.query_osv(name, clean_version, "npm").await {
                         Ok(vulns) => {
                             for vuln in vulns {
-                                findings.push(Finding::sca(vuln, name, clean_version));
+                                findings.push(Finding::sca_with_source(vuln, name, clean_version, Some(path)));
                             }
                         }
                         Err(e) => {
@@ -1060,7 +1060,7 @@ impl ScaEngine {
                     match self.query_osv(name, version, "PyPI").await {
                         Ok(vulns) => {
                             for vuln in vulns {
-                                findings.push(Finding::sca(vuln, name, version));
+                                findings.push(Finding::sca_with_source(vuln, name, version, Some(path)));
                             }
                         }
                         Err(e) => {
@@ -1101,7 +1101,7 @@ impl ScaEngine {
                 match self.query_osv(module, version, "Go").await {
                     Ok(vulns) => {
                         for vuln in vulns {
-                            findings.push(Finding::sca(vuln, module, version));
+                            findings.push(Finding::sca_with_source(vuln, module, version, Some(path)));
                         }
                     }
                     Err(e) => {
@@ -1381,10 +1381,11 @@ impl DepsDevClient {
                     modified: None,
                 };
 
-                findings.push(Finding::sca(
+                findings.push(Finding::sca_with_source(
                     vuln,
                     &result.version.version_key.name,
                     &result.version.version_key.version,
+                    None, // deps.dev results don't have a specific lock file
                 ));
             }
         }
