@@ -1,13 +1,9 @@
-//! Security analysis modules.
+//! The analyzers. Each turns files (or a whole checkout) into findings.
 
-mod queries;
-mod sast;
-mod sca;
-mod secrets;
-mod taint;
-
-pub use queries::*;
-pub use sast::*;
-pub use sca::*;
-pub use secrets::*;
-pub use taint::*;
+pub mod ai;
+pub mod rules;
+pub mod sast;
+pub mod sca;
+pub mod secrets;
+pub mod unicode;
+pub mod workflows;

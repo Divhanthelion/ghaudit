@@ -1,358 +1,273 @@
-//! Configuration management for the security auditor.
+//! Configuration: built-in defaults, optionally overridden by a TOML file, then by CLI flags.
+//!
+//! Unknown keys are rejected so a typo in a config file is an error rather than a
+//! silently ignored setting.
 
-use crate::models::Severity;
+use crate::error::{Error, Result};
+use crate::model::Severity;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::Path;
 
-/// Main configuration for the security auditor.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Languages the SAST engine has rules for.
+pub const SUPPORTED_LANGUAGES: &[&str] = &["rust", "python", "javascript", "typescript", "go"];
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
-    /// GitHub configuration
     pub github: GitHubConfig,
-
-    /// Analysis configuration
     pub analysis: AnalysisConfig,
-
-    /// Output configuration
-    pub output: OutputConfig,
-
-    /// Concurrency settings
-    pub concurrency: ConcurrencyConfig,
+    pub sca: ScaConfig,
+    pub ai: AiConfig,
+    pub report: ReportConfig,
 }
 
-/// GitHub API configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct GitHubConfig {
-    /// GitHub personal access token or app token
+    /// Personal access token. Prefer the GITHUB_TOKEN environment variable.
+    #[serde(skip_serializing)]
     pub token: Option<String>,
-
-    /// GitHub API base URL (for GitHub Enterprise)
-    #[serde(default = "default_github_api_url")]
+    /// REST API base URL; change for GitHub Enterprise Server.
     pub api_url: String,
-
-    /// Rate limit handling: delay in milliseconds between requests
-    #[serde(default = "default_rate_limit_delay")]
-    pub rate_limit_delay_ms: u64,
-
-    /// Maximum repositories to scan in a single run
-    #[serde(default = "default_max_repos")]
+    /// Upper bound on repositories scanned by `org`, `user` and `search`.
     pub max_repos: usize,
-}
-
-/// Analysis configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AnalysisConfig {
-    /// Enable SAST (Static Application Security Testing)
-    #[serde(default = "default_true")]
-    pub enable_sast: bool,
-
-    /// Enable SCA (Software Composition Analysis)
-    #[serde(default = "default_true")]
-    pub enable_sca: bool,
-
-    /// Enable secret detection
-    #[serde(default = "default_true")]
-    pub enable_secrets: bool,
-
-    /// Enable provenance verification (SLSA/Sigstore)
-    #[serde(default)]
-    pub enable_provenance: bool,
-
-    /// Enable AI-driven analysis
-    #[serde(default)]
-    pub enable_ai: bool,
-
-    /// Languages to analyze
-    #[serde(default = "default_languages")]
-    pub languages: Vec<String>,
-
-    /// File patterns to ignore
-    #[serde(default = "default_ignore_patterns")]
-    pub ignore_patterns: Vec<String>,
-
-    /// Maximum file size to analyze (in bytes)
-    #[serde(default = "default_max_file_size")]
-    pub max_file_size: usize,
-
-    /// Minimum entropy threshold for secret detection
-    #[serde(default = "default_entropy_threshold")]
-    pub entropy_threshold: f64,
-
-    /// Minimum severity level to report
-    #[serde(default = "default_min_severity")]
-    pub min_severity: Severity,
-
-    /// Temporary directory for cloning repositories
-    pub temp_dir: Option<PathBuf>,
-}
-
-/// Output configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OutputConfig {
-    /// Output format
-    #[serde(default)]
-    pub format: OutputFormat,
-
-    /// Output file path (stdout if not specified)
-    pub output_path: Option<PathBuf>,
-
-    /// Include source code snippets in findings
-    #[serde(default = "default_true")]
-    pub include_snippets: bool,
-
-    /// Maximum snippet lines
-    #[serde(default = "default_snippet_lines")]
-    pub snippet_lines: usize,
-}
-
-/// Concurrency configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConcurrencyConfig {
-    /// Number of tokio worker threads (0 = auto)
-    #[serde(default)]
-    pub tokio_workers: usize,
-
-    /// Number of rayon threads for CPU-bound work (0 = auto)
-    #[serde(default)]
-    pub rayon_threads: usize,
-
-    /// Maximum concurrent repository clones
-    #[serde(default = "default_concurrent_clones")]
-    pub concurrent_clones: usize,
-
-    /// Channel buffer size for pipeline
-    #[serde(default = "default_channel_buffer")]
-    pub channel_buffer: usize,
-
-    /// Maximum files to process in a single parallel batch
-    /// (helps control memory usage for large repositories)
-    #[serde(default = "default_batch_size")]
-    pub batch_size: usize,
-}
-
-/// Output format enumeration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum OutputFormat {
-    /// SARIF (Static Analysis Results Interchange Format)
-    #[default]
-    Sarif,
-    /// JSON format
-    Json,
-    /// Human-readable text
-    Text,
-}
-
-// Default value functions
-fn default_github_api_url() -> String {
-    "https://api.github.com".to_string()
-}
-
-fn default_rate_limit_delay() -> u64 {
-    100
-}
-
-fn default_max_repos() -> usize {
-    100
-}
-
-fn default_true() -> bool {
-    true
-}
-
-fn default_languages() -> Vec<String> {
-    vec![
-        "rust".to_string(),
-        "python".to_string(),
-        "javascript".to_string(),
-        "go".to_string(),
-    ]
-}
-
-fn default_ignore_patterns() -> Vec<String> {
-    vec![
-        "**/target/**".to_string(),
-        "**/node_modules/**".to_string(),
-        "**/vendor/**".to_string(),
-        "**/.git/**".to_string(),
-        "**/dist/**".to_string(),
-        "**/build/**".to_string(),
-    ]
-}
-
-fn default_max_file_size() -> usize {
-    1024 * 1024 // 1 MB
-}
-
-fn default_entropy_threshold() -> f64 {
-    4.5
-}
-
-fn default_min_severity() -> Severity {
-    Severity::Low
-}
-
-fn default_snippet_lines() -> usize {
-    5
-}
-
-fn default_concurrent_clones() -> usize {
-    4
-}
-
-fn default_channel_buffer() -> usize {
-    100
-}
-
-fn default_batch_size() -> usize {
-    500 // Process files in batches to control memory
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            github: GitHubConfig::default(),
-            analysis: AnalysisConfig::default(),
-            output: OutputConfig::default(),
-            concurrency: ConcurrencyConfig::default(),
-        }
-    }
+    pub include_forks: bool,
+    pub include_archived: bool,
+    /// Repositories cloned and scanned at the same time in multi-repo scans.
+    pub concurrency: usize,
 }
 
 impl Default for GitHubConfig {
     fn default() -> Self {
         Self {
-            token: std::env::var("GITHUB_TOKEN").ok(),
-            api_url: default_github_api_url(),
-            rate_limit_delay_ms: default_rate_limit_delay(),
-            max_repos: default_max_repos(),
+            token: None,
+            api_url: "https://api.github.com".into(),
+            max_repos: 100,
+            include_forks: false,
+            include_archived: false,
+            concurrency: 4,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AnalysisConfig {
+    pub sast: bool,
+    pub secrets: bool,
+    pub sca: bool,
+    /// GitHub Actions workflow checks.
+    pub workflows: bool,
+    pub ai: bool,
+    /// Languages the SAST engine analyzes. Secrets are searched in every text file.
+    pub languages: Vec<String>,
+    /// Extra gitignore-style patterns to skip, relative to the scan root.
+    pub exclude: Vec<String>,
+    /// Files larger than this many bytes are skipped.
+    pub max_file_size: u64,
 }
 
 impl Default for AnalysisConfig {
     fn default() -> Self {
         Self {
-            enable_sast: true,
-            enable_sca: true,
-            enable_secrets: true,
-            enable_provenance: false,
-            enable_ai: false,
-            languages: default_languages(),
-            ignore_patterns: default_ignore_patterns(),
-            max_file_size: default_max_file_size(),
-            entropy_threshold: default_entropy_threshold(),
-            min_severity: default_min_severity(),
-            temp_dir: None,
+            sast: true,
+            secrets: true,
+            sca: true,
+            workflows: true,
+            ai: false,
+            languages: SUPPORTED_LANGUAGES.iter().map(|s| s.to_string()).collect(),
+            exclude: Vec::new(),
+            max_file_size: 1024 * 1024,
         }
     }
 }
 
-impl Default for OutputConfig {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ScaConfig {
+    /// osv-scanner executable name or path.
+    pub osv_scanner: String,
+    /// Extra arguments passed to `osv-scanner scan source`,
+    /// e.g. `["--offline-vulnerabilities", "--download-offline-databases"]`.
+    pub extra_args: Vec<String>,
+    pub timeout_secs: u64,
+}
+
+impl Default for ScaConfig {
     fn default() -> Self {
         Self {
-            format: OutputFormat::default(),
-            output_path: None,
-            include_snippets: true,
-            snippet_lines: default_snippet_lines(),
+            osv_scanner: "osv-scanner".into(),
+            extra_args: Vec::new(),
+            timeout_secs: 600,
         }
     }
 }
 
-impl Default for ConcurrencyConfig {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AiConfig {
+    /// OpenAI-compatible chat completions endpoint (LM Studio, Ollama, llama.cpp server, ...).
+    pub url: String,
+    pub model: String,
+    pub timeout_secs: u64,
+    /// Stop after this many files; local models are slow.
+    pub max_files: usize,
+}
+
+impl Default for AiConfig {
     fn default() -> Self {
         Self {
-            tokio_workers: 0,
-            rayon_threads: 0,
-            concurrent_clones: default_concurrent_clones(),
-            channel_buffer: default_channel_buffer(),
-            batch_size: default_batch_size(),
+            url: "http://localhost:1234/v1/chat/completions".into(),
+            model: "local-model".into(),
+            timeout_secs: 120,
+            max_files: 50,
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReportConfig {
+    /// Findings below this severity are left out of the report.
+    pub min_severity: Severity,
+    /// Exit with status 1 when any reported finding is at or above this severity.
+    pub fail_on: FailOn,
+}
+
+impl Default for ReportConfig {
+    fn default() -> Self {
+        Self {
+            min_severity: Severity::Low,
+            fail_on: FailOn(Some(Severity::High)),
+        }
+    }
+}
+
+/// A severity threshold, or `never` to always exit 0 when the scan completes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct FailOn(pub Option<Severity>);
+
+impl std::str::FromStr for FailOn {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        if s.trim().eq_ignore_ascii_case("never") {
+            Ok(FailOn(None))
+        } else {
+            s.parse::<Severity>().map(|sev| FailOn(Some(sev)))
+        }
+    }
+}
+
+impl TryFrom<String> for FailOn {
+    type Error = String;
+    fn try_from(s: String) -> std::result::Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
+impl From<FailOn> for String {
+    fn from(f: FailOn) -> String {
+        f.0.map_or("never".into(), |s| s.as_str().into())
     }
 }
 
 impl Config {
-    /// Load configuration from a TOML file.
-    pub fn from_file(path: &std::path::Path) -> crate::error::Result<Self> {
-        let content = std::fs::read_to_string(path)?;
-        let config: Config = toml::from_str(&content)?;
+    /// Load a TOML config file. Missing sections and keys fall back to defaults.
+    pub fn from_file(path: &Path) -> Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| Error::Config(format!("cannot read {}: {e}", path.display())))?;
+        let config: Config =
+            toml::from_str(&text).map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
+        config.validate()?;
         Ok(config)
     }
 
-    /// Create a configuration builder.
-    pub fn builder() -> ConfigBuilder {
-        ConfigBuilder::default()
+    /// Check values that serde cannot.
+    pub fn validate(&self) -> Result<()> {
+        for lang in &self.analysis.languages {
+            if !SUPPORTED_LANGUAGES.contains(&lang.as_str()) {
+                return Err(Error::Config(format!(
+                    "unsupported language '{lang}' (supported: {})",
+                    SUPPORTED_LANGUAGES.join(", ")
+                )));
+            }
+        }
+        if self.analysis.max_file_size == 0 {
+            return Err(Error::Config("max_file_size must be greater than 0".into()));
+        }
+        if self.github.max_repos == 0 {
+            return Err(Error::Config("max_repos must be greater than 0".into()));
+        }
+        if self.github.concurrency == 0 {
+            return Err(Error::Config("concurrency must be greater than 0".into()));
+        }
+        Ok(())
+    }
+
+    /// Environment variables override the AI defaults so existing LM Studio setups keep working.
+    pub fn apply_env(&mut self) {
+        let var = |names: &[&str]| names.iter().find_map(|n| std::env::var(n).ok());
+        if let Some(url) = var(&["GHAUDIT_AI_URL", "LMSTUDIO_URL"]) {
+            self.ai.url = url;
+        }
+        if let Some(model) = var(&["GHAUDIT_AI_MODEL", "LMSTUDIO_MODEL"]) {
+            self.ai.model = model;
+        }
+        if let Some(t) = var(&["GHAUDIT_AI_TIMEOUT_SECS", "LMSTUDIO_TIMEOUT_SECS"])
+            && let Ok(t) = t.parse()
+        {
+            self.ai.timeout_secs = t;
+        }
     }
 }
 
-/// Builder for creating configurations programmatically.
-#[derive(Debug, Default)]
-pub struct ConfigBuilder {
-    config: Config,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl ConfigBuilder {
-    pub fn github_token(mut self, token: impl Into<String>) -> Self {
-        self.config.github.token = Some(token.into());
-        self
+    #[test]
+    fn partial_file_uses_defaults() {
+        let c: Config = toml::from_str("[analysis]\nsca = false\n").unwrap();
+        assert!(!c.analysis.sca);
+        assert!(c.analysis.sast);
+        assert_eq!(c.report.fail_on, FailOn(Some(Severity::High)));
+        assert_eq!(c.github.api_url, "https://api.github.com");
     }
 
-    pub fn enable_sast(mut self, enable: bool) -> Self {
-        self.config.analysis.enable_sast = enable;
-        self
+    #[test]
+    fn unknown_keys_are_rejected() {
+        let err = toml::from_str::<Config>("[analysis]\nenable_sast = false\n").unwrap_err();
+        assert!(err.to_string().contains("enable_sast"));
+        assert!(toml::from_str::<Config>("[concurrency]\nrayon_threads = 4\n").is_err());
     }
 
-    pub fn enable_sca(mut self, enable: bool) -> Self {
-        self.config.analysis.enable_sca = enable;
-        self
+    #[test]
+    fn severities_parse_from_toml() {
+        let c: Config =
+            toml::from_str("[report]\nmin_severity = \"medium\"\nfail_on = \"critical\"\n")
+                .unwrap();
+        assert_eq!(c.report.min_severity, Severity::Medium);
+        assert_eq!(c.report.fail_on, FailOn(Some(Severity::Critical)));
+        let c: Config = toml::from_str("[report]\nfail_on = \"never\"\n").unwrap();
+        assert_eq!(c.report.fail_on, FailOn(None));
     }
 
-    pub fn enable_secrets(mut self, enable: bool) -> Self {
-        self.config.analysis.enable_secrets = enable;
-        self
+    #[test]
+    fn example_config_is_valid_and_documents_the_defaults() {
+        let example: Config = toml::from_str(include_str!("../ghaudit.example.toml")).unwrap();
+        example.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(&example).unwrap(),
+            serde_json::to_value(Config::default()).unwrap(),
+            "ghaudit.example.toml must show the real defaults"
+        );
     }
 
-    pub fn enable_provenance(mut self, enable: bool) -> Self {
-        self.config.analysis.enable_provenance = enable;
-        self
-    }
-
-    pub fn enable_ai(mut self, enable: bool) -> Self {
-        self.config.analysis.enable_ai = enable;
-        self
-    }
-
-    pub fn min_severity(mut self, severity: Severity) -> Self {
-        self.config.analysis.min_severity = severity;
-        self
-    }
-
-    pub fn output_format(mut self, format: OutputFormat) -> Self {
-        self.config.output.format = format;
-        self
-    }
-
-    pub fn output_path(mut self, path: PathBuf) -> Self {
-        self.config.output.output_path = Some(path);
-        self
-    }
-
-    pub fn temp_dir(mut self, path: PathBuf) -> Self {
-        self.config.analysis.temp_dir = Some(path);
-        self
-    }
-
-    pub fn languages(mut self, languages: Vec<String>) -> Self {
-        self.config.analysis.languages = languages;
-        self
-    }
-
-    pub fn max_repos(mut self, max: usize) -> Self {
-        self.config.github.max_repos = max;
-        self
-    }
-
-    pub fn build(self) -> Config {
-        self.config
+    #[test]
+    fn unsupported_language_is_an_error() {
+        let mut c = Config::default();
+        c.analysis.languages = vec!["cobol".into()];
+        assert!(c.validate().is_err());
     }
 }

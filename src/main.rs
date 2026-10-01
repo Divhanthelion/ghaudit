@@ -1,460 +1,431 @@
-//! sec_auditor - GitHub Security Analysis CLI
-//!
-//! A high-performance security analysis tool for GitHub repositories.
+//! ghaudit command-line interface.
 
-use clap::{Parser, Subcommand, ValueEnum};
-use sec_auditor::{
-    config::{Config, OutputFormat},
-    reporter::create_reporter,
-    ScanResult, Scanner, Severity,
-};
+use anyhow::{Context, bail};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use ghaudit::analyzer::{rules, workflows};
+use ghaudit::config::{Config, FailOn, SUPPORTED_LANGUAGES};
+use ghaudit::model::{ScanReport, Severity};
+use ghaudit::report::{self, Format};
+use ghaudit::scanner::Scanner;
+use ghaudit::target::{self, Target};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use tracing::{error, info, warn, Level};
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use std::process::ExitCode;
+use tracing_subscriber::EnvFilter;
 
-/// Maximum allowed output path depth to prevent path traversal.
-const MAX_OUTPUT_DEPTH: usize = 5;
+/// Exit status when findings meet the --fail-on threshold.
+const EXIT_FINDINGS: u8 = 1;
+/// Exit status for usage or runtime errors (clap also uses 2 for bad arguments).
+const EXIT_ERROR: u8 = 2;
+/// Exit status when the scan finished but part of it failed (e.g. osv-scanner missing).
+const EXIT_INCOMPLETE: u8 = 3;
+const EXIT_INTERRUPTED: u8 = 130;
 
-/// Validate output path for directory traversal attacks.
-///
-/// Ensures the path:
-/// 1. Is within the current working directory or below
-/// 2. Does not contain path traversal sequences (..)
-/// 3. Is not an absolute path pointing outside allowed areas
-fn validate_output_path(path: &Path) -> anyhow::Result<PathBuf> {
-    // Convert to absolute path to resolve any relative components
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-
-    // Canonicalize to resolve symlinks and normalize path
-    let canonical = match absolute.canonicalize() {
-        Ok(p) => p,
-        Err(_) => {
-            // Path may not exist yet, check parent directory
-            if let Some(parent) = absolute.parent() {
-                let canonical_parent = parent.canonicalize()?;
-                canonical_parent.join(absolute.file_name().unwrap_or_default())
-            } else {
-                return Err(anyhow::anyhow!(
-                    "Invalid output path: cannot canonicalize parent directory"
-                ));
-            }
-        }
-    };
-
-    // Check path depth to prevent deeply nested traversal
-    let depth = canonical.components().count();
-    if depth > MAX_OUTPUT_DEPTH + 3 {
-        // +3 accounts for prefix like C:\ on Windows or / on Unix
-        return Err(anyhow::anyhow!(
-            "Output path exceeds maximum allowed depth ({} components)",
-            MAX_OUTPUT_DEPTH
-        ));
-    }
-
-    // Verify no suspicious patterns remain after canonicalization
-    let path_str = canonical.to_string_lossy();
-    if path_str.contains("..") || path_str.contains("~") {
-        return Err(anyhow::anyhow!(
-            "Output path contains invalid characters after normalization"
-        ));
-    }
-
-    Ok(canonical)
-}
-
-/// Parse a severity string into a Severity enum.
-fn parse_severity(s: &str) -> Severity {
-    match s.to_lowercase().as_str() {
-        "critical" => Severity::Critical,
-        "high" => Severity::High,
-        "medium" => Severity::Medium,
-        "low" => Severity::Low,
-        "none" => Severity::None,
-        _ => Severity::Low, // Default to low
-    }
-}
-
-/// High-performance security analysis for GitHub repositories
 #[derive(Parser)]
-#[command(name = "sec_auditor")]
-#[command(author, version, about, long_about = None)]
+#[command(
+    name = "ghaudit",
+    version,
+    about = "Security scanner for GitHub repositories: risky code patterns, leaked secrets and vulnerable dependencies.",
+    after_help = "Exit status: 0 clean, 1 findings at or above --fail-on, 2 error, 3 scan incomplete.\nDocumentation: https://github.com/Divhanthelion/ghaudit"
+)]
 struct Cli {
-    /// Verbosity level (-v, -vv, -vvv)
-    #[arg(short, long, action = clap::ArgAction::Count)]
-    verbose: u8,
+    #[command(subcommand)]
+    command: Command,
 
-    /// Suppress all output except errors
-    #[arg(short, long)]
-    quiet: bool,
+    #[command(flatten)]
+    global: GlobalArgs,
+}
 
-    /// Output format
-    #[arg(short = 'f', long, default_value = "text")]
-    format: OutputFormatArg,
+#[derive(Args)]
+struct GlobalArgs {
+    /// Report format
+    #[arg(short = 'f', long, value_enum, default_value_t = Format::Text, global = true)]
+    format: Format,
 
-    /// Output file (stdout if not specified)
-    #[arg(short, long)]
+    /// Write the report to this file instead of stdout
+    #[arg(short = 'o', long, value_name = "FILE", global = true)]
     output: Option<PathBuf>,
 
-    /// GitHub token (or set GITHUB_TOKEN env var)
-    #[arg(long)]
-    token: Option<String>,
-
-    /// Configuration file
-    #[arg(short, long)]
+    /// TOML configuration file (see ghaudit.example.toml)
+    #[arg(short = 'c', long, value_name = "FILE", global = true)]
     config: Option<PathBuf>,
 
-    #[command(subcommand)]
-    command: Commands,
+    /// GitHub token, for private repositories, org/user/search scans and higher rate limits
+    #[arg(long, env = "GITHUB_TOKEN", hide_env_values = true, global = true)]
+    token: Option<String>,
+
+    /// When to color text output
+    #[arg(long, value_enum, default_value_t = ColorChoice::Auto, global = true)]
+    color: ColorChoice,
+
+    /// More log output on stderr (-v, -vv, -vvv)
+    #[arg(short, long, action = clap::ArgAction::Count, global = true)]
+    verbose: u8,
+
+    /// Only log errors
+    #[arg(short, long, global = true, conflicts_with = "verbose")]
+    quiet: bool,
 }
 
-#[derive(ValueEnum, Clone, Copy)]
-enum OutputFormatArg {
-    Text,
-    Json,
-    Sarif,
-}
-
-impl From<OutputFormatArg> for OutputFormat {
-    fn from(arg: OutputFormatArg) -> Self {
-        match arg {
-            OutputFormatArg::Text => OutputFormat::Text,
-            OutputFormatArg::Json => OutputFormat::Json,
-            OutputFormatArg::Sarif => OutputFormat::Sarif,
-        }
-    }
+#[derive(Clone, Copy, ValueEnum)]
+enum ColorChoice {
+    Auto,
+    Always,
+    Never,
 }
 
 #[derive(Subcommand)]
-enum Commands {
-    /// Scan a repository or local path
+enum Command {
+    /// Scan a local directory or one GitHub repository
+    #[command(after_help = "TARGET may be a directory (., ../app), owner/repo, or a GitHub URL.")]
     Scan {
-        /// Repository (owner/repo), URL, or local path
         target: String,
-
-        /// Enable SAST analysis
-        #[arg(long, default_value = "true")]
-        sast: bool,
-
-        /// Enable SCA (dependency) analysis
-        #[arg(long, default_value = "true")]
-        sca: bool,
-
-        /// Enable secret detection
-        #[arg(long, default_value = "true")]
-        secrets: bool,
-
-        /// Enable AI-driven analysis
-        #[arg(long)]
-        ai: bool,
-
-        /// Enable provenance verification
-        #[arg(long)]
-        provenance: bool,
-
-        /// Languages to analyze (comma-separated)
-        #[arg(long, default_value = "rust,python,javascript,go")]
-        languages: String,
-
-        /// Maximum file size to analyze (bytes)
-        #[arg(long, default_value = "1048576")]
-        max_file_size: usize,
-
-        /// Minimum severity to report
-        #[arg(long, default_value = "low")]
-        min_severity: String,
+        #[command(flatten)]
+        scan: ScanArgs,
     },
-
-    /// Scan all repositories in an organization
+    /// Scan the repositories of a GitHub organization
     Org {
-        /// Organization name
         name: String,
-
-        /// Maximum repositories to scan
-        #[arg(long, default_value = "100")]
-        max_repos: usize,
+        #[command(flatten)]
+        scan: ScanArgs,
+        #[command(flatten)]
+        multi: MultiArgs,
     },
-
-    /// Scan all repositories for a user
+    /// Scan the repositories owned by a GitHub user
     User {
-        /// Username
         name: String,
-
-        /// Maximum repositories to scan
-        #[arg(long, default_value = "100")]
-        max_repos: usize,
+        #[command(flatten)]
+        scan: ScanArgs,
+        #[command(flatten)]
+        multi: MultiArgs,
     },
-
-    /// Search and scan repositories
+    /// Scan repositories matching a GitHub search query (requires a token)
+    #[command(
+        after_help = "Example: ghaudit search 'topic:cli language:rust stars:>100' --max-repos 20"
+    )]
     Search {
-        /// Search query (GitHub search syntax)
         query: String,
-
-        /// Maximum repositories to scan
-        #[arg(long, default_value = "10")]
-        max_repos: usize,
+        #[command(flatten)]
+        scan: ScanArgs,
+        #[command(flatten)]
+        multi: MultiArgs,
     },
-
-    /// Verify supply chain provenance
-    Verify {
-        /// Path to Cargo.lock or package-lock.json
-        path: PathBuf,
-    },
-
-    /// Check rate limit status
+    /// List the built-in code rules
+    Rules,
+    /// Show the GitHub API rate limit for the current token
     RateLimit,
 }
 
-/// Initialize the logging subsystem based on CLI verbosity.
-fn setup_logging(verbose: u8, quiet: bool) {
-    let log_level = match (verbose, quiet) {
-        (_, true) => Level::ERROR,
-        (0, false) => Level::WARN,
-        (1, false) => Level::INFO,
-        (2, false) => Level::DEBUG,
-        _ => Level::TRACE,
-    };
+#[derive(Args, Default)]
+struct ScanArgs {
+    /// Skip code pattern analysis
+    #[arg(long)]
+    no_sast: bool,
 
-    tracing_subscriber::registry()
-        .with(fmt::layer().with_target(false))
-        .with(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new(log_level.to_string())),
-        )
-        .init();
+    /// Skip secret detection
+    #[arg(long)]
+    no_secrets: bool,
+
+    /// Skip dependency vulnerability scanning (osv-scanner)
+    #[arg(long)]
+    no_sca: bool,
+
+    /// Skip GitHub Actions workflow checks
+    #[arg(long)]
+    no_workflows: bool,
+
+    /// Also ask a local LLM to review source files (OpenAI-compatible endpoint, e.g. LM Studio)
+    #[arg(long)]
+    ai: bool,
+
+    /// Languages for code analysis (comma-separated)
+    #[arg(long, value_delimiter = ',', value_name = "LANG,...")]
+    languages: Option<Vec<String>>,
+
+    /// Skip paths matching this gitignore-style pattern (repeatable)
+    #[arg(long, value_name = "GLOB")]
+    exclude: Vec<String>,
+
+    /// Skip files larger than this many bytes
+    #[arg(long, value_name = "BYTES")]
+    max_file_size: Option<u64>,
+
+    /// Leave findings below this severity out of the report [info, low, medium, high, critical]
+    #[arg(long, value_name = "SEVERITY")]
+    min_severity: Option<Severity>,
+
+    /// Exit with status 1 if a finding is at or above this severity [default: high; or never]
+    #[arg(long, value_name = "SEVERITY")]
+    fail_on: Option<FailOn>,
 }
 
-/// Setup graceful shutdown signal handling.
-fn setup_shutdown_handler() -> Arc<AtomicBool> {
-    let shutdown_flag = Arc::new(AtomicBool::new(false));
-    let shutdown_flag_clone = shutdown_flag.clone();
+#[derive(Args, Default)]
+struct MultiArgs {
+    /// Maximum number of repositories to scan
+    #[arg(long, value_name = "N")]
+    max_repos: Option<usize>,
 
-    tokio::spawn(async move {
-        if let Err(e) = tokio::signal::ctrl_c().await {
-            error!("Failed to listen for shutdown signal: {}", e);
-            return;
+    /// Include forked repositories
+    #[arg(long)]
+    include_forks: bool,
+
+    /// Include archived repositories
+    #[arg(long)]
+    include_archived: bool,
+
+    /// Repositories to clone and scan at the same time
+    #[arg(long, value_name = "N")]
+    concurrency: Option<usize>,
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    init_logging(cli.global.verbose, cli.global.quiet);
+
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("error: cannot start async runtime: {e}");
+            return ExitCode::from(EXIT_ERROR);
         }
-
-        warn!("Received interrupt signal, initiating graceful shutdown...");
-        shutdown_flag_clone.store(true, Ordering::SeqCst);
-
-        // If we get a second signal, force exit
-        if let Ok(()) = tokio::signal::ctrl_c().await {
-            error!("Received second interrupt, forcing shutdown");
-            std::process::exit(130);
+    };
+    let outcome = runtime.block_on(async {
+        tokio::select! {
+            result = run(cli) => Some(result),
+            _ = tokio::signal::ctrl_c() => None,
         }
     });
+    // Dropping the scan future above removed temporary clones and killed child
+    // processes; don't wait for in-flight file analysis threads.
+    runtime.shutdown_background();
 
-    shutdown_flag
+    match outcome {
+        None => {
+            eprintln!("interrupted");
+            ExitCode::from(EXIT_INTERRUPTED)
+        }
+        Some(Ok(code)) => ExitCode::from(code),
+        Some(Err(e)) => {
+            eprintln!("error: {e:#}");
+            ExitCode::from(EXIT_ERROR)
+        }
+    }
 }
 
-/// Load and merge configuration from file and CLI options.
-fn load_config(cli: &Cli) -> anyhow::Result<Config> {
-    let mut config = if let Some(ref config_path) = &cli.config {
-        Config::from_file(config_path)?
-    } else {
-        Config::default()
+async fn run(cli: Cli) -> anyhow::Result<u8> {
+    let g = &cli.global;
+    let mut config = match &g.config {
+        Some(path) => Config::from_file(path)?,
+        None => Config::default(),
     };
-
-    // Override with CLI options
-    if let Some(ref token) = cli.token {
-        config.github.token = Some(token.clone());
-    }
-    config.output.format = cli.format.into();
-    config.output.output_path = cli.output.clone();
-
-    Ok(config)
-}
-
-/// Execute the scan command with the given configuration.
-async fn execute_scan(
-    config: &Config,
-    target: String,
-    sast: bool,
-    sca: bool,
-    secrets: bool,
-    ai: bool,
-    provenance: bool,
-    languages: String,
-    max_file_size: usize,
-    min_severity: String,
-) -> anyhow::Result<ScanResult> {
-    let mut scan_config = config.clone();
-    scan_config.analysis.enable_sast = sast;
-    scan_config.analysis.enable_sca = sca;
-    scan_config.analysis.enable_secrets = secrets;
-    scan_config.analysis.enable_ai = ai;
-    scan_config.analysis.enable_provenance = provenance;
-    scan_config.analysis.languages = languages
-        .split(',')
-        .map(|s| s.trim().to_lowercase())
-        .collect();
-    scan_config.analysis.max_file_size = max_file_size;
-    let min_sev = parse_severity(&min_severity);
-    scan_config.analysis.min_severity = min_sev;
-
-    let scanner = Scanner::new(scan_config)?;
-    let mut result = scanner.scan_repository(&target).await?;
-    result.findings.retain(|f| f.severity >= min_sev);
-
-    Ok(result)
-}
-
-/// Execute organization scan.
-async fn execute_org_scan(config: &Config, name: String, max_repos: usize) -> anyhow::Result<ScanResult> {
-    let mut org_config = config.clone();
-    org_config.github.max_repos = max_repos;
-    let scanner = Scanner::new(org_config)?;
-    Ok(scanner.scan_repository(&format!("org:{}", name)).await?)
-}
-
-/// Execute user scan.
-async fn execute_user_scan(config: &Config, name: String, max_repos: usize) -> anyhow::Result<ScanResult> {
-    let mut user_config = config.clone();
-    user_config.github.max_repos = max_repos;
-    let scanner = Scanner::new(user_config)?;
-    Ok(scanner.scan_repository(&format!("user:{}", name)).await?)
-}
-
-/// Execute search scan.
-async fn execute_search(config: &Config, query: String, max_repos: usize) -> anyhow::Result<ScanResult> {
-    let mut search_config = config.clone();
-    search_config.github.max_repos = max_repos;
-    let scanner = Scanner::new(search_config)?;
-    Ok(scanner.scan_repository(&query).await?)
-}
-
-/// Execute provenance verification.
-async fn execute_verify(scanner: &Scanner, path: PathBuf) -> anyhow::Result<ScanResult> {
-    let findings = scanner.verify_provenance(&path).await?;
-    let mut result = sec_auditor::ScanResult::new(path.display().to_string());
-    for finding in findings {
-        result.add_finding(finding);
-    }
-    Ok(result)
-}
-
-/// Check GitHub rate limit status.
-async fn check_rate_limit(config: &Config) -> anyhow::Result<()> {
-    if config.github.token.is_none() {
-        error!("GitHub token required for rate limit check");
-        std::process::exit(1);
+    config.apply_env();
+    if let Some(token) = g.token.clone().filter(|t| !t.is_empty()) {
+        config.github.token = Some(token);
     }
 
-    let github = sec_auditor::crawler::GitHubClient::new(config.github.clone())?;
-    let status = github.check_rate_limit().await?;
+    let (target, scan_args, multi) = match cli.command {
+        Command::Rules => {
+            print_rules(g.format)?;
+            return Ok(0);
+        }
+        Command::RateLimit => {
+            let scanner = Scanner::new(config)?;
+            let rl = scanner.github().rate_limit().await?;
+            let reset = chrono::DateTime::from_timestamp(rl.reset as i64, 0)
+                .map(|t| t.format("%H:%M:%S UTC").to_string())
+                .unwrap_or_default();
+            let auth = if scanner.github().has_token() {
+                "authenticated"
+            } else {
+                "unauthenticated"
+            };
+            println!(
+                "{} of {} requests remaining ({auth}); resets at {reset}",
+                rl.remaining, rl.limit
+            );
+            return Ok(0);
+        }
+        Command::Scan { target, scan } => (
+            target::parse_scan_target(&target)?,
+            scan,
+            MultiArgs::default(),
+        ),
+        Command::Org { name, scan, multi } => (Target::Org(owner(&name)?), scan, multi),
+        Command::User { name, scan, multi } => (Target::User(owner(&name)?), scan, multi),
+        Command::Search { query, scan, multi } => (Target::Search(query), scan, multi),
+    };
+    apply_scan_args(&mut config, scan_args, multi)?;
+    let fail_on = config.report.fail_on;
 
-    println!("GitHub API Rate Limit Status:");
-    println!("  Limit: {}", status.limit);
-    println!("  Remaining: {}", status.remaining);
-    println!("  Reset in: {}s", status.seconds_until_reset());
+    // Fail on an unwritable output path now, not after a long scan.
+    let output = g.output.as_deref().map(prepare_output).transpose()?;
 
-    if status.is_limited() {
-        println!("\nWarning: You are currently rate limited!");
+    let scanner = Scanner::new(config)?;
+    let report = scanner.scan(&target).await?;
+
+    match output {
+        Some((file, path)) => {
+            let text = report::render(&report, g.format, false);
+            write_output(file, &path, &text)?;
+            tracing::info!("report written to {}", path.display());
+        }
+        None => write_stdout(&report, g.format, g.color)?,
     }
 
+    Ok(exit_code(&report, fail_on))
+}
+
+fn exit_code(report: &ScanReport, fail_on: FailOn) -> u8 {
+    if let FailOn(Some(threshold)) = fail_on
+        && report.count_at_least(threshold) > 0
+    {
+        return EXIT_FINDINGS;
+    }
+    if report.is_complete() {
+        0
+    } else {
+        EXIT_INCOMPLETE
+    }
+}
+
+fn owner(name: &str) -> anyhow::Result<String> {
+    if !target::valid_owner(name) {
+        bail!("'{name}' is not a valid GitHub user or organization name");
+    }
+    Ok(name.to_string())
+}
+
+fn apply_scan_args(config: &mut Config, scan: ScanArgs, multi: MultiArgs) -> anyhow::Result<()> {
+    let a = &mut config.analysis;
+    a.sast &= !scan.no_sast;
+    a.secrets &= !scan.no_secrets;
+    a.sca &= !scan.no_sca;
+    a.workflows &= !scan.no_workflows;
+    a.ai |= scan.ai;
+    if let Some(langs) = scan.languages {
+        a.languages = langs
+            .into_iter()
+            .map(|l| l.trim().to_ascii_lowercase())
+            .filter(|l| !l.is_empty())
+            .collect();
+    }
+    a.exclude.extend(scan.exclude);
+    if let Some(size) = scan.max_file_size {
+        a.max_file_size = size;
+    }
+    if let Some(sev) = scan.min_severity {
+        config.report.min_severity = sev;
+    }
+    if let Some(f) = scan.fail_on {
+        config.report.fail_on = f;
+    }
+    let gh = &mut config.github;
+    if let Some(n) = multi.max_repos {
+        gh.max_repos = n;
+    }
+    gh.include_forks |= multi.include_forks;
+    gh.include_archived |= multi.include_archived;
+    if let Some(n) = multi.concurrency {
+        gh.concurrency = n;
+    }
+    if !(config.analysis.sast
+        || config.analysis.secrets
+        || config.analysis.sca
+        || config.analysis.workflows
+        || config.analysis.ai)
+    {
+        bail!("every analyzer is disabled; nothing to do");
+    }
+    config.validate().context("invalid options")?;
     Ok(())
 }
 
-/// Exit with appropriate code based on findings.
-fn exit_with_findings(result: &ScanResult) -> ! {
-    let critical = result
-        .findings
-        .iter()
-        .filter(|f| {
-            matches!(
-                f.severity,
-                sec_auditor::Severity::Critical | sec_auditor::Severity::High
-            )
-        })
-        .count();
-
-    if critical > 0 {
-        std::process::exit(1);
+/// Create a temporary file next to the destination; it is renamed into place once the
+/// report is complete, so a failed scan never leaves a truncated report behind.
+fn prepare_output(path: &Path) -> anyhow::Result<(tempfile::NamedTempFile, PathBuf)> {
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    if path.is_dir() {
+        bail!("output path {} is a directory", path.display());
     }
-    std::process::exit(0);
+    let file = tempfile::NamedTempFile::new_in(&parent)
+        .with_context(|| format!("cannot write to directory {}", parent.display()))?;
+    Ok((file, path.to_path_buf()))
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .expect("Failed to install rustls crypto provider");
+fn write_output(mut file: tempfile::NamedTempFile, path: &Path, text: &str) -> anyhow::Result<()> {
+    file.write_all(text.as_bytes())?;
+    file.persist(path)
+        .with_context(|| format!("cannot write {}", path.display()))?;
+    Ok(())
+}
 
-    let cli = Cli::parse();
+fn write_stdout(report: &ScanReport, format: Format, color: ColorChoice) -> anyhow::Result<()> {
+    let text = report::render(report, format, format == Format::Text);
+    let choice = match color {
+        ColorChoice::Auto => anstream::ColorChoice::Auto,
+        ColorChoice::Always => anstream::ColorChoice::Always,
+        ColorChoice::Never => anstream::ColorChoice::Never,
+    };
+    // anstream strips the escape codes when stdout is not a terminal, NO_COLOR is
+    // set, or --color never was given, and enables them on Windows consoles.
+    let mut out = anstream::AutoStream::new(std::io::stdout().lock(), choice);
+    match out.write_all(text.as_bytes()).and_then(|_| out.flush()) {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()), // e.g. `| head`
+        other => Ok(other?),
+    }
+}
 
-    setup_logging(cli.verbose, cli.quiet);
-    let shutdown_flag = setup_shutdown_handler();
-    let config = load_config(&cli)?;
-
-    if shutdown_flag.load(Ordering::SeqCst) {
-        warn!("Shutdown requested before scan started");
+fn print_rules(format: Format) -> anyhow::Result<()> {
+    let code: Vec<&rules::Rule> = rules::all().collect();
+    if format != Format::Text {
+        let mut json: Vec<serde_json::Value> = code
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.id, "kind": "code", "name": r.name, "severity": r.severity, "confidence": r.confidence,
+                    "cwe": r.cwe, "description": r.message, "remediation": r.remediation,
+                })
+            })
+            .collect();
+        json.extend(workflows::RULES.iter().map(|r| {
+            serde_json::json!({ "id": r.id, "kind": "workflow", "name": r.name, "severity": r.severity })
+        }));
+        println!("{}", serde_json::to_string_pretty(&json)?);
         return Ok(());
     }
-
-    let scanner = Scanner::new(config.clone())?;
-
-    // Extract output config before consuming config in match
-    let output_format = config.output.format.clone();
-    let output_path = config.output.output_path.clone();
-
-    let result = match cli.command {
-        Commands::Scan {
-            target,
-            sast,
-            sca,
-            secrets,
-            ai,
-            provenance,
-            languages,
-            max_file_size,
-            min_severity,
-        } => {
-            execute_scan(
-                &config,
-                target,
-                sast,
-                sca,
-                secrets,
-                ai,
-                provenance,
-                languages,
-                max_file_size,
-                min_severity,
-            )
-            .await?
-        }
-        Commands::Org { name, max_repos } => execute_org_scan(&config, name, max_repos).await?,
-        Commands::User { name, max_repos } => execute_user_scan(&config, name, max_repos).await?,
-        Commands::Search { query, max_repos } => execute_search(&config, query, max_repos).await?,
-        Commands::Verify { path } => execute_verify(&scanner, path).await?,
-        Commands::RateLimit => {
-            check_rate_limit(&config).await?;
-            return Ok(());
-        }
-    };
-
-    let reporter = create_reporter(output_format);
-    let report = reporter.generate(&result);
-
-    // Output report using extracted path
-    if let Some(ref path) = output_path {
-        let validated_path = validate_output_path(path)?;
-        let mut temp_file = tempfile::NamedTempFile::new_in(
-            validated_path.parent().unwrap_or_else(|| Path::new("."))
-        )?;
-        temp_file.write_all(report.as_bytes())?;
-        temp_file.persist(&validated_path)?;
-        info!("Report written to: {}", validated_path.display());
-    } else {
-        println!("{}", report);
+    println!("{:<34} {:<9} NAME", "RULE", "SEVERITY");
+    for r in &code {
+        println!("{:<34} {:<9} {}", r.id, r.severity.as_str(), r.name);
     }
+    for r in workflows::RULES {
+        println!("{:<34} {:<9} {}", r.id, r.severity.as_str(), r.name);
+    }
+    println!(
+        "\n{} code rules for {}, {} GitHub Actions workflow checks. Secret, dependency and hidden-Unicode checks are described in the README.",
+        code.len(),
+        SUPPORTED_LANGUAGES.join(", "),
+        workflows::RULES.len()
+    );
+    Ok(())
+}
 
-    exit_with_findings(&result);
+fn init_logging(verbose: u8, quiet: bool) {
+    let level = match (quiet, verbose) {
+        (true, _) => "error",
+        (false, 0) => "warn",
+        (false, 1) => "info",
+        (false, 2) => "debug",
+        _ => "trace",
+    };
+    let filter = EnvFilter::try_from_env("GHAUDIT_LOG")
+        .unwrap_or_else(|_| EnvFilter::new(format!("ghaudit={level},warn")));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .without_time()
+        .init();
 }

@@ -1,73 +1,32 @@
-//! Error types for the security auditor application.
+//! Error type for the library.
 
 use thiserror::Error;
 
-/// Main error type for the security auditor.
 #[derive(Error, Debug)]
-pub enum AuditorError {
-    #[error("GitHub API error: {0}")]
+pub enum Error {
+    #[error("invalid target '{0}': expected a local path, owner/repo, or a github.com URL")]
+    InvalidTarget(String),
+
+    #[error("a GitHub token is required for {0} (set GITHUB_TOKEN or pass --token)")]
+    TokenRequired(&'static str),
+
+    #[error("GitHub API: {0}")]
     GitHub(String),
 
-    #[error("Git operation failed: {0}")]
-    Git(#[from] git2::Error),
+    #[error("git: {0}")]
+    Git(String),
 
-    #[error("Failed to clone repository: {0}")]
-    Clone(String),
-
-    #[error("Analysis error: {0}")]
-    Analysis(String),
-
-    #[error("Tree-sitter parsing error: {0}")]
-    Parse(String),
-
-    #[error("OSV query failed: {0}")]
-    Osv(String),
-
-    #[error("Sigstore verification failed: {0}")]
-    Sigstore(String),
-
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-
-    #[error("Serialization error: {0}")]
-    Serialization(#[from] serde_json::Error),
-
-    #[error("TOML parsing error: {0}")]
-    Toml(#[from] toml::de::Error),
-
-    #[error("HTTP request failed: {0}")]
-    Http(#[from] reqwest::Error),
-
-    #[error("URL parse error: {0}")]
-    Url(#[from] url::ParseError),
-
-    #[error("Configuration error: {0}")]
+    #[error("configuration: {0}")]
     Config(String),
 
-    #[error("Rate limited: retry after {0} seconds")]
-    RateLimited(u64),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
 
-    #[error("Repository not found: {0}")]
-    NotFound(String),
+    #[error(transparent)]
+    Http(#[from] reqwest::Error),
 
-    #[error("Authentication required")]
-    AuthRequired,
-
-    #[error("Invalid Cargo.lock format: {0}")]
-    CargoLock(String),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
 }
 
-/// Result type alias for auditor operations.
-pub type Result<T> = std::result::Result<T, AuditorError>;
-
-impl From<octocrab::Error> for AuditorError {
-    fn from(err: octocrab::Error) -> Self {
-        AuditorError::GitHub(err.to_string())
-    }
-}
-
-impl From<cargo_lock::Error> for AuditorError {
-    fn from(err: cargo_lock::Error) -> Self {
-        AuditorError::CargoLock(err.to_string())
-    }
-}
+pub type Result<T> = std::result::Result<T, Error>;
