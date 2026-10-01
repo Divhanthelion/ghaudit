@@ -1,6 +1,7 @@
 # ghaudit
 
 [![CI](https://github.com/Divhanthelion/ghaudit/actions/workflows/ci.yml/badge.svg)](https://github.com/Divhanthelion/ghaudit/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Divhanthelion/ghaudit)](https://github.com/Divhanthelion/ghaudit/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A security scanner for GitHub repositories. Point it at a local checkout, a single
@@ -124,17 +125,34 @@ report still lists what failed.
 ### In GitHub Actions
 
 ```yaml
-- name: Install ghaudit and osv-scanner
-  run: |
-    cargo install --git https://github.com/Divhanthelion/ghaudit
-    go install github.com/google/osv-scanner/v2/cmd/osv-scanner@latest
-    echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-- name: Scan
-  run: ghaudit scan . -f sarif -o ghaudit.sarif --fail-on never
-- uses: github/codeql-action/upload-sarif@v3
-  with:
-    sarif_file: ghaudit.sarif
+permissions:
+  contents: read
+  security-events: write # upload SARIF to code scanning
+
+steps:
+  - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    with:
+      persist-credentials: false
+  - name: Install ghaudit (verifying its build provenance) and osv-scanner
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: v0.2.0
+    run: |
+      archive="ghaudit-$VERSION-x86_64-unknown-linux-gnu.tar.gz"
+      gh release download "$VERSION" -R Divhanthelion/ghaudit -p "$archive"
+      gh attestation verify "$archive" -R Divhanthelion/ghaudit
+      tar xzf "$archive" && sudo mv "${archive%.tar.gz}/ghaudit" /usr/local/bin/
+      go install github.com/google/osv-scanner/v2/cmd/osv-scanner@v2.6.0
+      echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+  - name: Scan
+    run: ghaudit scan . -f sarif -o ghaudit.sarif --fail-on never
+  - uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4
+    with:
+      sarif_file: ghaudit.sarif
 ```
+
+Drop `--fail-on never` to make the job fail on high-severity findings instead of only
+reporting them.
 
 The SARIF output has stable fingerprints, so alerts are tracked across runs instead of
 reopening. It also carries `security-severity` scores, so GitHub labels alerts
