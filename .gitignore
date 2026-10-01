@@ -1,20 +1,17 @@
 /target
-/reports
 
-# Local settings
+# Reports produced while testing
+*.sarif
+/report.json
+
+# Local settings and secrets
 .claude/
-
-# Research notes
-*.md
-!README.md
-!SECURITY_AUDIT.md
-
-# GH_Audit hygiene
-.DS_Store
 .env
 .env.*
 !.env.example
-__pycache__/
-*.pyc
-target/
-dist/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

@@ -1,0 +1,2298 @@
+{
+ "results": [
+  {
+   "source": {
+    "path": "__ROOT__/Cargo.lock",
+    "type": "lockfile"
+   },
+   "packages": [
+    {
+     "package": {
+      "name": "demo",
+      "version": "0.1.0",
+      "ecosystem": "crates.io"
+     }
+    },
+    {
+     "package": {
+      "name": "smallvec",
+      "version": "0.6.9",
+      "ecosystem": "crates.io"
+     },
+     "groups": [
+      {
+       "ids": [
+        "RUSTSEC-2018-0018",
+        "GHSA-55m5-whcv-c49c",
+        "GHSA-66p5-j55p-32r9"
+       ],
+       "aliases": [
+        "CVE-2018-25023",
+        "GHSA-55m5-whcv-c49c",
+        "GHSA-66p5-j55p-32r9",
+        "RUSTSEC-2018-0018"
+       ],
+       "max_severity": "7.5"
+      },
+      {
+       "ids": [
+        "RUSTSEC-2019-0009",
+        "GHSA-mm7v-vpv8-xfc3"
+       ],
+       "aliases": [
+        "CVE-2019-15551",
+        "GHSA-mm7v-vpv8-xfc3",
+        "RUSTSEC-2019-0009"
+       ],
+       "max_severity": "9.8"
+      },
+      {
+       "ids": [
+        "RUSTSEC-2019-0012",
+        "GHSA-69gw-hgj3-45m7"
+       ],
+       "aliases": [
+        "CVE-2019-15554",
+        "GHSA-69gw-hgj3-45m7",
+        "RUSTSEC-2019-0012"
+       ],
+       "max_severity": "9.8"
+      },
+      {
+       "ids": [
+        "RUSTSEC-2021-0003",
+        "GHSA-43w2-9j62-hq99"
+       ],
+       "aliases": [
+        "CVE-2021-25900",
+        "GHSA-43w2-9j62-hq99",
+        "RUSTSEC-2021-0003"
+       ],
+       "max_severity": "9.8"
+      }
+     ],
+     "vulnerabilities": [
+      {
+       "affected": [
+        {
+         "database_specific": {
+          "categories": [],
+          "cvss": null,
+          "informational": "unsound",
+          "source": "https://github.com/rustsec/advisory-db/blob/osv/crates/RUSTSEC-2018-0018.json"
+         },
+         "package": {
+          "ecosystem": "crates.io",
+          "name": "smallvec",
+          "purl": "pkg:cargo/smallvec"
+         },
+         "ranges": [
+          {
+           "events": [
+            {
+             "introduced": "0.0.0-0"
+            },
+            {
+             "fixed": "0.6.13"
+            }
+           ],
+           "type": "SEMVER"
+          }
+         ]
+        }
+       ],
+       "aliases": [
+        "CVE-2018-25023",
+        "GHSA-55m5-whcv-c49c",
+        "GHSA-66p5-j55p-32r9"
+       ],
+       "database_specific": {
+        "license": "CC0-1.0"
+       },
+       "details": "Affected versions of this crate called `mem::uninitialized()` to create values of a user-supplied type `T`.\nThis is unsound e.g. if `T` is a reference type (which must be non-null and thus may not remain uninitialized).\n \nThe flaw was corre",
+       "id": "RUSTSEC-2018-0018",
+       "modified": "2023-11-08T04:00:14.788260Z",
+       "published": "2018-09-25T12:00:00Z",
+       "references": [
+        {
+         "type": "PACKAGE",
+         "url": "https://crates.io/crates/smallvec"
+        },
+        {
+         "type": "ADVISORY",
+         "url": "https://rustsec.org/advisories/RUSTSEC-2018-0018.html"
+        }
+       ],
+       "schema_version": "1.7.3",
+       "summary": "smallvec creates uninitialized value of any type"
+      },
+      {
+       "affected": [
+        {
+         "database_specific": {
+          "categories": [],
+          "cvss": "CVSS:3.0/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+          "informational": null,
+          "source": "https://github.com/rustsec/advisory-db/blob/osv/crates/RUSTSEC-2019-0009.json"
+         },
+         "package": {
+          "ecosystem": "crates.io",
+          "name": "smallvec",
+          "purl": "pkg:cargo/smallvec"
+         },
+         "ranges": [
+          {
+           "events": [
+            {
+             "introduced": "0.6.5"
+            },
+            {
+             "fixed": "0.6.10"
+            }
+           ],
+           "type": "SEMVER"
+          }
+         ]
+        }
+       ],
+       "aliases": [
+        "CVE-2019-15551",
+        "GHSA-mm7v-vpv8-xfc3"
+       ],
+       "database_specific": {
+        "license": "CC0-1.0"
+       },
+       "details": "Attempting to call `grow` on a spilled SmallVec with a value equal to the current capacity causes it to free the existing data. This performs a double free immediately and may lead to use-after-free on subsequent accesses to the SmallVec co",
+       "id": "RUSTSEC-2019-0009",
+       "modified": "2026-07-17T16:00:03.204193636Z",
+       "published": "2019-06-06T12:00:00Z",
+       "references": [
+        {
+         "type": "PACKAGE",
+         "url": "https://crates.io/crates/smallvec"
+        },
+        {
+         "type": "ADVISORY",
+         "url": "https://rustsec.org/advisories/RUSTSEC-2019-0009.html"
+        }
+       ],
+       "schema_version": "1.7.5",
+       "severity": [
+        {
+         "score": "CVSS:3.0/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+         "type": "CVSS_V3"
+        }
+       ],
+       "summary": "Double-free and use-after-free in SmallVec::grow()"
+      },
+      {
+       "affected": [
+        {
+         "database_specific": {
+          "categories": [
+           "code-execution",
+           "memory-corruption"
+          ],
+          "cvss": "CVSS:3.0/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+          "informational": null,
+          "source": "https://github.com/rustsec/advisory-db/blob/osv/crates/RUSTSEC-2019-0012.json"
+         },
+         "package": {
+          "ecosystem": "crates.io",
+          "name": "smallvec",
+          "purl": "pkg:cargo/smallvec"
+         },
+         "ranges": [
+          {
+           "events": [
+            {
+             "introduced": "0.6.3"
+            },
+            {
+             "fixed": "0.6.10"
+            }
+           ],
+           "type": "SEMVER"
+          }
+         ]
+        }
+       ],
+       "aliases": [
+        "CVE-2019-15554",
+        "GHSA-69gw-hgj3-45m7"
+       ],
+       "database_specific": {
+        "license": "CC0-1.0"
+       },
+       "details": "Attempting to call `grow` on a spilled SmallVec with a value less than the current capacity causes corruption of memory allocator data structures.\n\nAn attacker that controls the value passed to `grow` may exploit this flaw to obtain memory ",
+       "id": "RUSTSEC-2019-0012",
+       "modified": "2026-07-17T16:00:03.225430317Z",
+       "published": "2019-07-19T12:00:00Z",
+       "references": [
+        {
+         "type": "PACKAGE",
+         "url": "https://crates.io/crates/smallvec"
+        },
+        {
+         "type": "ADVISORY",
+         "url": "https://rustsec.org/advisories/RUSTSEC-2019-0012.html"
+        }
+       ],
+       "schema_version": "1.7.5",
+       "severity": [
+        {
+         "score": "CVSS:3.0/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+         "type": "CVSS_V3"
+        }
+       ],
+       "summary": "Memory corruption in SmallVec::grow()"
+      },
+      {
+       "affected": [
+        {
+         "database_specific": {
+          "categories": [
+           "memory-corruption"
+          ],
+          "cvss": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+          "informational": null,
+          "source": "https://github.com/rustsec/advisory-db/blob/osv/crates/RUSTSEC-2021-0003.json"
+         },
+         "package": {
+          "ecosystem": "crates.io",
+          "name": "smallvec",
+          "purl": "pkg:cargo/smallvec"
+         },
+         "ranges": [
+          {
+           "events": [
+            {
+             "introduced": "0.6.3"
+            },
+            {
+             "fixed": "0.6.14"
+            },
+            {
+             "introduced": "1.0.0"
+            },
+            {
+             "fixed": "1.6.1"
+            }
+           ],
+           "type": "SEMVER"
+          }
+         ]
+        }
+       ],
+       "aliases": [
+        "CVE-2021-25900",
+        "GHSA-43w2-9j62-hq99"
+       ],
+       "database_specific": {
+        "license": "CC0-1.0"
+       },
+       "details": "A bug in the `SmallVec::insert_many` method caused it to allocate a buffer that was smaller than needed.  It then wrote past the end of the buffer, causing a buffer overflow and memory corruption on the heap.\n\nThis bug was only triggered if",
+       "id": "RUSTSEC-2021-0003",
+       "modified": "2026-07-17T16:00:03.208176448Z",
+       "published": "2021-01-08T12:00:00Z",
+       "references": [
+        {
+         "type": "PACKAGE",
+         "url": "https://crates.io/crates/smallvec"
+        },
+        {
+         "type": "ADVISORY",
+         "url": "https://rustsec.org/advisories/RUSTSEC-2021-0003.html"
+        }
+       ],
+       "schema_version": "1.7.5",
+       "severity": [
+        {
+         "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+         "type": "CVSS_V3"
+        }
+       ],
+       "summary": "Buffer overflow in SmallVec::insert_many"
+      },
+      {
+       "affected": [
+        {
+         "database_specific": {
+          "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2022/05/GHSA-43w2-9j62-hq99/GHSA-43w2-9j62-hq99.json"
+         },
+         "package": {
+          "ecosystem": "crates.io",
+          "name": "smallvec",
+          "purl": "pkg:cargo/smallvec"
+         },
+         "ranges": [
+          {
+           "events": [
+            {
+             "introduced": "0.6.3"
+            },
+            {
+             "fixed": "0.6.14"
+            }
+           ],
+           "type": "SEMVER"
+          }
+         ]
+        },
+        {
+         "database_specific": {
+          "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2022/05/GHSA-43w2-9j62-hq99/GHSA-43w2-9j62-hq99.json"
+         },
+         "package": {
+          "ecosystem": "crates.io",
+          "name": "smallvec",
+          "purl": "pkg:cargo/smallvec"
+         },
+         "ranges": [
+          {
+           "events": [
+            {
+             "introduced": "1.0.0"
+            },
+            {
+             "fixed": "1.6.1"
+            }
+           ],
+           "type": "SEMVER"
+          }
+         ]
+        }
+       ],
+       "aliases": [
+        "CVE-2021-25900",
+        "RUSTSEC-2021-0003"
+       ],
+       "database_specific": {
+        "cwe_ids": [
+         "CWE-787"
+        ],
+        "github_reviewed": true,
+        "github_reviewed_at": "2022-06-17T00:20:48Z",
+        "nvd_published_at": "2021-01-26T18:16:00Z",
+        "severity": "CRITICAL"
+       },
+       "details": "A bug in the SmallVec::insert_many method caused it to allocate a buffer that was smaller than needed. It then wrote past the end of the buffer, causing a buffer overflow and memory corruption on the heap. This bug was only triggered if the",
+       "id": "GHSA-43w2-9j62-hq99",
+       "modified": "2023-11-08T04:05:16.493284Z",
+       "published": "2022-05-24T17:40:21Z",
+       "references": [
+        {
+         "type": "ADVISORY",
+         "url": "https://nvd.nist.gov/vuln/detail/CVE-2021-25900"
+        },
+        {
+         "type": "WEB",
+         "url": "https://github.com/servo/rust-smallvec/issues/252"
+        }
+       ],
+       "schema_version": "1.9.0",
+       "severity": [
+        {
+         "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+         "type": "CVSS_V3"
+        }
+       ],
+       "summary": "Buffer overflow in SmallVec::insert_many"
+      },
+      {
+       "affected": [
+        {
+         "database_specific": {
+          "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2022/01/GHSA-55m5-whcv-c49c/GHSA-55m5-whcv-c49c.json"
+         },
+         "package": {
+          "ecosystem": "crates.io",
+          "name": "smallvec",
+          "purl": "pkg:cargo/smallvec"
+         },
+         "ranges": [
+          {
+           "events": [
+            {
+             "introduced": "0"
+            },
+            {
+             "fixed": "0.6.13"
+            }
+           ],
+           "type": "SEMVER"
+          }
+         ]
+        }
+       ],
+       "aliases": [
+        "CVE-2018-25023",
+        "GHSA-66p5-j55p-32r9",
+        "RUSTSEC-2018-0018"
+       ],
+       "database_specific": {
+        "cwe_ids": [
+         "CWE-908"
+        ],
+        "github_reviewed": true,
+        "github_reviewed_at": "2022-01-06T18:40:05Z",
+        "nvd_published_at": "2021-12-27T00:15:00Z",
+        "severity": "HIGH"
+       },
+       "details": "Affected versions of this crate called mem::uninitialized() to create values of a user-supplied type T. This is unsound e.g. if T is a reference type (which must be non-null and thus may not remain uninitialized). The flaw was corrected by ",
+       "id": "GHSA-55m5-whcv-c49c",
+       "modified": "2023-11-08T04:00:14.788260Z",
+       "published": "2022-01-06T22:20:28Z",
+       "references": [
+        {
+         "type": "ADVISORY",
+         "url": "https://nvd.nist.gov/vuln/detail/CVE-2018-25023"
+        },
+        {
+         "type": "WEB",
+         "url": "https://github.com/servo/rust-smallvec/issues/126"
+        }
+       ],
+       "schema_version": "1.9.0",
+       "severity": [
+        {
+         "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:H/A:N",
+         "type": "CVSS_V3"
+        }
+       ],
+       "summary": "Use of Uninitialized Resource in smallvec"
+      },
+      {
+       "affected": [
+        {
+         "database_specific": {
+          "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2021/08/GHSA-66p5-j55p-32r9/GHSA-66p5-j55p-32r9.json"
+         },
+         "package": {
+          "ecosystem": "crates.io",
+          "name": "smallvec",
+          "purl": "pkg:cargo/smallvec"
+         },
+         "ranges": [
+          {
+           "events": [
+            {
+             "introduced": "0"
+            },
+            {
+             "fixed": "0.6.13"
+            }
+           ],
+           "type": "SEMVER"
+          }
+         ]
+        }
+       ],
+       "aliases": [
+        "CVE-2018-25023",
+        "GHSA-55m5-whcv-c49c",
+        "RUSTSEC-2018-0018"
+       ],
+       "database_specific": {
+        "cwe_ids": [
+         "CWE-457"
+        ],
+        "github_reviewed": true,
+        "github_reviewed_at": "2021-08-06T16:36:54Z",
+        "nvd_published_at": null,
+        "severity": "MODERATE"
+       },
+       "details": "Affected versions of this crate called `mem::uninitialized()` to create values of a user-supplied type `T`.\nThis is unsound e.g. if `T` is a reference type (which must be non-null and thus may not remain uninitialized).\n \nThe flaw was corre",
+       "id": "GHSA-66p5-j55p-32r9",
+       "modified": "2023-11-08T04:00:14.788260Z",
+       "published": "2021-08-25T21:00:25Z",
+       "references": [
+        {
+         "type": "WEB",
+         "url": "https://github.com/servo/rust-smallvec/issues/126"
+        },
+        {
+         "type": "WEB",
+         "url": "https://github.com/servo/rust-smallvec/pull/162"
+        }
+       ],
+       "schema_version": "1.9.0",
+       "summary": "smallvec creates uninitialized value of any type"
+      },
+      {
+       "affected": [
+        {
+         "database_specific": {
+          "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2021/08/GHSA-69gw-hgj3-45m7/GHSA-69gw-hgj3-45m7.json"
+         },
+         "package": {
+          "ecosystem": "crates.io",
+          "name": "smallvec",
+          "purl": "pkg:cargo/smallvec"
+         },
+         "ranges": [
+          {
+           "events": [
+            {
+             "introduced": "0.6.3"
+            },
+            {
+             "fixed": "0.6.10"
+            }
+           ],
+           "type": "SEMVER"
+          }
+         ]
+        }
+       ],
+       "aliases": [
+        "CVE-2019-15554",
+        "RUSTSEC-2019-0012"
+       ],
+       "database_specific": {
+        "cwe_ids": [
+         "CWE-787"
+        ],
+        "github_reviewed": true,
+        "github_reviewed_at": "2021-08-19T21:23:44Z",
+        "nvd_published_at": null,
+        "severity": "CRITICAL"
+       },
+       "details": "Attempting to call grow on a spilled SmallVec with a value less than the current capacity causes corruption of memory allocator data structures. An attacker that controls the value passed to grow may exploit this flaw to obtain memory conte",
+       "id": "GHSA-69gw-hgj3-45m7",
+       "modified": "2023-11-08T04:01:14.344753Z",
+       "published": "2021-08-25T20:43:58Z",
+       "references": [
+        {
+         "type": "ADVISORY",
+         "url": "https://nvd.nist.gov/vuln/detail/CVE-2019-15554"
+        },
+        {
+         "type": "WEB",
+         "url": "https://github.com/servo/rust-smallvec/issues/149"
+        }
+       ],
+       "schema_version": "1.9.0",
+       "severity": [
+        {
+         "score": "CVSS:3.0/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+         "type": "CVSS_V3"
+        }
+       ],
+       "summary": "Memory corruption in smallvec"
+      },
+      {
+       "affected": [
+        {
+         "database_specific": {
+          "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2021/08/GHSA-mm7v-vpv8-xfc3/GHSA-mm7v-vpv8-xfc3.json"
+         },
+         "package": {
+          "ecosystem": "crates.io",
+          "name": "smallvec",
+          "purl": "pkg:cargo/smallvec"
+         },
+         "ranges": [
+          {
+           "events": [
+            {
+             "introduced": "0.6.5"
+            },
+            {
+             "fixed": "0.6.10"
+            }
+           ],
+           "type": "SEMVER"
+          }
+         ]
+        }
+       ],
+       "aliases": [
+        "CVE-2019-15551",
+        "RUSTSEC-2019-0009"
+       ],
+       "database_specific": {
+        "cwe_ids": [
+         "CWE-415"
+        ],
+        "github_reviewed": true,
+        "github_reviewed_at": "2021-08-19T21:22:23Z",
+        "nvd_published_at": null,
+        "severity": "CRITICAL"
+       },
+       "details": "Attempting to call grow on a spilled SmallVec with a value equal to the current capacity causes it to free the existing data. This performs a double free immediately and may lead to use-after-free on subsequent accesses to the SmallVec cont",
+       "id": "GHSA-mm7v-vpv8-xfc3",
+       "modified": "2023-11-08T04:01:14.162214Z",
+       "published": "2021-08-25T20:44:59Z",
+       "references": [
+        {
+         "type": "ADVISORY",
+         "url": "https://nvd.nist.gov/vuln/detail/CVE-2019-15551"
+        },
+        {
+         "type": "WEB",
+         "url": "https://github.com/servo/rust-smallvec/issues/148"
+        }
+       ],
+       "schema_version": "1.9.0",
+       "severity": [
+        {
+         "score": "CVSS:3.0/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+         "type": "CVSS_V3"
+        }
+       ],
+       "summary": "Double free in smallvec"
+      }
+     ]
+    },
+    {
+     "package": {
+      "name": "time",
+      "version": "0.1.43",
+      "ecosystem": "crates.io"
+     },
+     "groups": [
+      {
+       "ids": [
+        "RUSTSEC-2020-0071",
+        "GHSA-wcg3-cvx6-7396"
+       ],
+       "aliases": [
+        "CVE-2020-26235",
+        "GHSA-wcg3-cvx6-7396",
+        "RUSTSEC-2020-0071"
+       ],
+       "max_severity": "6.2"
+      }
+     ],
+     "vulnerabilities": [
+      {
+       "affected": [
+        {
+         "database_specific": {
+          "categories": [
+           "code-execution",
+           "memory-corruption"
+          ],
+          "cvss": "CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H",
+          "informational": null,
+          "source": "https://github.com/rustsec/advisory-db/blob/osv/crates/RUSTSEC-2020-0071.json"
+         },
+         "package": {
+          "ecosystem": "crates.io",
+          "name": "time",
+          "purl": "pkg:cargo/time"
+         },
+         "ranges": [
+          {
+           "events": [
+            {
+             "introduced": "0.0.0-0"
+            },
+            {
+             "fixed": "0.2.0"
+            },
+            {
+             "introduced": "0.2.1-0"
+            },
+            {
+             "fixed": "0.2.1"
+            },
+            {
+             "introduced": "0.2.2-0"
+            },
+            {
+             "fixed": "0.2.2"
+            },
+            {
+             "introduced": "0.2.3-0"
+            },
+            {
+             "fixed": "0.2.3"
+            },
+            {
+             "introduced": "0.2.4-0"
+            },
+            {
+             "fixed": "0.2.4"
+            },
+            {
+             "introduced": "0.2.5-0"
+            },
+            {
+             "fixed": "0.2.5"
+            },
+            {
+             "introduced": "0.2.6-0"
+            },
+            {
+             "fixed": "0.2.6"
+            },
+            {
+             "introduced": "0.2.7-0"
+            },
+            {
+             "fixed": "0.2.23"
+            }
+           ],
+           "type": "SEMVER"
+          }
+         ]
+        }
+       ],
+       "aliases": [
+        "CVE-2020-26235",
+        "GHSA-wcg3-cvx6-7396"
+       ],
+       "database_specific": {
+        "license": "CC0-1.0"
+       },
+       "details": "### Impact\n\nThe affected functions set environment variables without synchronization. On Unix-like operating systems, this can crash in multithreaded programs. Programs may segfault due to dereferencing a dangling pointer if an environment ",
+       "id": "RUSTSEC-2020-0071",
+       "modified": "2026-02-04T02:31:56.682937Z",
+       "published": "2020-11-18T12:00:00Z",
+       "references": [
+        {
+         "type": "PACKAGE",
+         "url": "https://crates.io/crates/time"
+        },
+        {
+         "type": "ADVISORY",
+         "url": "https://rustsec.org/advisories/RUSTSEC-2020-0071.html"
+        }
+       ],
+       "related": [
+        "RUSTSEC-2020-0159"
+       ],
+       "schema_version": "1.7.3",
+       "severity": [
+        {
+         "score": "CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H",
+         "type": "CVSS_V3"
+        }
+       ],
+       "summary": "Potential segfault in the time crate"
+      },
+      {
+       "affected": [
+        {
+         "database_specific": {
+          "last_known_affected_version_range": "< 0.2.0",
+          "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2021/08/GHSA-wcg3-cvx6-7396/GHSA-wcg3-cvx6-7396.json"
+         },
+         "package": {
+          "ecosystem": "crates.io",
+          "name": "time",
+          "purl": "pkg:cargo/time"
+         },
+         "ranges": [
+          {
+           "events": [
+            {
+             "introduced": "0.1.0"
+            },
+            {
+             "fixed": "0.2.23"
+            }
+           ],
+           "type": "SEMVER"
+          }
+         ]
+        },
+        {
+         "database_specific": {
+          "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2021/08/GHSA-wcg3-cvx6-7396/GHSA-wcg3-cvx6-7396.json"
+         },
+         "package": {
+          "ecosystem": "crates.io",
+          "name": "time",
+          "purl": "pkg:cargo/time"
+         },
+         "ranges": [
+          {
+           "events": [
+            {
+             "introduced": "0.2.7"
+            },
+            {
+             "fixed": "0.2.23"
+            }
+           ],
+           "type": "SEMVER"
+          }
+         ]
+        }
+       ],
+       "aliases": [
+        "CVE-2020-26235",
+        "RUSTSEC-2020-0071"
+       ],
+       "database_specific": {
+        "cwe_ids": [
+         "CWE-476"
+        ],
+        "github_reviewed": true,
+        "github_reviewed_at": "2021-08-18T21:06:21Z",
+        "nvd_published_at": "2020-11-24T22:15:00Z",
+        "severity": "MODERATE"
+       },
+       "details": "### Impact\n\nUnix-like operating systems may segfault due to dereferencing a dangling pointer in specific circumstances. This requires an environment variable to be set in a different thread than the affected functions. This may occur withou",
+       "id": "GHSA-wcg3-cvx6-7396",
+       "modified": "2026-09-10T03:49:08.359875406Z",
+       "published": "2021-08-25T20:56:46Z",
+       "references": [
+        {
+         "type": "WEB",
+         "url": "https://github.com/time-rs/time/security/advisories/GHSA-wcg3-cvx6-7396"
+        },
+        {
+         "type": "ADVISORY",
+         "url": "https://nvd.nist.gov/vuln/detail/CVE-2020-26235"
+        }
+       ],
+       "schema_version": "1.9.0",
+       "severity": [
+        {
+         "score": "CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H",
+         "type": "CVSS_V3"
+        }
+       ],
+       "summary": "Segmentation fault in time"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "source": {
+    "path": "__ROOT__/requirements.txt",
+    "type": "lockfile"
+   },
+   "packages": [
+    {
+     "package": {
+      "name": "django",
+      "version": "2.0.0",
+      "ecosystem": "PyPI"
+     },
+     "groups": [
+      {
+       "ids": [
+        "PYSEC-2018-2",
+        "GHSA-5hg3-6c2f-f3wr"
+       ],
+       "aliases": [
+        "CVE-2018-14574",
+        "GHSA-5hg3-6c2f-f3wr",
+        "PYSEC-2018-2"
+       ],
+       "max_severity": "6.1"
+      },
+      {
+       "ids": [
+        "PYSEC-2018-4",
+        "GHSA-rf4j-j272-fj86"
+       ],
+       "aliases": [
+        "CVE-2018-6188",
+        "GHSA-rf4j-j272-fj86",
+        "PYSEC-2018-4"
+       ],
+       "max_severity": "8.7"
+      },
+      {
+       "ids": [
+        "PYSEC-2018-5",
+        "GHSA-r28v-mw67-m5p9"
+       ],
+       "aliases": [
+        "CVE-2018-7536",
+        "GHSA-r28v-mw67-m5p9",
+        "PYSEC-2018-5"
+       ],
+       "max_severity": "6.9"
+      }
+     ],
+     "vulnerabilities": [
+      {
+       "affected": [
+        {
+         "database_specific": {
+          "source": "https://github.com/pypa/advisory-database/blob/main/vulns/django/PYSEC-2018-2.yaml"
+         },
+         "package": {
+          "ecosystem": "PyPI",
+          "name": "django",
+          "purl": "pkg:pypi/django"
+         },
+         "ranges": [
+          {
+           "events": [
+            {
+             "introduced": "1.11"
+            },
+            {
+             "fixed": "1.11.15"
+            },
+            {
+             "introduced": "2.0"
+            },
+            {
+             "fixed": "2.0.8"
+            }
+           ],
+           "type": "ECOSYSTEM"
+          }
+         ]
+        }
+       ],
+       "aliases": [
+        "CVE-2018-14574",
+        "GHSA-5hg3-6c2f-f3wr"
+       ],
+       "details": "django.middleware.common.CommonMiddleware in Django 1.11.x before 1.11.15 and 2.0.x before 2.0.8 has an Open Redirect.",
+       "id": "PYSEC-2018-2",
+       "modified": "2023-11-08T03:59:55.770463Z",
+       "published": "2018-08-03T17:29:00Z",
+       "references": [
+        {
+         "type": "ARTICLE",
+         "url": "https://www.djangoproject.com/weblog/2018/aug/01/security-releases/"
+        },
+        {
+         "type": "WEB",
+         "url": "https://usn.ubuntu.com/3726-1/"
+        }
+       ],
+       "schema_version": "1.7.3"
+      },
+      {
+       "affected": [
+        {
+         "database_specific": {
+          "source": "https://github.com/pypa/advisory-database/blob/main/vulns/django/PYSEC-2018-4.yaml"
+         },
+         "package": {
+          "ecosystem": "PyPI",
+          "name": "django",
+          "purl": "pkg:pypi/django"
+         },
+         "ranges": [
+          {
+           "events": [
+            {
+             "introduced": "2.0"
+            },
+            {
+             "fixed": "2.0.2"
+            }
+           ],
+           "type": "ECOSYSTEM"
+          }
+         ]
+        }
+       ],
+       "aliases": [
+        "CVE-2018-6188",
+        "GHSA-rf4j-j272-fj86"
+       ],
+       "details": "django.contrib.auth.forms.AuthenticationForm in Django 2.0 before 2.0.2, and 1.11.8 and 1.11.9, allows remote attackers to obtain potentially sensitive information by leveraging data exposure from the confirm_login_allowed() method, as demo",
+       "id": "PYSEC-2018-4",
+       "modified": "2023-11-08T04:00:21.087397Z",
+       "published": "2018-02-05T03:29:00Z",
+       "references": [
+        {
+         "type": "ARTICLE",
+         "url": "https://www.djangoproject.com/weblog/2018/feb/01/security-releases/"
+        },
+        {
+         "type": "WEB",
+         "url": "http://www.securitytracker.com/id/1040422"
+        }
+       ],
+       "schema_version": "1.7.3"
+      },
+      {
+       "affected": [
+        {
+         "database_specific": {
+          "source": "https://github.com/pypa/advisory-database/blob/main/vulns/django/PYSEC-2018-5.yaml"
+         },
+         "package": {
+          "ecosystem": "PyPI",
+          "name": "django",
+          "purl": "pkg:pypi/django"
+         },
+         "ranges": [
+          {
+           "events": [
+            {
+             "introduced": "1.8"
+            },
+            {
+             "fixed": "1.8.19"
+            },
+            {
+             "introduced": "1.11"
+            },
+            {
+             "fixed": "1.11.11"
+            },
+            {
+             "introduced": "2.0"
+            },
+            {
+             "fixed": "2.0.3"
+            }
+           ],
+           "type": "ECOSYSTEM"
+          }
+         ]
+        }
+       ],
+       "aliases": [
+        "CVE-2018-7536",
+        "GHSA-r28v-mw67-m5p9"
+       ],
+       "details": "An issue was discovered in Django 2.0 before 2.0.3, 1.11 before 1.11.11, and 1.8 before 1.8.19. The django.utils.html.urlize() function was extremely slow to evaluate certain inputs due to catastrophic backtracking vulnerabilities in two re",
+       "id": "PYSEC-2018-5",
+       "modified": "2023-11-08T04:00:22.813615Z",
+       "published": "2018-03-09T20:29:00Z",
+       "references": [
+        {
+         "type": "ARTICLE",
+         "url": "https://www.djangoproject.com/weblog/2018/mar/06/security-releases/"
+        },
+        {
+         "type": "WEB",
+         "url": "https://lists.debian.org/debian-lts-announce/2018/03/msg00006.html"
+        }
+       ],
+       "schema_version": "1.7.3"
+      },
+      {
+       "affected": [
+        {
+         "database_specific": {
+          "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2018/10/GHSA-5hg3-6c2f-f3wr/GHSA-5hg3-6c2f-f3wr.json"
+         },
+         "package": {
+          "ecosystem": "PyPI",
+          "name": "django",
+          "purl": "pkg:pypi/django"
+         },
+         "ranges": [
+          {
+           "events": [
+            {
+             "introduced": "2.0"
+            },
+            {
+             "fixed": "2.0.8"
+            }
+           ],
+           "type": "ECOSYSTEM"
+          }
+         ]
+        },
+        {
+         "database_specific": {
+          "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2018/10/GHSA-5hg3-6c2f-f3wr/GHSA-5hg3-6c2f-f3wr.json"
+         },
+         "package": {
+          "ecosystem": "PyPI",
+          "name": "django",
+          "purl": "pkg:pypi/django"
+         },
+         "ranges": [
+          {
+           "events": [
+            {
+             "introduced": "1.11"
+            },
+            {
+             "fixed": "1.11.15"
+            }
+           ],
+           "type": "ECOSYSTEM"
+          }
+         ]
+        }
+       ],
+       "aliases": [
+        "CVE-2018-14574",
+        "PYSEC-2018-2"
+       ],
+       "database_specific": {
+        "cwe_ids": [
+         "CWE-601"
+        ],
+        "github_reviewed": true,
+        "github_reviewed_at": "2020-06-16T21:16:20Z",
+        "nvd_published_at": null,
+        "severity": "MODERATE"
+       },
+       "details": "`django.middleware.common.CommonMiddleware` in Django 1.11.x before 1.11.15 and 2.0.x before 2.0.8 has an Open Redirect.",
+       "id": "GHSA-5hg3-6c2f-f3wr",
+       "modified": "2024-09-17T15:21:46.347995Z",
+       "published": "2018-10-04T21:58:46Z",
+       "references": [
+        {
+         "type": "ADVISORY",
+         "url": "https://nvd.nist.gov/vuln/detail/CVE-2018-14574"
+        },
+        {
+         "type": "WEB",
+         "url": "https://github.com/django/django/commit/6fffc3c6d420e44f4029d5643f38d00a39b08525"
+        }
+       ],
+       "schema_version": "1.9.0",
+       "severity": [
+        {
+         "score": "CVSS:3.0/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N",
+         "type": "CVSS_V3"
+        },
+        {
+         "score": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:P/VC:N/VI:N/VA:N/SC:L/SI:L/SA:N",
+         "type": "CVSS_V4"
+        }
+       ],
+       "summary": "Django open redirect"
+      },
+      {
+       "affected": [
+        {
+         "database_specific": {
+          "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2019/01/GHSA-r28v-mw67-m5p9/GHSA-r28v-mw67-m5p9.json"
+         },
+         "package": {
+          "ecosystem": "PyPI",
+          "name": "django",
+          "purl": "pkg:pypi/django"
+         },
+         "ranges": [
+          {
+           "events": [
+            {
+             "introduced": "2.0a1"
+            },
+            {
+             "fixed": "2.0.3"
+            }
+           ],
+           "type": "ECOSYSTEM"
+          }
+         ]
+        },
+        {
+         "database_specific": {
+          "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2019/01/GHSA-r28v-mw67-m5p9/GHSA-r28v-mw67-m5p9.json"
+         },
+         "package": {
+          "ecosystem": "PyPI",
+          "name": "django",
+          "purl": "pkg:pypi/django"
+         },
+         "ranges": [
+          {
+           "events": [
+            {
+             "introduced": "1.11a1"
+            },
+            {
+             "fixed": "1.11.11"
+            }
+           ],
+           "type": "ECOSYSTEM"
+          }
+         ]
+        },
+        {
+         "database_specific": {
+          "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2019/01/GHSA-r28v-mw67-m5p9/GHSA-r28v-mw67-m5p9.json"
+         },
+         "package": {
+          "ecosystem": "PyPI",
+          "name": "django",
+          "purl": "pkg:pypi/django"
+         },
+         "ranges": [
+          {
+           "events": [
+            {
+             "introduced": "1.8a1"
+            },
+            {
+             "fixed": "1.8.19"
+            }
+           ],
+           "type": "ECOSYSTEM"
+          }
+         ]
+        }
+       ],
+       "aliases": [
+        "CVE-2018-7536",
+        "PYSEC-2018-5"
+       ],
+       "database_specific": {
+        "cwe_ids": [
+         "CWE-185"
+        ],
+        "github_reviewed": true,
+        "github_reviewed_at": "2020-06-16T21:53:19Z",
+        "nvd_published_at": "2018-03-09T20:29:00Z",
+        "severity": "MODERATE"
+       },
+       "details": "An issue was discovered in Django 2.0 before 2.0.3, 1.11 before 1.11.11, and 1.8 before 1.8.19. The `django.utils.html.urlize()` function was extremely slow to evaluate certain inputs due to catastrophic backtracking vulnerabilities in two ",
+       "id": "GHSA-r28v-mw67-m5p9",
+       "modified": "2024-09-18T20:09:50.350214Z",
+       "published": "2019-01-04T17:50:07Z",
+       "references": [
+        {
+         "type": "ADVISORY",
+         "url": "https://nvd.nist.gov/vuln/detail/CVE-2018-7536"
+        },
+        {
+         "type": "WEB",
+         "url": "https://github.com/django/django/commit/1ca63a66ef3163149ad822701273e8a1844192c2"
+        }
+       ],
+       "schema_version": "1.9.0",
+       "severity": [
+        {
+         "score": "CVSS:3.0/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:L",
+         "type": "CVSS_V3"
+        },
+        {
+         "score": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:N/VI:L/VA:N/SC:N/SI:N/SA:N",
+         "type": "CVSS_V4"
+        }
+       ],
+       "summary": "Django denial-of-service possibility in urlize and urlizetrunc template filters"
+      },
+      {
+       "affected": [
+        {
+         "database_specific": {
+          "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2018/10/GHSA-rf4j-j272-fj86/GHSA-rf4j-j272-fj86.json"
+         },
+         "package": {
+          "ecosystem": "PyPI",
+          "name": "django",
+          "purl": "pkg:pypi/django"
+         },
+         "ranges": [
+          {
+           "events": [
+            {
+             "introduced": "2.0a1"
+            },
+            {
+             "fixed": "2.0.2"
+            }
+           ],
+           "type": "ECOSYSTEM"
+          }
+         ]
+        },
+        {
+         "database_specific": {
+          "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2018/10/GHSA-rf4j-j272-fj86/GHSA-rf4j-j272-fj86.json"
+         },
+         "package": {
+          "ecosystem": "PyPI",
+          "name": "django",
+          "purl": "pkg:pypi/django"
+         },
+         "ranges": [
+          {
+           "events": [
+            {
+             "introduced": "1.11.8"
+            },
+            {
+             "fixed": "1.11.10"
+            }
+           ],
+           "type": "ECOSYSTEM"
+          }
+         ]
+        }
+       ],
+       "aliases": [
+        "CVE-2018-6188",
+        "PYSEC-2018-4"
+       ],
+       "database_specific": {
+        "cwe_ids": [
+         "CWE-200"
+        ],
+        "github_reviewed": true,
+        "github_reviewed_at": "2020-06-16T21:54:30Z",
+        "nvd_published_at": null,
+        "severity": "HIGH"
+       },
+       "details": "`django.contrib.auth.forms.AuthenticationForm` in Django 2.0 before 2.0.2, and 1.11.8 and 1.11.9, allows remote attackers to obtain potentially sensitive information by leveraging data exposure from the `confirm_login_allowed()` method, as ",
+       "id": "GHSA-rf4j-j272-fj86",
+       "modified": "2024-09-18T20:08:51.348160Z",
+       "published": "2018-10-03T21:13:54Z",
+       "references": [
+        {
+         "type": "ADVISORY",
+         "url": "https://nvd.nist.gov/vuln/detail/CVE-2018-6188"
+        },
+        {
+         "type": "WEB",
+         "url": "https://github.com/django/django/commit/57b95fedad5e0b83fc9c81466b7d1751c6427aae"
+        }
+       ],
+       "schema_version": "1.9.0",
+       "severity": [
+        {
+         "score": "CVSS:3.0/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+         "type": "CVSS_V3"
+        },
+        {
+         "score": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:N/VA:N/SC:N/SI:N/SA:N",
+         "type": "CVSS_V4"
+        }
+       ],
+       "summary": "Django vulnerable to information leakage in AuthenticationForm"
+      }
+     ]
+    },
+    {
+     "package": {
+      "name": "requests",
+      "version": "2.31.0",
+      "ecosystem": "PyPI"
+     },
+     "groups": [
+      {
+       "ids": [
+        "PYSEC-2026-1872",
+        "GHSA-9hjg-9r4m-mvj7"
+       ],
+       "aliases": [
+        "CVE-2024-47081",
+        "GHSA-9hjg-9r4m-mvj7",
+        "PYSEC-2026-1872"
+       ],
+       "max_severity": "5.3"
+      },
+      {
+       "ids": [
+        "PYSEC-2026-1873",
+        "GHSA-9wx4-h78v-vm56"
+       ],
+       "aliases": [
+        "CVE-2024-35195",
+        "GHSA-9wx4-h78v-vm56",
+        "PYSEC-2026-1873"
+       ],
+       "max_severity": "5.6"
+      },
+      {
+       "ids": [
+        "PYSEC-2026-2275",
+        "GHSA-gc5v-m9x4-r6x2"
+       ],
+       "aliases": [
+        "CVE-2026-25645",
+        "GHSA-gc5v-m9x4-r6x2",
+        "PYSEC-2026-2275"
+       ],
+       "max_severity": "5.5"
+      }
+     ],
+     "vulnerabilities": [
+      {
+       "affected": [
+        {
+         "database_specific": {
+          "source": "https://github.com/pypa/advisory-database/blob/main/vulns/requests/PYSEC-2026-1872.yaml"
+         },
+         "package": {
+          "ecosystem": "PyPI",
+          "name": "requests",
+          "purl": "pkg:pypi/requests"
+         },
+         "ranges": [
+          {
+           "events": [
+            {
+             "introduced": "0"
+            },
+            {
+             "fixed": "2.32.4"
+            }
+           ],
+           "type": "ECOSYSTEM"
+          }
+         ]
+        }
+       ],
+       "aliases": [
+        "CVE-2024-47081",
+        "GHSA-9hjg-9r4m-mvj7"
+       ],
+       "details": "### Impact\n\nDue to a URL parsing issue, Requests releases prior to 2.32.4 may leak .netrc credentials to third parties for specific maliciously-crafted URLs.\n\n### Workarounds\nFor older versions of Requests, use of the .netrc file can be dis",
+       "id": "PYSEC-2026-1872",
+       "modified": "2026-07-07T17:47:00.332079836Z",
+       "published": "2026-07-07T16:02:54.151964Z",
+       "references": [
+        {
+         "type": "WEB",
+         "url": "https://github.com/psf/requests/security/advisories/GHSA-9hjg-9r4m-mvj7"
+        },
+        {
+         "type": "ADVISORY",
+         "url": "https://nvd.nist.gov/vuln/detail/CVE-2024-47081"
+        }
+       ],
+       "schema_version": "1.7.5",
+       "severity": [
+        {
+         "score": "CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:U/C:H/I:N/A:N",
+         "type": "CVSS_V3"
+        }
+       ],
+       "summary": "Requests vulnerable to .netrc credentials leak via malicious URLs"
+      },
+      {
+       "affected": [
+        {
+         "database_specific": {
+          "source": "https://github.com/pypa/advisory-database/blob/main/vulns/requests/PYSEC-2026-1873.yaml"
+         },
+         "package": {
+          "ecosystem": "PyPI",
+          "name": "requests",
+          "purl": "pkg:pypi/requests"
+         },
+         "ranges": [
+          {
+           "events": [
+            {
+             "introduced": "0"
+            },
+            {
+             "fixed": "2.32.0"
+            }
+           ],
+           "type": "ECOSYSTEM"
+          }
+         ]
+        }
+       ],
+       "aliases": [
+        "CVE-2024-35195",
+        "GHSA-9wx4-h78v-vm56"
+       ],
+       "details": "When using a `requests.Session`, if the first request to a given origin is made with `verify=False`, TLS certificate verification may remain disabled for all subsequent requests to that origin, even if `verify=True` is explicitly specified ",
+       "id": "PYSEC-2026-1873",
+       "modified": "2026-07-07T17:46:36.762141019Z",
+       "published": "2026-07-07T11:45:42.890131Z",
+       "references": [
+        {
+         "type": "WEB",
+         "url": "https://github.com/psf/requests/security/advisories/GHSA-9wx4-h78v-vm56"
+        },
+        {
+         "type": "ADVISORY",
+         "url": "https://nvd.nist.gov/vuln/detail/CVE-2024-35195"
+        }
+       ],
+       "schema_version": "1.7.5",
+       "severity": [
+        {
+         "score": "CVSS:3.1/AV:L/AC:H/PR:H/UI:R/S:U/C:H/I:H/A:N",
+         "type": "CVSS_V3"
+        }
+       ],
+       "summary": "Requests `Session` object does not verify requests after making first request with verify=False"
+      },
+      {
+       "affected": [
+        {
+         "database_specific": {
+          "source": "https://github.com/pypa/advisory-database/blob/main/vulns/requests/PYSEC-2026-2275.yaml"
+         },
+         "package": {
+          "ecosystem": "PyPI",
+          "name": "requests",
+          "purl": "pkg:pypi/requests"
+         },
+         "ranges": [
+          {
+           "events": [
+            {
+             "introduced": "0"
+            },
+            {
+             "fixed": "2.33.0"
+            }
+           ],
+           "type": "ECOSYSTEM"
+          }
+         ]
+        }
+       ],
+       "aliases": [
+        "CVE-2026-25645",
+        "GHSA-gc5v-m9x4-r6x2"
+       ],
+       "details": "Requests is a HTTP library. Prior to version 2.33.0, the `requests.utils.extract_zipped_paths()` utility function uses a predictable filename when extracting files from zip archives into the system temporary directory. If the target file al",
+       "id": "PYSEC-2026-2275",
+       "modified": "2026-07-13T07:15:43.964902190Z",
+       "published": "2026-03-25T17:16:52.970Z",
+       "references": [
+        {
+         "type": "ADVISORY",
+         "url": "https://github.com/psf/requests/releases/tag/v2.33.0"
+        },
+        {
+         "type": "ADVISORY",
+         "url": "https://github.com/psf/requests/security/advisories/GHSA-gc5v-m9x4-r6x2"
+        }
+       ],
+       "schema_version": "1.7.5",
+       "severity": [
+        {
+         "score": "CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:N/I:H/A:N",
+         "type": "CVSS_V3"
+        }
+       ]
+      },
+      {
+       "affected": [
+        {
+         "database_specific": {
+          "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2025/06/GHSA-9hjg-9r4m-mvj7/GHSA-9hjg-9r4m-mvj7.json"
+         },
+         "package": {
+          "ecosystem": "PyPI",
+          "name": "requests",
+          "purl": "pkg:pypi/requests"
+         },
+         "ranges": [
+          {
+           "events": [
+            {
+             "introduced": "0"
+            },
+            {
+             "fixed": "2.32.4"
+            }
+           ],
+           "type": "ECOSYSTEM"
+          }
+         ]
+        }
+       ],
+       "aliases": [
+        "CVE-2024-47081",
+        "PYSEC-2026-1872"
+       ],
+       "database_specific": {
+        "cwe_ids": [
+         "CWE-522"
+        ],
+        "github_reviewed": true,
+        "github_reviewed_at": "2025-06-09T19:06:08Z",
+        "nvd_published_at": "2025-06-09T18:15:24Z",
+        "severity": "MODERATE"
+       },
+       "details": "### Impact\n\nDue to a URL parsing issue, Requests releases prior to 2.32.4 may leak .netrc credentials to third parties for specific maliciously-crafted URLs.\n\n### Workarounds\nFor older versions of Requests, use of the .netrc file can be dis",
+       "id": "GHSA-9hjg-9r4m-mvj7",
+       "modified": "2026-09-10T03:50:25.139398550Z",
+       "published": "2025-06-09T19:06:08Z",
+       "references": [
+        {
+         "type": "WEB",
+         "url": "https://github.com/psf/requests/security/advisories/GHSA-9hjg-9r4m-mvj7"
+        },
+        {
+         "type": "ADVISORY",
+         "url": "https://nvd.nist.gov/vuln/detail/CVE-2024-47081"
+        }
+       ],
+       "schema_version": "1.9.0",
+       "severity": [
+        {
+         "score": "CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:U/C:H/I:N/A:N",
+         "type": "CVSS_V3"
+        }
+       ],
+       "summary": "Requests vulnerable to .netrc credentials leak via malicious URLs"
+      },
+      {
+       "affected": [
+        {
+         "database_specific": {
+          "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2024/05/GHSA-9wx4-h78v-vm56/GHSA-9wx4-h78v-vm56.json"
+         },
+         "package": {
+          "ecosystem": "PyPI",
+          "name": "requests",
+          "purl": "pkg:pypi/requests"
+         },
+         "ranges": [
+          {
+           "events": [
+            {
+             "introduced": "0"
+            },
+            {
+             "fixed": "2.32.0"
+            }
+           ],
+           "type": "ECOSYSTEM"
+          }
+         ]
+        }
+       ],
+       "aliases": [
+        "CVE-2024-35195",
+        "PYSEC-2026-1873"
+       ],
+       "database_specific": {
+        "cwe_ids": [
+         "CWE-670"
+        ],
+        "github_reviewed": true,
+        "github_reviewed_at": "2024-05-20T20:15:00Z",
+        "nvd_published_at": "2024-05-20T21:15:09Z",
+        "severity": "MODERATE"
+       },
+       "details": "When using a `requests.Session`, if the first request to a given origin is made with `verify=False`, TLS certificate verification may remain disabled for all subsequent requests to that origin, even if `verify=True` is explicitly specified ",
+       "id": "GHSA-9wx4-h78v-vm56",
+       "modified": "2026-09-10T03:50:13.740879755Z",
+       "published": "2024-05-20T20:15:00Z",
+       "references": [
+        {
+         "type": "WEB",
+         "url": "https://github.com/psf/requests/security/advisories/GHSA-9wx4-h78v-vm56"
+        },
+        {
+         "type": "ADVISORY",
+         "url": "https://nvd.nist.gov/vuln/detail/CVE-2024-35195"
+        }
+       ],
+       "schema_version": "1.9.0",
+       "severity": [
+        {
+         "score": "CVSS:3.1/AV:L/AC:H/PR:H/UI:R/S:U/C:H/I:H/A:N",
+         "type": "CVSS_V3"
+        }
+       ],
+       "summary": "Requests `Session` object does not verify requests after making first request with verify=False"
+      },
+      {
+       "affected": [
+        {
+         "database_specific": {
+          "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2026/03/GHSA-gc5v-m9x4-r6x2/GHSA-gc5v-m9x4-r6x2.json"
+         },
+         "package": {
+          "ecosystem": "PyPI",
+          "name": "requests",
+          "purl": "pkg:pypi/requests"
+         },
+         "ranges": [
+          {
+           "events": [
+            {
+             "introduced": "0"
+            },
+            {
+             "fixed": "2.33.0"
+            }
+           ],
+           "type": "ECOSYSTEM"
+          }
+         ]
+        }
+       ],
+       "aliases": [
+        "CVE-2026-25645",
+        "PYSEC-2026-2275"
+       ],
+       "database_specific": {
+        "cwe_ids": [
+         "CWE-377"
+        ],
+        "github_reviewed": true,
+        "github_reviewed_at": "2026-03-25T16:56:28Z",
+        "nvd_published_at": "2026-03-25T17:16:52Z",
+        "severity": "MODERATE"
+       },
+       "details": "### Impact\nThe `requests.utils.extract_zipped_paths()` utility function uses a predictable filename when extracting files from zip archives into the system temporary directory. If the target file already exists, it is reused without validat",
+       "id": "GHSA-gc5v-m9x4-r6x2",
+       "modified": "2026-09-10T03:50:39.207922076Z",
+       "published": "2026-03-25T16:56:28Z",
+       "references": [
+        {
+         "type": "WEB",
+         "url": "https://github.com/psf/requests/security/advisories/GHSA-gc5v-m9x4-r6x2"
+        },
+        {
+         "type": "ADVISORY",
+         "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-25645"
+        }
+       ],
+       "schema_version": "1.9.0",
+       "severity": [
+        {
+         "score": "CVSS:3.1/AV:L/AC:H/PR:L/UI:R/S:U/C:N/I:H/A:N",
+         "type": "CVSS_V3"
+        }
+       ],
+       "summary": "Requests has Insecure Temp File Reuse in its extract_zipped_paths() utility function"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "source": {
+    "path": "__ROOT__/svc/go.mod",
+    "type": "lockfile"
+   },
+   "packages": [
+    {
+     "package": {
+      "name": "golang.org/x/text",
+      "version": "0.3.0",
+      "ecosystem": "Go"
+     },
+     "groups": [
+      {
+       "ids": [
+        "GO-2020-0015",
+        "GHSA-5rcv-m4m3-hfh7"
+       ],
+       "aliases": [
+        "CVE-2020-14040",
+        "GHSA-5rcv-m4m3-hfh7",
+        "GO-2020-0015"
+       ],
+       "max_severity": "7.5"
+      },
+      {
+       "ids": [
+        "GO-2021-0113",
+        "GHSA-ppp9-7jff-5vj2"
+       ],
+       "aliases": [
+        "CVE-2021-38561",
+        "GHSA-ppp9-7jff-5vj2",
+        "GO-2021-0113"
+       ],
+       "max_severity": "7.5"
+      },
+      {
+       "ids": [
+        "GO-2022-1059",
+        "GHSA-69ch-w2m2-3vjp"
+       ],
+       "aliases": [
+        "CVE-2022-32149",
+        "GHSA-69ch-w2m2-3vjp",
+        "GO-2022-1059"
+       ],
+       "max_severity": "7.5"
+      },
+      {
+       "ids": [
+        "GO-2026-5970"
+       ],
+       "aliases": [
+        "CVE-2026-56852",
+        "GO-2026-5970"
+       ],
+       "max_severity": ""
+      }
+     ],
+     "vulnerabilities": [
+      {
+       "affected": [
+        {
+         "database_specific": {
+          "source": "https://vuln.go.dev/ID/GO-2020-0015.json"
+         },
+         "package": {
+          "ecosystem": "Go",
+          "name": "golang.org/x/text",
+          "purl": "pkg:golang/golang.org/x/text"
+         },
+         "ranges": [
+          {
+           "events": [
+            {
+             "introduced": "0"
+            },
+            {
+             "fixed": "0.3.3"
+            }
+           ],
+           "type": "SEMVER"
+          }
+         ]
+        }
+       ],
+       "aliases": [
+        "CVE-2020-14040",
+        "GHSA-5rcv-m4m3-hfh7"
+       ],
+       "credits": [
+        {
+         "name": "@abacabadabacaba"
+        },
+        {
+         "name": "Anton Gyllenberg"
+        }
+       ],
+       "database_specific": {
+        "review_status": "REVIEWED",
+        "url": "https://pkg.go.dev/vuln/GO-2020-0015"
+       },
+       "details": "An attacker could provide a single byte to a UTF16 decoder instantiated with UseBOM or ExpectBOM to trigger an infinite loop if the String function on the Decoder is called, or the Decoder is passed to transform.String. If used to parse use",
+       "id": "GO-2020-0015",
+       "modified": "2026-02-04T03:02:32.031255Z",
+       "published": "2021-04-14T20:04:52Z",
+       "references": [
+        {
+         "type": "FIX",
+         "url": "https://go.dev/cl/238238"
+        },
+        {
+         "type": "FIX",
+         "url": "https://go.googlesource.com/text/+/23ae387dee1f90d29a23c0e87ee0b46038fbed0e"
+        }
+       ],
+       "related": [
+        "CGA-36h4-wcvc-55j4"
+       ],
+       "schema_version": "1.7.3",
+       "summary": "Infinite loop when decoding some inputs in golang.org/x/text"
+      },
+      {
+       "affected": [
+        {
+         "database_specific": {
+          "source": "https://vuln.go.dev/ID/GO-2021-0113.json"
+         },
+         "package": {
+          "ecosystem": "Go",
+          "name": "golang.org/x/text",
+          "purl": "pkg:golang/golang.org/x/text"
+         },
+         "ranges": [
+          {
+           "events": [
+            {
+             "introduced": "0"
+            },
+            {
+             "fixed": "0.3.7"
+            }
+           ],
+           "type": "SEMVER"
+          }
+         ]
+        }
+       ],
+       "aliases": [
+        "CVE-2021-38561",
+        "GHSA-ppp9-7jff-5vj2"
+       ],
+       "credits": [
+        {
+         "name": "Guido Vranken"
+        }
+       ],
+       "database_specific": {
+        "review_status": "REVIEWED",
+        "url": "https://pkg.go.dev/vuln/GO-2021-0113"
+       },
+       "details": "Due to improper index calculation, an incorrectly formatted language tag can cause Parse to panic via an out of bounds read. If Parse is used to process untrusted user inputs, this may be used as a vector for a denial of service attack.",
+       "id": "GO-2021-0113",
+       "modified": "2026-02-04T02:31:07.297346Z",
+       "published": "2021-10-06T17:51:21Z",
+       "references": [
+        {
+         "type": "FIX",
+         "url": "https://go.dev/cl/340830"
+        },
+        {
+         "type": "FIX",
+         "url": "https://go.googlesource.com/text/+/383b2e75a7a4198c42f8f87833eefb772868a56f"
+        }
+       ],
+       "related": [
+        "CGA-rxmv-qq37-m2jc",
+        "RHBA-2023:1649",
+        "RHSA-2023:0407"
+       ],
+       "schema_version": "1.7.3",
+       "summary": "Out-of-bounds read in golang.org/x/text/language"
+      },
+      {
+       "affected": [
+        {
+         "database_specific": {
+          "source": "https://vuln.go.dev/ID/GO-2022-1059.json"
+         },
+         "package": {
+          "ecosystem": "Go",
+          "name": "golang.org/x/text",
+          "purl": "pkg:golang/golang.org/x/text"
+         },
+         "ranges": [
+          {
+           "events": [
+            {
+             "introduced": "0"
+            },
+            {
+             "fixed": "0.3.8"
+            }
+           ],
+           "type": "SEMVER"
+          }
+         ]
+        }
+       ],
+       "aliases": [
+        "CVE-2022-32149",
+        "GHSA-69ch-w2m2-3vjp"
+       ],
+       "credits": [
+        {
+         "name": "Adam Korczynski (ADA Logics)"
+        },
+        {
+         "name": "OSS-Fuzz"
+        }
+       ],
+       "database_specific": {
+        "review_status": "REVIEWED",
+        "url": "https://pkg.go.dev/vuln/GO-2022-1059"
+       },
+       "details": "An attacker may cause a denial of service by crafting an Accept-Language header which ParseAcceptLanguage will take significant time to parse.",
+       "id": "GO-2022-1059",
+       "modified": "2026-02-04T03:39:03.311488Z",
+       "published": "2022-10-11T18:16:24Z",
+       "references": [
+        {
+         "type": "REPORT",
+         "url": "https://go.dev/issue/56152"
+        },
+        {
+         "type": "FIX",
+         "url": "https://go.dev/cl/442235"
+        }
+       ],
+       "related": [
+        "CGA-wf56-6rqf-4crj"
+       ],
+       "schema_version": "1.7.3",
+       "summary": "Denial of service via crafted Accept-Language header in golang.org/x/text/language"
+      },
+      {
+       "affected": [
+        {
+         "database_specific": {
+          "source": "https://vuln.go.dev/ID/GO-2026-5970.json"
+         },
+         "package": {
+          "ecosystem": "Go",
+          "name": "golang.org/x/text",
+          "purl": "pkg:golang/golang.org/x/text"
+         },
+         "ranges": [
+          {
+           "events": [
+            {
+             "introduced": "0"
+            },
+            {
+             "fixed": "0.39.0"
+            }
+           ],
+           "type": "SEMVER"
+          }
+         ]
+        }
+       ],
+       "aliases": [
+        "CVE-2026-56852"
+       ],
+       "credits": [
+        {
+         "name": "Viky Choi (\"vikychoi\" on GitHub)"
+        }
+       ],
+       "database_specific": {
+        "review_status": "REVIEWED",
+        "url": "https://pkg.go.dev/vuln/GO-2026-5970"
+       },
+       "details": "A norm.Iter can enter an infinite loop when handling input containing invalid UTF-8 bytes.",
+       "id": "GO-2026-5970",
+       "modified": "2026-09-23T10:41:39.386264978Z",
+       "published": "2026-07-14T17:29:56Z",
+       "references": [
+        {
+         "type": "REPORT",
+         "url": "https://go.dev/issue/80142"
+        },
+        {
+         "type": "FIX",
+         "url": "https://go.dev/cl/794100"
+        }
+       ],
+       "related": [
+        "RHSA-2026:40964",
+        "RHSA-2026:41020",
+        "RHSA-2026:42083",
+        "RHSA-2026:42230",
+        "RHSA-2026:42241",
+        "RHSA-2026:43015",
+        "RHSA-2026:43119",
+        "RHSA-2026:43311",
+        "RHSA-2026:43554",
+        "RHSA-2026:43581",
+        "RHSA-2026:43716",
+        "RHSA-2026:43797",
+        "RHSA-2026:43799",
+        "RHSA-2026:43801",
+        "RHSA-2026:43803",
+        "RHSA-2026:43852",
+        "RHSA-2026:43866",
+        "RHSA-2026:43873",
+        "RHSA-2026:43906",
+        "RHSA-2026:44151",
+        "RHSA-2026:44152",
+        "RHSA-2026:44162",
+        "RHSA-2026:44430",
+        "RHSA-2026:44451",
+        "RHSA-2026:44479",
+        "RHSA-2026:46953",
+        "RHSA-2026:46960",
+        "RHSA-2026:46988",
+        "RHSA-2026:48306",
+        "RHSA-2026:49317",
+        "RHSA-2026:49360",
+        "RHSA-2026:51065",
+        "RHSA-2026:52912",
+        "RHSA-2026:54364",
+        "RHSA-2026:54549",
+        "RHSA-2026:68334",
+        "RHSA-2026:68335",
+        "RHSA-2026:69258",
+        "RHSA-2026:70201"
+       ],
+       "schema_version": "1.8.0",
+       "summary": "Infinite loop on invalid input in golang.org/x/text"
+      },
+      {
+       "affected": [
+        {
+         "database_specific": {
+          "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2021/05/GHSA-5rcv-m4m3-hfh7/GHSA-5rcv-m4m3-hfh7.json"
+         },
+         "package": {
+          "ecosystem": "Go",
+          "name": "golang.org/x/text",
+          "purl": "pkg:golang/golang.org/x/text"
+         },
+         "ranges": [
+          {
+           "events": [
+            {
+             "introduced": "0"
+            },
+            {
+             "fixed": "0.3.3"
+            }
+           ],
+           "type": "SEMVER"
+          }
+         ]
+        }
+       ],
+       "aliases": [
+        "CVE-2020-14040",
+        "GO-2020-0015"
+       ],
+       "database_specific": {
+        "cwe_ids": [
+         "CWE-400",
+         "CWE-835"
+        ],
+        "github_reviewed": true,
+        "github_reviewed_at": "2021-05-12T14:54:58Z",
+        "nvd_published_at": null,
+        "severity": "MODERATE"
+       },
+       "details": "Go version v0.3.3 of the x/text package fixes a vulnerability in encoding/unicode that could lead to the UTF-16 decoder entering an infinite loop, causing the program to crash or run out of memory. An attacker could provide a single byte to",
+       "id": "GHSA-5rcv-m4m3-hfh7",
+       "modified": "2026-09-10T03:49:04.603920760Z",
+       "published": "2021-05-18T18:34:35Z",
+       "references": [
+        {
+         "type": "ADVISORY",
+         "url": "https://nvd.nist.gov/vuln/detail/CVE-2020-14040"
+        },
+        {
+         "type": "WEB",
+         "url": "https://github.com/golang/go/issues/39491"
+        }
+       ],
+       "schema_version": "1.9.0",
+       "severity": [
+        {
+         "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H/E:P/RL:O/RC:C",
+         "type": "CVSS_V3"
+        }
+       ],
+       "summary": "golang.org/x/text Infinite loop"
+      },
+      {
+       "affected": [
+        {
+         "database_specific": {
+          "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2022/10/GHSA-69ch-w2m2-3vjp/GHSA-69ch-w2m2-3vjp.json"
+         },
+         "package": {
+          "ecosystem": "Go",
+          "name": "golang.org/x/text",
+          "purl": "pkg:golang/golang.org/x/text"
+         },
+         "ranges": [
+          {
+           "events": [
+            {
+             "introduced": "0"
+            },
+            {
+             "fixed": "0.3.8"
+            }
+           ],
+           "type": "SEMVER"
+          }
+         ]
+        }
+       ],
+       "aliases": [
+        "CVE-2022-32149",
+        "GO-2022-1059"
+       ],
+       "database_specific": {
+        "cwe_ids": [
+         "CWE-772"
+        ],
+        "github_reviewed": true,
+        "github_reviewed_at": "2022-10-28T20:11:26Z",
+        "nvd_published_at": "2022-10-14T15:15:00Z",
+        "severity": "HIGH"
+       },
+       "details": "The BCP 47 tag parser has quadratic time complexity due to inherent aspects of its design. Since the parser is, by design, exposed to untrusted user input, this can be leveraged to force a program to consume significant time parsing Accept-",
+       "id": "GHSA-69ch-w2m2-3vjp",
+       "modified": "2026-09-10T03:49:46.240531909Z",
+       "published": "2022-10-14T19:00:40Z",
+       "references": [
+        {
+         "type": "ADVISORY",
+         "url": "https://nvd.nist.gov/vuln/detail/CVE-2022-32149"
+        },
+        {
+         "type": "WEB",
+         "url": "https://github.com/golang/go/issues/56152"
+        }
+       ],
+       "schema_version": "1.9.0",
+       "severity": [
+        {
+         "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H",
+         "type": "CVSS_V3"
+        }
+       ],
+       "summary": "golang.org/x/text/language Denial of service via crafted Accept-Language header"
+      },
+      {
+       "affected": [
+        {
+         "database_specific": {
+          "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2022/12/GHSA-ppp9-7jff-5vj2/GHSA-ppp9-7jff-5vj2.json"
+         },
+         "package": {
+          "ecosystem": "Go",
+          "name": "golang.org/x/text",
+          "purl": "pkg:golang/golang.org/x/text"
+         },
+         "ranges": [
+          {
+           "events": [
+            {
+             "introduced": "0"
+            },
+            {
+             "fixed": "0.3.7"
+            }
+           ],
+           "type": "SEMVER"
+          }
+         ]
+        }
+       ],
+       "aliases": [
+        "CVE-2021-38561",
+        "GO-2021-0113"
+       ],
+       "database_specific": {
+        "cwe_ids": [
+         "CWE-125"
+        ],
+        "github_reviewed": true,
+        "github_reviewed_at": "2023-01-09T20:02:12Z",
+        "nvd_published_at": "2022-12-26T06:15:00Z",
+        "severity": "HIGH"
+       },
+       "details": "golang.org/x/text/language in golang.org/x/text before 0.3.7 can panic with an out-of-bounds read during BCP 47 language tag parsing. Index calculation is mishandled. If parsing untrusted user input, this can be used as a vector for a denia",
+       "id": "GHSA-ppp9-7jff-5vj2",
+       "modified": "2026-09-10T03:49:50.331764985Z",
+       "published": "2022-12-26T06:30:22Z",
+       "references": [
+        {
+         "type": "ADVISORY",
+         "url": "https://nvd.nist.gov/vuln/detail/CVE-2021-38561"
+        },
+        {
+         "type": "WEB",
+         "url": "https://deps.dev/advisory/OSV/GO-2021-0113"
+        }
+       ],
+       "schema_version": "1.9.0",
+       "severity": [
+        {
+         "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H",
+         "type": "CVSS_V3"
+        }
+       ],
+       "summary": "golang.org/x/text/language Out-of-bounds Read vulnerability"
+      }
+     ]
+    }
+   ]
+  }
+ ],
+ "experimental_config": {
+  "licenses": {
+   "summary": false,
+   "allowlist": null
+  }
+ }
+}

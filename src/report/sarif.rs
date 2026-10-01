@@ -1,0 +1,295 @@
+//! SARIF 2.1.0 output, shaped for GitHub code scanning.
+//!
+//! Notes on the choices here:
+//! - `startLine` is always >= 1 (GitHub rejects 0).
+//! - URIs are relative with `/` separators, so reports from Windows and Linux match.
+//! - Fingerprints are content-based and stable across runs, so alerts are tracked
+//!   instead of being closed and re-opened on every upload.
+//! - `security-severity` is what GitHub uses to label alerts critical/high/medium/low.
+
+use crate::model::{AnalyzerState, Finding, ScanReport, Severity};
+use serde_json::{Value, json};
+use std::collections::HashMap;
+
+const SCHEMA: &str = "https://json.schemastore.org/sarif-2.1.0.json";
+const INFO_URI: &str = "https://github.com/Divhanthelion/ghaudit";
+
+fn level(sev: Severity) -> &'static str {
+    match sev {
+        Severity::Critical | Severity::High => "error",
+        Severity::Medium | Severity::Unknown => "warning",
+        Severity::Low | Severity::Info => "note",
+    }
+}
+
+/// Numeric score in GitHub's bands (>= 9 critical, >= 7 high, >= 4 medium, else low).
+fn security_severity(f: &Finding) -> String {
+    let score = f
+        .dependency
+        .as_ref()
+        .and_then(|d| d.cvss_score)
+        .unwrap_or(match f.severity {
+            Severity::Critical => 9.5,
+            Severity::High => 8.0,
+            Severity::Medium | Severity::Unknown => 5.5,
+            Severity::Low => 3.0,
+            Severity::Info => 0.0,
+        });
+    format!("{score:.1}")
+}
+
+fn uri(f: &Finding) -> String {
+    match &f.repository {
+        Some(repo) => format!("{repo}/{}", f.location.path),
+        None => f.location.path.clone(),
+    }
+}
+
+fn rule(f: &Finding) -> Value {
+    let mut tags = vec!["security".to_string(), f.category.label().to_string()];
+    tags.extend(
+        f.cwe
+            .iter()
+            .map(|c| format!("external/cwe/{}", c.to_lowercase())),
+    );
+    let (short, full) = match &f.dependency {
+        // The finding title names the package; the rule describes the advisory.
+        Some(dep) => {
+            let summary = f
+                .title
+                .split_once(": ")
+                .map_or(f.title.as_str(), |(_, s)| s)
+                .to_string();
+            (format!("{}: {summary}", dep.advisory), f.message.clone())
+        }
+        None => (f.title.clone(), f.message.clone()),
+    };
+    let mut rule = json!({
+        "id": f.rule_id,
+        "name": f.rule_id,
+        "shortDescription": { "text": short },
+        "fullDescription": { "text": full },
+        "defaultConfiguration": { "level": level(f.severity) },
+        "properties": {
+            "tags": tags,
+            "precision": match f.confidence {
+                crate::model::Confidence::High => "high",
+                crate::model::Confidence::Medium => "medium",
+                crate::model::Confidence::Low => "low",
+            },
+            "security-severity": security_severity(f),
+        }
+    });
+    if let Some(fix) = &f.remediation {
+        rule["help"] = json!({ "text": fix, "markdown": fix });
+    }
+    if let Some(dep) = &f.dependency {
+        rule["helpUri"] = json!(dep.url);
+    }
+    rule
+}
+
+fn result(f: &Finding, rule_index: usize) -> Value {
+    let loc = &f.location;
+    let mut region = json!({
+        "startLine": loc.start_line.max(1),
+        "startColumn": loc.start_column.max(1),
+        "endLine": loc.end_line.max(loc.start_line).max(1),
+        "endColumn": loc.end_column.max(1),
+    });
+    if let Some(snippet) = &f.snippet
+        && let Some(text) = snippet
+            .lines
+            .get(loc.start_line.saturating_sub(snippet.first_line))
+    {
+        region["snippet"] = json!({ "text": text });
+    }
+    let mut message = f.message.clone();
+    if let Some(fix) = &f.remediation {
+        message = format!("{message}\nFix: {fix}");
+    }
+    json!({
+        "ruleId": f.rule_id,
+        "ruleIndex": rule_index,
+        "level": level(f.severity),
+        "message": { "text": message },
+        "locations": [{
+            "physicalLocation": {
+                "artifactLocation": { "uri": uri(f), "uriBaseId": "%SRCROOT%" },
+                "region": region,
+            }
+        }],
+        "fingerprints": { "ghaudit/v1": f.fingerprint },
+        "partialFingerprints": { "primaryLocationLineHash": f.fingerprint },
+        "properties": {
+            "category": f.category.label(),
+            "severity": f.severity.as_str(),
+            "confidence": f.confidence.to_string(),
+        }
+    })
+}
+
+pub fn to_sarif(report: &ScanReport) -> Value {
+    let mut rules = Vec::new();
+    let mut index: HashMap<&str, usize> = HashMap::new();
+    for f in &report.findings {
+        if !index.contains_key(f.rule_id.as_str()) {
+            index.insert(&f.rule_id, rules.len());
+            rules.push(rule(f));
+        }
+    }
+    let results: Vec<Value> = report
+        .findings
+        .iter()
+        .map(|f| result(f, index[f.rule_id.as_str()]))
+        .collect();
+
+    let notifications: Vec<Value> = report
+        .analyzers
+        .iter()
+        .filter(|a| a.state == AnalyzerState::Failed)
+        .map(|a| json!({ "level": "error", "message": { "text": format!("{} analyzer failed: {}", a.analyzer, a.detail.as_deref().unwrap_or("unknown error")) } }))
+        .chain(report.repositories.iter().filter_map(|r| {
+            r.error.as_ref().map(|e| json!({ "level": "error", "message": { "text": format!("{}: {e}", r.name) } }))
+        }))
+        .collect();
+
+    let run = json!({
+        "tool": {
+            "driver": {
+                "name": report.tool,
+                "version": report.version,
+                "semanticVersion": report.version,
+                "informationUri": INFO_URI,
+                "rules": rules,
+            }
+        },
+        "invocations": [{
+            "executionSuccessful": report.is_complete(),
+            "startTimeUtc": report.started_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "endTimeUtc": report.finished_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "toolExecutionNotifications": notifications,
+        }],
+        "results": results,
+    });
+    json!({ "$schema": SCHEMA, "version": "2.1.0", "runs": [run] })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{AnalyzerStatus, Category, Confidence, DependencyInfo, Location, Snippet};
+
+    fn sample() -> ScanReport {
+        let mut r = ScanReport::new("demo");
+        r.analyzers = vec![
+            AnalyzerStatus::completed("sast"),
+            AnalyzerStatus::failed("sca", "osv-scanner not found"),
+        ];
+        r.findings.push(
+            Finding::new(
+                "python/eval",
+                Category::Sast,
+                Severity::High,
+                Confidence::Medium,
+                "eval",
+                "msg",
+                Location::new("src\\app.py", 3, 2),
+                "eval(x)",
+            )
+            .with_snippet(Snippet::around("a\nb\neval(x)\n", 3, 1))
+            .with_cwe(["CWE-95"])
+            .with_remediation("fix it"),
+        );
+        let mut dep = Finding::new(
+            "osv/GHSA-xxxx",
+            Category::Dependency,
+            Severity::Critical,
+            Confidence::High,
+            "smallvec 0.6.9: buffer overflow",
+            "crates.io smallvec@0.6.9 is affected by GHSA-xxxx",
+            Location::new("Cargo.lock", 0, 0),
+            "k",
+        );
+        dep.dependency = Some(DependencyInfo {
+            ecosystem: "crates.io".into(),
+            package: "smallvec".into(),
+            version: "0.6.9".into(),
+            advisory: "GHSA-xxxx".into(),
+            aliases: vec![],
+            fixed_versions: vec!["0.6.10".into()],
+            cvss_score: Some(9.8),
+            url: "https://osv.dev/vulnerability/GHSA-xxxx".into(),
+        });
+        r.findings.push(dep);
+        r.finalize(Severity::Low);
+        r
+    }
+
+    #[test]
+    fn locations_are_valid_for_github() {
+        let sarif = to_sarif(&sample());
+        for res in sarif["runs"][0]["results"].as_array().unwrap() {
+            let loc = &res["locations"][0]["physicalLocation"];
+            assert!(loc["region"]["startLine"].as_u64().unwrap() >= 1);
+            assert!(
+                !loc["artifactLocation"]["uri"]
+                    .as_str()
+                    .unwrap()
+                    .contains('\\')
+            );
+        }
+    }
+
+    #[test]
+    fn rules_are_indexed_and_carry_severity() {
+        let sarif = to_sarif(&sample());
+        let run = &sarif["runs"][0];
+        let rules = run["tool"]["driver"]["rules"].as_array().unwrap();
+        for res in run["results"].as_array().unwrap() {
+            let idx = res["ruleIndex"].as_u64().unwrap() as usize;
+            assert_eq!(rules[idx]["id"], res["ruleId"]);
+        }
+        let dep_rule = rules.iter().find(|r| r["id"] == "osv/GHSA-xxxx").unwrap();
+        assert_eq!(dep_rule["properties"]["security-severity"], "9.8");
+        assert_eq!(
+            dep_rule["shortDescription"]["text"],
+            "GHSA-xxxx: buffer overflow"
+        );
+        let code_rule = rules.iter().find(|r| r["id"] == "python/eval").unwrap();
+        assert!(
+            code_rule["properties"]["tags"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("external/cwe/cwe-95"))
+        );
+    }
+
+    #[test]
+    fn fingerprints_are_stable_across_runs() {
+        let a = to_sarif(&sample());
+        let b = to_sarif(&sample());
+        let fp = |s: &Value| -> Vec<Value> {
+            s["runs"][0]["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["fingerprints"].clone())
+                .collect()
+        };
+        assert_eq!(fp(&a), fp(&b));
+    }
+
+    #[test]
+    fn failures_are_reported_as_unsuccessful_execution() {
+        let sarif = to_sarif(&sample());
+        let inv = &sarif["runs"][0]["invocations"][0];
+        assert_eq!(inv["executionSuccessful"], false);
+        assert!(
+            inv["toolExecutionNotifications"][0]["message"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("sca")
+        );
+    }
+}

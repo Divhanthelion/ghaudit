@@ -1,0 +1,38 @@
+# ghaudit configuration. Every key is optional; the values shown are the defaults.
+# Use with: ghaudit scan . -c ghaudit.toml
+# Unknown keys are rejected, so a typo is reported instead of silently ignored.
+# Command-line flags override this file.
+
+[analysis]
+sast = true        # code rules
+secrets = true     # credential detection
+sca = true         # dependency vulnerabilities via osv-scanner
+ai = false         # LLM review (see [ai])
+languages = ["rust", "python", "javascript", "typescript", "go"]
+# Gitignore-style patterns to skip, on top of .gitignore and the built-in list
+# (node_modules, vendor, target, dist, build, .venv, ...).
+exclude = []       # e.g. ["docs/**", "tests/fixtures/"]
+max_file_size = 1048576
+
+[report]
+min_severity = "low"   # info | low | medium | high | critical
+fail_on = "high"       # exit 1 at or above this severity; "never" to disable
+
+[sca]
+osv_scanner = "osv-scanner"   # name on PATH, or a full path
+extra_args = []               # e.g. ["--offline-vulnerabilities", "--download-offline-databases"]
+timeout_secs = 600
+
+[github]
+# token = "..."     # prefer the GITHUB_TOKEN environment variable
+api_url = "https://api.github.com"   # GitHub Enterprise: "https://ghe.example.com/api/v3"
+max_repos = 100
+include_forks = false
+include_archived = false
+concurrency = 4     # repositories cloned and scanned at once
+
+[ai]
+url = "http://localhost:1234/v1/chat/completions"   # any OpenAI-compatible endpoint
+model = "local-model"
+timeout_secs = 120
+max_files = 50
