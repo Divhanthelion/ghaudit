@@ -162,12 +162,21 @@ mod tests {
             "a/b/c",
             "https://github.com/onlyowner",
             "-bad/repo",
-            "o/..",
+            "o/x y",
             "https://github.com",
             "./does/not/exist/anywhere",
         ] {
             assert!(parse_scan_target(bad).is_err(), "{bad} should be rejected");
         }
+    }
+
+    #[test]
+    fn dot_names_are_not_repositories() {
+        // Checked on the validator directly: on Windows "o/.." resolves to "." and
+        // is (correctly) treated as a local directory first.
+        assert!(!valid_repo(".."));
+        assert!(!valid_repo("."));
+        assert!(valid_repo("repo.js"));
     }
 
     #[test]
