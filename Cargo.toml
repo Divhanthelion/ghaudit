@@ -54,7 +54,7 @@ tempfile = "3.20"
 futures = "0.3"
 # GitHub Actions workflow parsing (maintained fork of serde_yaml)
 serde_yaml_ng = "0.10"
-anstream = "0.6"
+anstream = "1.0"
 
 [dev-dependencies]
 assert_cmd = "2"
