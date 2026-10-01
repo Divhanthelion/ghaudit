@@ -115,6 +115,7 @@ fn json_report_finds_issues_and_skips_ignored_paths() {
             ("sast", "completed"),
             ("secrets", "completed"),
             ("sca", "skipped"),
+            ("workflows", "completed"),
             ("ai", "skipped")
         ]
     );
@@ -401,7 +402,14 @@ fn usage_errors_exit_2() {
         .code(2);
     ghaudit().args(["org", "bad org name"]).assert().code(2);
     ghaudit()
-        .args(["scan", ".", "--no-sast", "--no-sca", "--no-secrets"])
+        .args([
+            "scan",
+            ".",
+            "--no-sast",
+            "--no-sca",
+            "--no-secrets",
+            "--no-workflows",
+        ])
         .assert()
         .code(2);
 }
@@ -475,4 +483,37 @@ fn real_osv_scanner_reports_known_vulnerabilities() {
             .iter()
             .any(|f| f["dependency"]["package"] == "django")
     );
+}
+
+#[test]
+fn github_actions_workflows_are_audited() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        ".github/workflows/triage.yml",
+        "on: issues\npermissions:\n  issues: write\njobs:\n  label:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: some-org/labeler@v2\n      - run: echo \"${{ github.event.issue.title }}\"\n",
+    );
+    let (report, code) = json_report(&[
+        "scan",
+        dir.path().to_str().unwrap(),
+        "--no-sca",
+        "-f",
+        "json",
+    ]);
+    assert_eq!(
+        rule_ids(&report),
+        vec!["gha/template-injection", "gha/unpinned-action"]
+    );
+    assert_eq!(report["findings"][0]["category"], "workflow");
+    assert_eq!(report["findings"][0]["severity"], "critical");
+    assert_eq!(code, 1);
+    let (report, _) = json_report(&[
+        "scan",
+        dir.path().to_str().unwrap(),
+        "--no-sca",
+        "--no-workflows",
+        "-f",
+        "json",
+    ]);
+    assert!(rule_ids(&report).is_empty());
 }

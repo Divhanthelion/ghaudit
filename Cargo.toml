@@ -52,6 +52,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 tempfile = "3.20"
 futures = "0.3"
+# GitHub Actions workflow parsing (maintained fork of serde_yaml)
+serde_yaml_ng = "0.10"
 anstream = "0.6"
 
 [dev-dependencies]

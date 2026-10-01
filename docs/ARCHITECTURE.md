@@ -12,7 +12,7 @@ flowchart LR
     T -->|owner/repo| G["git.rs<br/>shallow clone to temp dir"]
     T -->|org / user / search| API["github.rs<br/>list repositories"] --> G
     G --> D["discovery.rs<br/>pick files"]
-    D --> L["per-file analysis (rayon)<br/>sast.rs + secrets.rs"]
+    D --> L["per-file analysis (rayon)<br/>sast.rs, secrets.rs,<br/>workflows.rs, unicode.rs"]
     D --> S["sca.rs<br/>osv-scanner subprocess"]
     L --> AI["ai.rs (optional)<br/>LLM review"]
     L --> R["model.rs<br/>ScanReport"]
@@ -125,6 +125,43 @@ The engine works like this:
   `every_rule_matches_its_examples_and_not_its_counter_examples` runs all of them. A
   rule that stops matching, or starts over-matching, fails the build.
 
+#### GitHub Actions workflows (`analyzer/workflows.rs`)
+
+Each `.github/workflows/*.yml` file is parsed with `serde_yaml_ng`. The checks then run
+over the structure:
+
+1. `on:` is collected as a set of triggers. `on:` may be a string, a list or a map.
+2. Each job and its steps are walked in order.
+3. The checks combine the trigger set with what a step does.
+
+Some examples of how the checks combine:
+
+- `${{ github.event.issue.title }}` inside `run:` is always injection. It is
+  **critical** when the trigger is privileged (`pull_request_target`, `issue_comment`,
+  `workflow_run`, ...), because the job then holds secrets and a write token.
+- `actions/checkout` with `ref: ${{ github.event.pull_request.head.sha }}` is only a
+  problem on `pull_request_target`/`workflow_run`. On `pull_request` it is the safe,
+  normal pattern, so it is not flagged.
+
+The list of attacker-controlled contexts (`ATTACKER_CONTEXT`) follows GitHub's
+security-hardening guidance and zizmor's context analysis. Excluded are values an
+outsider cannot shape freely: numbers, SHAs, repository names.
+
+Line numbers are found by searching the source text forward from the previous match,
+so repeated text resolves to the occurrence being checked.
+
+#### Hidden Unicode (`analyzer/unicode.rs`)
+
+This runs on source files and on AI-agent instruction files. It looks for:
+
+- bidirectional controls (U+202A–202E, U+2066–2069);
+- Unicode tag characters (U+E0000–E007F);
+- zero-width characters, in agent files only.
+
+Flag emoji (which legitimately use tag characters), a leading byte-order mark, and
+zero-width joiners in emoji are allowed. The snippet shows each hidden character as
+`<U+XXXX>`.
+
 #### Secrets (`analyzer/secrets.rs`)
 
 There are two passes:
@@ -203,6 +240,8 @@ The three formats:
 
 | Decision | Why |
 |---|---|
+| Workflow checks are static and per file | They need no API calls, so they cost nothing extra in org-scale scans. That is ghaudit's niche next to deeper single-repo tools like zizmor. |
+| ghaudit's own CI pins every action by SHA, and releases use no caches | It follows its own advice: see `.github/workflows/`. Release binaries carry signed build provenance. |
 | Delegate dependency scanning to osv-scanner | Lockfile parsing and per-ecosystem version matching are large, subtle problems that Google maintains well. The old hand-written version mis-parsed versions and lost all severities. |
 | Small, precise rule set | A scanner that flags every `unwrap()` or file read gets ignored. Every rule must ship with examples and near-misses. |
 | System `git` and pure-Rust TLS (rustls + ring) | No C libraries to build, so `cargo install` works on Windows, macOS and Linux. Proxies and credentials behave like the user's own git. |

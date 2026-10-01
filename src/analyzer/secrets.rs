@@ -79,15 +79,19 @@ static PROVIDERS: LazyLock<Vec<Provider>> = LazyLock::new(|| {
         ),
         provider(
             "secret/gitlab-token",
-            "GitLab personal access token",
-            r"\b(glpat-[A-Za-z0-9_\-]{20,})\b",
+            "GitLab token",
+            // Personal, deploy, runner, CI-build, trigger, feed, OAuth... tokens, including
+            // the routable format (`glpat-<payload>.<2><7>`) introduced in GitLab 17.
+            r"\b((?:glpat|gldt|glrt|glcbt|glptt|glft|glffct|glimt|glagent|gloas|glsoat)-[0-9A-Za-z_\-]{20,300}(?:\.[0-9a-z]{9})?)",
             S::Critical,
             C::High,
         ),
         provider(
             "secret/slack-token",
             "Slack token",
-            r"\b(xox[abposr]-[A-Za-z0-9-]{10,})\b",
+            // Bot/user/legacy tokens, rotating (xoxe.xoxb-) and refresh (xoxe-) tokens,
+            // and app-level tokens (xapp-).
+            r"\b(xoxe\.xox[bp]-\d-[A-Za-z0-9]{100,}|xox[abposre]-[A-Za-z0-9-]{10,}|xapp-\d-[A-Za-z0-9-]{20,})",
             S::High,
             C::High,
         ),
@@ -652,6 +656,29 @@ mod tests {
                 ids(&found)
             );
         }
+    }
+
+    #[test]
+    fn gitlab_and_slack_current_formats() {
+        let routable = tok(&[
+            "glpat-",
+            "YzowCm86MTpwOjE3ZnA0dGcuMDHpqlKHnlEA",
+            ".121e8269o",
+        ]);
+        let found = detect("ci.env", &format!("TOKEN={routable}\n"));
+        assert_eq!(ids(&found), vec!["secret/gitlab-token"]);
+        assert_eq!(
+            found[0].location.end_column - found[0].location.start_column,
+            routable.len(),
+            "whole routable token matched"
+        );
+        let runner = tok(&["glrt-", "t1_Zx9Qp2Lm7Kw4Rt8VbN3c"]);
+        assert_eq!(ids(&detect("a.sh", &runner)), vec!["secret/gitlab-token"]);
+        let app = tok(&["xapp-1-", "A0123456789-1234567890123-abcdef0123456789"]);
+        assert_eq!(
+            ids(&detect("a.py", &format!("t = '{app}'"))),
+            vec!["secret/slack-token"]
+        );
     }
 
     #[test]

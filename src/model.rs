@@ -132,6 +132,8 @@ pub enum Category {
     Secret,
     /// Known vulnerability in a third-party dependency (via osv-scanner).
     Dependency,
+    /// Insecure GitHub Actions workflow configuration.
+    Workflow,
     /// Issue suggested by a language model. Always needs human review.
     Ai,
 }
@@ -142,6 +144,7 @@ impl Category {
             Category::Sast => "code",
             Category::Secret => "secret",
             Category::Dependency => "dependency",
+            Category::Workflow => "workflow",
             Category::Ai => "ai",
         }
     }

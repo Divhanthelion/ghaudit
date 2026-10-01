@@ -159,6 +159,7 @@ fn write_summary(out: &mut String, s: &Style, report: &ScanReport) {
         Category::Sast,
         Category::Secret,
         Category::Dependency,
+        Category::Workflow,
         Category::Ai,
     ]
     .iter()

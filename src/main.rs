@@ -2,7 +2,7 @@
 
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use ghaudit::analyzer::rules;
+use ghaudit::analyzer::{rules, workflows};
 use ghaudit::config::{Config, FailOn, SUPPORTED_LANGUAGES};
 use ghaudit::model::{ScanReport, Severity};
 use ghaudit::report::{self, Format};
@@ -129,6 +129,10 @@ struct ScanArgs {
     /// Skip dependency vulnerability scanning (osv-scanner)
     #[arg(long)]
     no_sca: bool,
+
+    /// Skip GitHub Actions workflow checks
+    #[arg(long)]
+    no_workflows: bool,
 
     /// Also ask a local LLM to review source files (OpenAI-compatible endpoint, e.g. LM Studio)
     #[arg(long)]
@@ -296,6 +300,7 @@ fn apply_scan_args(config: &mut Config, scan: ScanArgs, multi: MultiArgs) -> any
     a.sast &= !scan.no_sast;
     a.secrets &= !scan.no_secrets;
     a.sca &= !scan.no_sca;
+    a.workflows &= !scan.no_workflows;
     a.ai |= scan.ai;
     if let Some(langs) = scan.languages {
         a.languages = langs
@@ -326,6 +331,7 @@ fn apply_scan_args(config: &mut Config, scan: ScanArgs, multi: MultiArgs) -> any
     if !(config.analysis.sast
         || config.analysis.secrets
         || config.analysis.sca
+        || config.analysis.workflows
         || config.analysis.ai)
     {
         bail!("every analyzer is disabled; nothing to do");
@@ -373,28 +379,35 @@ fn write_stdout(report: &ScanReport, format: Format, color: ColorChoice) -> anyh
 }
 
 fn print_rules(format: Format) -> anyhow::Result<()> {
-    let all: Vec<&rules::Rule> = rules::all().collect();
+    let code: Vec<&rules::Rule> = rules::all().collect();
     if format != Format::Text {
-        let json: Vec<serde_json::Value> = all
+        let mut json: Vec<serde_json::Value> = code
             .iter()
             .map(|r| {
                 serde_json::json!({
-                    "id": r.id, "name": r.name, "severity": r.severity, "confidence": r.confidence,
+                    "id": r.id, "kind": "code", "name": r.name, "severity": r.severity, "confidence": r.confidence,
                     "cwe": r.cwe, "description": r.message, "remediation": r.remediation,
                 })
             })
             .collect();
+        json.extend(workflows::RULES.iter().map(|r| {
+            serde_json::json!({ "id": r.id, "kind": "workflow", "name": r.name, "severity": r.severity })
+        }));
         println!("{}", serde_json::to_string_pretty(&json)?);
         return Ok(());
     }
     println!("{:<34} {:<9} NAME", "RULE", "SEVERITY");
-    for r in &all {
+    for r in &code {
+        println!("{:<34} {:<9} {}", r.id, r.severity.as_str(), r.name);
+    }
+    for r in workflows::RULES {
         println!("{:<34} {:<9} {}", r.id, r.severity.as_str(), r.name);
     }
     println!(
-        "\n{} rules for {}. Secrets and dependency checks are listed in the README.",
-        all.len(),
-        SUPPORTED_LANGUAGES.join(", ")
+        "\n{} code rules for {}, {} GitHub Actions workflow checks. Secret, dependency and hidden-Unicode checks are described in the README.",
+        code.len(),
+        SUPPORTED_LANGUAGES.join(", "),
+        workflows::RULES.len()
     );
     Ok(())
 }

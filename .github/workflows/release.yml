@@ -1,0 +1,108 @@
+name: Release
+
+# Push a tag like v0.2.0 to build binaries for Linux, macOS and Windows, attach them to
+# a GitHub release with checksums, and record signed build provenance for each file.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+# No dependency caches here on purpose: a cache written by a less trusted workflow is a
+# known way to poison release builds (Ultralytics 2024, TanStack 2026).
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Check the tag matches the crate version
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f2)
+          if [ "v$version" != "$TAG" ]; then
+            echo "::error::tag $TAG does not match Cargo.toml version $version"
+            exit 1
+          fi
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          name="ghaudit-$TAG-$TARGET"
+          mkdir -p "dist/$name"
+          cp "target/$TARGET/release/ghaudit" README.md LICENSE CHANGELOG.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          rm -r "dist/$name"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          $name = "ghaudit-$env:TAG-$env:TARGET"
+          New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
+          Copy-Item "target/$env:TARGET/release/ghaudit.exe", README.md, LICENSE, CHANGELOG.md "dist/$name/"
+          Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
+          Remove-Item -Recurse "dist/$name"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ghaudit-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release
+      id-token: write # sign build provenance
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum ghaudit-* > SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/ghaudit-*
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

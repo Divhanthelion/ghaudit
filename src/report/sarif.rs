@@ -13,6 +13,18 @@ use std::collections::HashMap;
 
 const SCHEMA: &str = "https://json.schemastore.org/sarif-2.1.0.json";
 const INFO_URI: &str = "https://github.com/Divhanthelion/ghaudit";
+/// GitHub code scanning shows at most this many results per run.
+pub const MAX_RESULTS: usize = 5000;
+/// GitHub truncates rule descriptions beyond this length.
+const MAX_DESCRIPTION: usize = 1000;
+
+fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        text.to_string()
+    } else {
+        format!("{}…", text.chars().take(max - 1).collect::<String>())
+    }
+}
 
 fn level(sev: Severity) -> &'static str {
     match sev {
@@ -67,8 +79,8 @@ fn rule(f: &Finding) -> Value {
     let mut rule = json!({
         "id": f.rule_id,
         "name": f.rule_id,
-        "shortDescription": { "text": short },
-        "fullDescription": { "text": full },
+        "shortDescription": { "text": clip(&short, MAX_DESCRIPTION) },
+        "fullDescription": { "text": clip(&full, MAX_DESCRIPTION) },
         "defaultConfiguration": { "level": level(f.severity) },
         "properties": {
             "tags": tags,
@@ -120,7 +132,9 @@ fn result(f: &Finding, rule_index: usize) -> Value {
             }
         }],
         "fingerprints": { "ghaudit/v1": f.fingerprint },
-        "partialFingerprints": { "primaryLocationLineHash": f.fingerprint },
+        // Our own key: GitHub's upload action computes primaryLocationLineHash itself and
+        // warns when a supplied value differs from its own.
+        "partialFingerprints": { "ghaudit/v1": f.fingerprint },
         "properties": {
             "category": f.category.label(),
             "severity": f.severity.as_str(),
@@ -130,16 +144,23 @@ fn result(f: &Finding, rule_index: usize) -> Value {
 }
 
 pub fn to_sarif(report: &ScanReport) -> Value {
+    // Keep the most severe findings if there are more than GitHub will display.
+    let mut findings: Vec<&Finding> = report.findings.iter().collect();
+    let dropped = findings.len().saturating_sub(MAX_RESULTS);
+    if dropped > 0 {
+        findings.sort_by_key(|f| std::cmp::Reverse(f.severity));
+        findings.truncate(MAX_RESULTS);
+    }
+
     let mut rules = Vec::new();
     let mut index: HashMap<&str, usize> = HashMap::new();
-    for f in &report.findings {
+    for f in &findings {
         if !index.contains_key(f.rule_id.as_str()) {
             index.insert(&f.rule_id, rules.len());
             rules.push(rule(f));
         }
     }
-    let results: Vec<Value> = report
-        .findings
+    let results: Vec<Value> = findings
         .iter()
         .map(|f| result(f, index[f.rule_id.as_str()]))
         .collect();
@@ -152,6 +173,9 @@ pub fn to_sarif(report: &ScanReport) -> Value {
         .chain(report.repositories.iter().filter_map(|r| {
             r.error.as_ref().map(|e| json!({ "level": "error", "message": { "text": format!("{}: {e}", r.name) } }))
         }))
+        .chain((dropped > 0).then(|| json!({ "level": "warning", "message": { "text": format!(
+            "{dropped} lower-severity findings omitted: SARIF consumers such as GitHub show at most {MAX_RESULTS} results per run. Use JSON output for the full list."
+        ) } })))
         .collect();
 
     let run = json!({
@@ -278,6 +302,44 @@ mod tests {
                 .collect()
         };
         assert_eq!(fp(&a), fp(&b));
+    }
+
+    #[test]
+    fn large_reports_keep_the_most_severe_results() {
+        let mut r = ScanReport::new("big");
+        for i in 0..MAX_RESULTS + 10 {
+            let sev = if i < 3 {
+                Severity::Critical
+            } else {
+                Severity::Low
+            };
+            r.findings.push(Finding::new(
+                "t/r",
+                Category::Sast,
+                sev,
+                Confidence::High,
+                "t",
+                "x".repeat(2000),
+                Location::new("a.py", i + 1, 1),
+                &i.to_string(),
+            ));
+        }
+        r.finalize(Severity::Low);
+        let sarif = to_sarif(&r);
+        let run = &sarif["runs"][0];
+        let results = run["results"].as_array().unwrap();
+        assert_eq!(results.len(), MAX_RESULTS);
+        assert_eq!(results.iter().filter(|x| x["level"] == "error").count(), 3);
+        let desc = run["tool"]["driver"]["rules"][0]["fullDescription"]["text"]
+            .as_str()
+            .unwrap();
+        assert_eq!(desc.chars().count(), MAX_DESCRIPTION);
+        assert!(
+            run["invocations"][0]["toolExecutionNotifications"][0]["message"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("10 lower-severity")
+        );
     }
 
     #[test]

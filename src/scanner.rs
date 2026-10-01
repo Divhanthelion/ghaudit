@@ -14,6 +14,7 @@ use crate::analyzer::ai::AiAnalyzer;
 use crate::analyzer::sast::SastEngine;
 use crate::analyzer::sca::OsvScanner;
 use crate::analyzer::secrets::{SecretDetector, redact_snippets};
+use crate::analyzer::{unicode, workflows};
 use crate::config::Config;
 use crate::discovery::{self, DiscoveryOptions, SourceFile};
 use crate::error::{Error, Result};
@@ -28,12 +29,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
-pub const ANALYZERS: [&str; 4] = ["sast", "secrets", "sca", "ai"];
+pub const ANALYZERS: [&str; 5] = ["sast", "secrets", "sca", "workflows", "ai"];
 
 /// Per-file analyzers, shared with blocking worker threads.
 struct LocalEngines {
     sast: Option<SastEngine>,
     secrets: Option<SecretDetector>,
+    workflows: bool,
 }
 
 pub struct Scanner {
@@ -82,7 +84,11 @@ impl Scanner {
         };
         let github = GitHub::new(&config.github.api_url, config.github.token.clone())?;
         Ok(Self {
-            local: Arc::new(LocalEngines { sast, secrets }),
+            local: Arc::new(LocalEngines {
+                sast,
+                secrets,
+                workflows: a.workflows,
+            }),
             sca,
             ai,
             github,
@@ -223,6 +229,7 @@ impl Scanner {
             "sast" => a.sast,
             "secrets" => a.secrets,
             "sca" => a.sca,
+            "workflows" => a.workflows,
             "ai" => a.ai,
             _ => false,
         }
@@ -280,6 +287,8 @@ impl Scanner {
             }
         });
 
+        dir.analyzers
+            .push(status("workflows", self.local.workflows));
         dir.analyzers.push(match &self.ai {
             None => AnalyzerStatus::skipped("ai", "disabled (enable with --ai)"),
             Some(ai) => self.run_ai(ai, &files, &mut dir.findings).await,
@@ -383,13 +392,23 @@ fn analyze_files(engines: &LocalEngines, files: &[SourceFile]) -> LocalResults {
                 matches!((&engines.sast, file.language), (Some(e), Some(l)) if e.handles(l));
             let wants_secrets =
                 engines.secrets.is_some() && SecretDetector::should_scan(&file.rel_path);
-            if !wants_sast && !wants_secrets {
+            let wants_workflow = engines.workflows && workflows::is_workflow(&file.rel_path);
+            // Hidden-Unicode checks ride along with code analysis.
+            let wants_unicode =
+                engines.sast.is_some() && unicode::applies_to(&file.rel_path, file.language);
+            if !(wants_sast || wants_secrets || wants_workflow || wants_unicode) {
                 return None;
             }
             let content = discovery::read_text(&file.abs_path)?;
             let mut found = Vec::new();
             if let (true, Some(engine), Some(lang)) = (wants_sast, &engines.sast, file.language) {
                 found.extend(engine.analyze(&file.rel_path, lang, &content));
+            }
+            if wants_unicode {
+                found.extend(unicode::detect(&file.rel_path, &content));
+            }
+            if wants_workflow {
+                found.extend(workflows::analyze(&file.rel_path, &content));
             }
             if let (true, Some(detector)) = (wants_secrets, &engines.secrets) {
                 let secrets = detector.detect(&file.rel_path, &content);

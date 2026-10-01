@@ -66,6 +66,9 @@ impl OsvScanner {
             "--recursive",
             "--all-packages",
             "--allow-no-lockfiles",
+            // Report everything in the JSON and exit code, including findings osv-scanner
+            // would otherwise de-emphasize (e.g. Debian "unimportant").
+            "--all-vulns",
             "--format",
             "json",
         ])
@@ -90,23 +93,26 @@ impl OsvScanner {
         };
 
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // 0: no vulnerabilities, 1: vulnerabilities found. Anything else is an error.
-        match output.status.code() {
-            Some(0 | 1) => {}
-            code => {
-                let tail: Vec<&str> = stderr.lines().rev().take(3).collect();
-                let tail: Vec<&str> = tail.into_iter().rev().collect();
-                return Err(format!(
-                    "osv-scanner exited with {}: {}",
-                    code.map_or("a signal".to_string(), |c| format!("status {c}")),
-                    tail.join(" | ")
-                ));
-            }
-        }
-
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let parsed = parse_output(&stdout)
-            .map_err(|e| format!("could not parse osv-scanner output: {e}"))?;
+        let failure = |code: Option<i32>| {
+            let tail: Vec<&str> = stderr.lines().rev().take(3).collect();
+            let tail: Vec<&str> = tail.into_iter().rev().collect();
+            format!(
+                "osv-scanner exited with {}: {}",
+                code.map_or("a signal".to_string(), |c| format!("status {c}")),
+                tail.join(" | ")
+            )
+        };
+        // 0: clean, 1: vulnerabilities found, 128: no packages found.
+        // 127: an error was logged but no vulnerabilities were found; the JSON on stdout
+        //      is still complete, so use it and surface the error as a warning.
+        // Anything else (129: API failure, 130: bad config, ...) is a failure.
+        let parsed = match output.status.code() {
+            Some(0 | 1 | 128) => parse_output(&stdout)
+                .map_err(|e| format!("could not parse osv-scanner output: {e}"))?,
+            Some(127) => parse_output(&stdout).map_err(|_| failure(Some(127)))?,
+            code => return Err(failure(code)),
+        };
         let mut outcome = convert(&parsed, &root);
         outcome.warnings = warnings_from(&stderr);
         Ok(outcome)
@@ -253,7 +259,11 @@ fn group_finding(
         .unwrap_or_default();
 
     let cvss_score = group.max_severity.trim().parse::<f64>().ok();
+    // OpenSSF malicious-package reports (MAL-...) carry no CVSS score, but the package
+    // itself is malware: installing it may already have compromised the machine.
+    let malicious = group.ids.iter().any(|id| id.starts_with("MAL-"));
     let severity = match cvss_score {
+        _ if malicious => Severity::Critical,
         Some(score) => Severity::from_cvss_score(score),
         None => in_group
             .iter()
@@ -314,6 +324,10 @@ fn group_finding(
         pkg.ecosystem, pkg.name, version
     );
     let remediation = match fixed_versions.first() {
+        _ if malicious => format!(
+            "Remove {} immediately. Treat every machine and CI runner that installed it as compromised: rotate the credentials they could reach.",
+            pkg.name
+        ),
         Some(v) => format!("Upgrade {} to {v} or later.", pkg.name),
         None => "No fixed version is published. Check the advisory for workarounds, or replace the package.".to_string(),
     };
@@ -727,6 +741,22 @@ mod tests {
     }
 
     #[test]
+    fn malicious_package_reports_are_critical() {
+        let json = r#"{"results":[{"source":{"path":"/r/package-lock.json"},"packages":[{"package":{"name":"evil-lib","version":"1.0.0","ecosystem":"npm"},
+            "groups":[{"ids":["MAL-2025-1234"],"aliases":[],"max_severity":""}],
+            "vulnerabilities":[{"id":"MAL-2025-1234","summary":"Malicious code in evil-lib (npm)","affected":[]}]}]}]}"#;
+        let o = convert(&parse_output(json).unwrap(), Path::new("/r"));
+        assert_eq!(o.findings[0].severity, Severity::Critical);
+        assert!(
+            o.findings[0]
+                .remediation
+                .as_deref()
+                .unwrap()
+                .contains("compromised")
+        );
+    }
+
+    #[test]
     fn version_comparison() {
         assert_eq!(compare_versions("2.0.8", "2.0.0"), Some(Ordering::Greater));
         assert_eq!(compare_versions("1.11.15", "2.0.0"), Some(Ordering::Less));
@@ -822,6 +852,30 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(err.contains("timed out"), "{err}");
+        }
+
+        #[tokio::test]
+        async fn exit_127_with_complete_json_is_a_warning_not_a_failure() {
+            let tmp = tempfile::tempdir().unwrap();
+            let program = fake_scanner(
+                tmp.path(),
+                "echo '{\"results\": []}'\necho 'failed resolution for requirements.txt' >&2\nexit 127",
+            );
+            let outcome = OsvScanner::new(program, vec![], &[], Duration::from_secs(30))
+                .scan(tmp.path())
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome.warnings,
+                vec!["failed resolution for requirements.txt".to_string()]
+            );
+
+            let program = fake_scanner(tmp.path(), "echo 'API down' >&2\nexit 129");
+            let err = OsvScanner::new(program, vec![], &[], Duration::from_secs(30))
+                .scan(tmp.path())
+                .await
+                .unwrap_err();
+            assert!(err.contains("status 129"), "{err}");
         }
 
         #[tokio::test]

@@ -7,6 +7,7 @@
 sast = true        # code rules
 secrets = true     # credential detection
 sca = true         # dependency vulnerabilities via osv-scanner
+workflows = true   # GitHub Actions workflow checks
 ai = false         # LLM review (see [ai])
 languages = ["rust", "python", "javascript", "typescript", "go"]
 # Gitignore-style patterns to skip, on top of .gitignore and the built-in list

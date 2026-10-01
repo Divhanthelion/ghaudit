@@ -50,6 +50,27 @@ A rebuild of the scanner with a focus on correct, trustworthy results.
 - **Remote repositories** are cloned with the system `git`. Tokens are passed without
   exposing them on the command line, and clones are always cleaned up.
 - **Config files** reject unknown keys; `ghaudit.example.toml` documents every setting.
+- **GitHub Actions workflow checks** (new). Nine checks: template injection, pwn-request
+  checkouts, unpinned and previously compromised actions, token permissions,
+  publicly-triggerable jobs with secrets, self-hosted runners, `secrets: inherit`, and
+  `toJSON(secrets)`.
+- **Hidden Unicode checks** (new): Trojan Source bidi characters, and invisible text in
+  code and AI-agent instruction files.
+- **Malicious packages**: OpenSSF `MAL-` advisories are reported as critical.
+- **osv-scanner integration hardening.**
+  - Passes `--all-vulns`.
+  - Treats exit code 127 with complete JSON as a warning.
+  - Accepts exit 128 (no packages).
+- **SARIF.**
+  - Caps output at 5,000 results, keeping the most severe and noting the rest.
+  - Truncates descriptions to GitHub's 1,000-character limit.
+  - Uses its own `partialFingerprints` key.
+- **Secret formats.** Current GitLab token formats (routable PATs and deploy, runner and
+  CI tokens) and Slack rotating, refresh and app tokens.
+- **Release binaries** for Linux (x86_64, arm64), macOS (Intel, Apple silicon) and
+  Windows. They ship with checksums and signed build provenance.
+- **CI.** Every action is pinned to a commit SHA, and Dependabot keeps the pins
+  current.
 
 ### Removed
 

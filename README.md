@@ -12,8 +12,16 @@ repository, or a whole organization, and it reports:
 - **Leaked credentials** in any text file, including `.env`, YAML and JSON. This covers
   20 provider formats (GitHub, AWS, Stripe, OpenAI, Anthropic, GitLab, npm, ...) plus
   secret-named assignments. Secrets are always masked in the output.
-- **Vulnerable dependencies** in every common lockfile and manifest, via Google's
-  [osv-scanner](https://github.com/google/osv-scanner) and the OSV database.
+- **Vulnerable and malicious dependencies** in every common lockfile and manifest, via
+  Google's [osv-scanner](https://github.com/google/osv-scanner) and the OSV database.
+- **Insecure GitHub Actions workflows**. These are the patterns behind the 2024–2026 CI
+  supply-chain attacks:
+  - script injection;
+  - "pwn request" checkouts;
+  - unpinned or previously compromised actions;
+  - over-broad tokens and secrets reachable by anyone.
+- **Hidden Unicode**: Trojan Source bidi tricks in code, and invisible instructions in
+  AI-agent files such as `.cursorrules`, `CLAUDE.md` and `.mcp.json`.
 
 Results come out as readable text, JSON, or SARIF for GitHub code scanning. The exit
 codes are designed for CI gates.
@@ -39,16 +47,27 @@ HIGH     code       SQL built from strings  [python/sql-injection]
            Fix: Pass values as parameters: cursor.execute("... WHERE id = %s", (user_id,)), ...
 
 Findings: 4 critical, 12 high, 14 medium, 4 low  (5 code, 2 secret, 27 dependency)
-Analyzers: sast ok  secrets ok  sca ok  ai off
+Analyzers: sast ok  secrets ok  sca ok  workflows ok  ai off
 ```
 
 ## Install
+
+Download a binary for Linux, macOS or Windows from
+[Releases](https://github.com/Divhanthelion/ghaudit/releases). Every release ships
+`SHA256SUMS` and signed build provenance, so you can check that a binary was built by
+this repository's release workflow from the tagged source:
+
+```bash
+gh attestation verify ghaudit-v0.2.0-x86_64-unknown-linux-gnu.tar.gz --repo Divhanthelion/ghaudit
+```
+
+Or build from source (Rust 1.88+):
 
 ```bash
 cargo install --git https://github.com/Divhanthelion/ghaudit
 ```
 
-This needs Rust 1.88+ and `git` on your `PATH`. Dependency scanning also needs
+ghaudit needs `git` on your `PATH` for remote scans. Dependency scanning also needs
 [osv-scanner](https://google.github.io/osv-scanner/installation/) v2:
 
 ```bash
@@ -80,7 +99,7 @@ Common options:
 |---|---|
 | `-f text\|json\|sarif` | Report format (default `text`) |
 | `-o FILE` | Write the report to a file (checked before the scan starts) |
-| `--no-sast`, `--no-secrets`, `--no-sca` | Turn analyzers off |
+| `--no-sast`, `--no-secrets`, `--no-sca`, `--no-workflows` | Turn analyzers off |
 | `--languages rust,python` | Limit code analysis to these languages |
 | `--exclude 'docs/**'` | Skip paths (gitignore syntax; repeatable; also applied to osv-scanner) |
 | `--min-severity medium` | Leave lower-severity findings out of the report |
@@ -189,6 +208,36 @@ Lockfiles and minified files are skipped. Provider tokens are reported even in t
 directories, because a live token in a fixture is still leaked. Generic matches are
 skipped in tests, examples and docs.
 
+### GitHub Actions workflows
+
+Files in `.github/workflows/` are checked for:
+
+| Rule | Severity | What | Real-world example |
+|---|---|---|---|
+| `gha/template-injection` | critical\* | `${{ github.event.issue.title }}`-style attacker-controlled values pasted into `run:` or `github-script` | Ultralytics (2024), nx "s1ngularity" (2025) |
+| `gha/untrusted-checkout` | critical | `pull_request_target`/`workflow_run` that checks out and runs the PR's code ("pwn request") | Trivy, TanStack, AsyncAPI (2026) |
+| `gha/compromised-action` | high | Mutable tag of an action whose tags were hijacked before | tj-actions/changed-files (2025), trivy-action (2026) |
+| `gha/unpinned-action` | medium\*\* | `uses:` by tag or branch instead of a commit SHA | same |
+| `gha/excessive-permissions` | high / medium | `permissions: write-all`, or no permissions block on a privileged trigger | |
+| `gha/public-trigger-with-secrets` | high | Issue/comment-triggered job that uses secrets without checking who triggered it | |
+| `gha/self-hosted-runner` | medium | Self-hosted runner reachable from pull requests | Shai-Hulud 2.0 (2025) |
+| `gha/secrets-inherit` | medium | `secrets: inherit` into an external reusable workflow | |
+| `gha/all-secrets-exposed` | high | `toJSON(secrets)` | |
+
+\* Medium when the trigger cannot carry secrets (e.g. `pull_request` from a fork).
+\*\* Low for GitHub's own `actions/*` and `github/*`.
+
+These are deliberately a high-confidence subset. For deeper workflow analysis, use
+[zizmor](https://github.com/zizmorcore/zizmor) as well.
+
+### Hidden Unicode
+
+- `unicode/bidi-control`: bidirectional control characters in source code, which make
+  code display differently from how it runs (Trojan Source, CVE-2021-42574).
+- `unicode/invisible-text`: zero-width and Unicode "tag" characters, which can hide
+  instructions in AI agent rule files (`.cursorrules`, `AGENTS.md`, `CLAUDE.md`,
+  `.github/copilot-instructions.md`, MCP configs) and in code.
+
 ### Dependencies
 
 osv-scanner reads Cargo.lock, package-lock.json, yarn.lock, pnpm-lock.yaml,
@@ -197,6 +246,9 @@ composer.lock, pom.xml, gradle lockfiles and more, at any depth.
 
 Each advisory becomes one finding. It carries the CVSS-based severity, the advisory ID
 and its aliases (CVE, GHSA, ...), the lockfile line, and the lowest version that fixes it.
+
+Known-malicious packages (OpenSSF `MAL-` reports) are always critical, because
+installing one may already have compromised the machine.
 
 ## Suppressing findings
 
@@ -229,6 +281,8 @@ medium: treat them as leads, not verdicts.
   [gitleaks](https://github.com/gitleaks/gitleaks) or
   [trufflehog](https://github.com/trufflesecurity/trufflehog) over history when it matters.
 - Repositories are cloned at depth 1 from their default branch.
+- Workflow checks read workflow files only; they don't inspect what a referenced action
+  does internally, or repository settings such as branch protection.
 
 ## Documentation
 

@@ -56,6 +56,8 @@ pub struct AnalysisConfig {
     pub sast: bool,
     pub secrets: bool,
     pub sca: bool,
+    /// GitHub Actions workflow checks.
+    pub workflows: bool,
     pub ai: bool,
     /// Languages the SAST engine analyzes. Secrets are searched in every text file.
     pub languages: Vec<String>,
@@ -71,6 +73,7 @@ impl Default for AnalysisConfig {
             sast: true,
             secrets: true,
             sca: true,
+            workflows: true,
             ai: false,
             languages: SUPPORTED_LANGUAGES.iter().map(|s| s.to_string()).collect(),
             exclude: Vec::new(),
