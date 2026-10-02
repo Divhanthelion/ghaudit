@@ -399,6 +399,13 @@ impl SecretDetector {
     fn scan(&self, rel_path: &str, content: &str, binary: bool) -> SecretScan {
         let index = LineIndex::new(content);
         let test = is_test_path(rel_path);
+        // Rust keeps unit tests in the source file, under `#[cfg(test)]`.
+        let test_code = if !test && !binary && rel_path.ends_with(".rs") {
+            crate::analyzer::sast::rust_test_ranges(content)
+        } else {
+            Vec::new()
+        };
+        let in_test_code = |offset: usize| test_code.iter().any(|r| r.contains(&offset));
         let mut findings = Vec::new();
         let mut values: Vec<String> = Vec::new();
         // Byte ranges already reported, so one value is reported once.
@@ -428,7 +435,8 @@ impl SecretDetector {
                     values.push(body.as_str().to_string());
                 }
                 let mut severity = p.severity;
-                if test {
+                let unit_test = in_test_code(m.start());
+                if test || unit_test {
                     // Most keys and tokens in tests and docs are fakes: report, quietly.
                     severity = if is_key {
                         Severity::Low
@@ -450,6 +458,8 @@ impl SecretDetector {
                     finding
                         .message
                         .push_str(" (in test, example or documentation files)");
+                } else if unit_test {
+                    finding.message.push_str(" (in test code)");
                 }
                 if binary {
                     finding.message.push_str(" (in a binary file)");
@@ -472,7 +482,11 @@ impl SecretDetector {
                 let (Some(key), Some(val)) = (caps.name("key"), caps.name("val")) else {
                     continue;
                 };
-                if overlaps(&covered, &val) || NON_SECRET_KEY.is_match(key.as_str()) {
+                // Generic matches in tests are fixtures, as in test files (skipped above).
+                if overlaps(&covered, &val)
+                    || NON_SECRET_KEY.is_match(key.as_str())
+                    || in_test_code(val.start())
+                {
                     continue;
                 }
                 let value = val.as_str();
@@ -575,9 +589,18 @@ fn is_placeholder(value: &str) -> bool {
     }
 }
 
-/// `${DB_PASSWORD}`, `$PASSWORD`, `%(pw)s`: the connection string reads it from elsewhere.
+/// `${DB_PASSWORD}`, `$PASSWORD`, `%(pw)s`, `env:API_KEY`: the value is read from elsewhere.
 fn is_reference(value: &str) -> bool {
-    value.starts_with('$') || value.starts_with('%') || value.starts_with('{')
+    value.starts_with('$') || value.starts_with('%') || value.starts_with('{') || {
+        // `env:NAME`, as LLM gateway and agent configs write environment lookups.
+        value
+            .get(..4)
+            .is_some_and(|p| p.eq_ignore_ascii_case("env:"))
+            && value.len() > 4
+            && value[4..]
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
 }
 
 fn distinct_chars(s: &str) -> usize {
@@ -892,6 +915,7 @@ mod tests {
             ("app.py", "password = \"changeme123\""),
             ("app.py", "api_key = \"<your-api-key>\""),
             ("app.py", "token = \"${GITHUB_TOKEN}\""),
+            ("blueprint.txt", "\"api_key\": \"env:OPENROUTER_API_KEY\","),
             ("app.js", "const SECRET_KEY = \"SECRET_KEY_NAME\";"),
             ("app.js", "const passwordField = \"user-password-input\";"),
             ("app.py", "token_url = \"https://example.com/oauth/token\""),
@@ -945,6 +969,38 @@ mod tests {
             ids(&detect("tests/fixtures/repo.json", &gh)),
             vec!["secret/github-token"]
         );
+    }
+
+    #[test]
+    fn rust_unit_tests_count_as_test_code() {
+        let pw = tok(&["Tr0ub4", "dor&3xq"]);
+        let gh = tok(&["ghp_", "R8d2kLq9ZxT4mWn7Bv1Cy6Pa3Hs5Je0Fu2Gk"]);
+        let src = format!(
+            "fn real() {{ let password = \"{pw}\"; }}\n\
+             \n\
+             #[cfg(test)]\n\
+             mod tests {{\n\
+             \x20   #[test]\n\
+             \x20   fn hashes() {{\n\
+             \x20       let password = \"{pw}\";\n\
+             \x20       let token = \"{gh}\";\n\
+             \x20   }}\n\
+             }}\n\
+             \n\
+             #[tokio::test(flavor = \"multi_thread\")]\n\
+             async fn more() {{ let secret = \"{pw}\"; }}\n"
+        );
+        let hits = detect("src/auth.rs", &src);
+        assert_eq!(
+            ids(&hits),
+            vec!["secret/github-token", "secret/generic-assignment"],
+            "provider tokens in tests are still reported; generic matches only outside them"
+        );
+        assert_eq!(hits[0].severity, Severity::Medium);
+        assert!(hits[0].message.ends_with("(in test code)"));
+        assert_eq!(hits[1].location.start_line, 1);
+        // Other languages are not parsed as Rust.
+        assert_eq!(detect("src/auth.py", &src).len(), 4);
     }
 
     #[test]
