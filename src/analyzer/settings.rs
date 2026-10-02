@@ -334,6 +334,14 @@ fn cwe(check: &str) -> &'static str {
 }
 
 /// Why a probe that did not answer cannot be read as a setting.
+/// GitHub's answer when a feature needs a paid plan or a public repository.
+fn needs_paid_plan(p: &Probe) -> bool {
+    p.status == 403
+        && p.message()
+            .to_ascii_lowercase()
+            .contains("upgrade to github")
+}
+
 fn why_not(p: &Probe, need: &str) -> String {
     match (p.status, p.message()) {
         (403 | 404, "") => need.to_string(),
@@ -463,7 +471,12 @@ pub async fn audit_repo(gh: &GitHub, owner: &str, name: &str) -> Result<Audit> {
         );
         runner_check(&mut ctx, private, &runners?);
     }
-    security_checks(&mut ctx, facts, private, admin, &alerts?, &fixes?, &pvr?);
+    let access = Access {
+        private,
+        admin,
+        archived,
+    };
+    security_checks(&mut ctx, facts, access, &alerts?, &fixes?, &pvr?);
     key_checks(&mut ctx, &keys?);
     webhook_checks(&mut ctx, "", &hooks?, NEED_ADMIN);
     collaborator_check(&mut ctx, &outside?);
@@ -580,16 +593,44 @@ fn branch_checks(
     }
     let rules_list = active_rules(rules);
     let protected_classic = bool_at(&info.body, &["protected"]) == Some(true);
+    // GitHub Free answers 403 "Upgrade to GitHub Pro or make this repository public"
+    // for rulesets and classic protection alike: the branch cannot be protected at all.
+    let plan_limited = needs_paid_plan(rules);
+    if !rules.ok() && !plan_limited && !protected_classic {
+        // Rulesets we cannot read (an organization's, say) may still protect the branch.
+        let why = why_not(rules, "needs read access to the repository's rulesets");
+        for c in checks {
+            ctx.na(c, why.clone());
+        }
+        return;
+    }
     let ruleset = PROTECTIVE.iter().any(|k| has_rule(&rules_list, k));
     if !(protected_classic || ruleset) {
+        let exposure = "Anyone with write access (or a leaked token, or a compromised workflow with a write token) can push, force-push or delete it";
+        // Like secret scanning, protection that needs a paid plan weighs less.
+        let (severity, message, fix) = if plan_limited {
+            (
+                Severity::Medium,
+                format!(
+                    "No branch protection rule or ruleset applies to `{branch}`, and GitHub offers neither for this private repository on its current plan. {exposure}."
+                ),
+                "Branch protection and rulesets on private repositories need GitHub Pro, Team or Enterprise. Without them, keep write access to yourself and avoid write-scoped deploy keys and long-lived tokens, or make the repository public.",
+            )
+        } else {
+            (
+                Severity::High,
+                format!(
+                    "No branch protection rule or ruleset applies to `{branch}`. {exposure}, and code reaches it without review."
+                ),
+                "Add a ruleset for the default branch that requires pull requests and blocks force pushes and deletion (Settings → Rules → Rulesets).",
+            )
+        };
         ctx.fail(Fail {
             check: checks[0].into(),
-            severity: Severity::High,
+            severity,
             title: "Default branch has no protection",
-            message: format!(
-                "No branch protection rule or ruleset applies to `{branch}`. Anyone with write access (or a leaked token, or a compromised workflow with a write token) can push, force-push or delete it, and code reaches it without review."
-            ),
-            fix: "Add a ruleset for the default branch that requires pull requests and blocks force pushes and deletion (Settings → Rules → Rulesets).",
+            message,
+            fix,
             page: "settings/rules",
             basis: branch.to_string(),
         });
@@ -721,16 +762,27 @@ fn branch_checks(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// What the repository object says about the repository and the token's access to it.
+#[derive(Clone, Copy)]
+struct Access {
+    private: bool,
+    admin: bool,
+    archived: bool,
+}
+
 fn security_checks(
     ctx: &mut Ctx,
     repo: &Value,
-    private: bool,
-    admin: bool,
+    access: Access,
     alerts: &Probe,
     fixes: &Probe,
     pvr: &Probe,
 ) {
+    let Access {
+        private,
+        admin,
+        archived,
+    } = access;
     // Secret scanning on private repositories needs a paid plan, so it weighs less.
     let weight = if private {
         Severity::Low
@@ -765,11 +817,22 @@ fn security_checks(
                 page: "settings/security_analysis",
                 basis: key.into(),
             }),
+            // An admin is shown `security_and_analysis` wherever the feature exists, so
+            // its absence means GitHub does not offer it here, not missing permissions.
+            None if admin => ctx.na(
+                check,
+                "GitHub reports no secret scanning settings although the token has admin access: the feature is not available for this repository (private repositories need GitHub Secret Protection)",
+            ),
             None => ctx.na(
                 check,
                 "the token cannot see security_and_analysis (needs admin access, or the Administration permission for an app token)",
             ),
         }
+    }
+
+    // Dependabot doesn't scan archived repositories, and their settings are read-only.
+    if archived {
+        return;
     }
 
     let check = "settings/dependabot-alerts-disabled";
@@ -816,7 +879,8 @@ fn security_checks(
         _ => ctx.na(check, why_not(fixes, NEED_ADMIN)),
     }
 
-    // Applies to public repositories only.
+    // Applies to public repositories only (and GitHub answers 422 for archived ones,
+    // which already returned above).
     if !private {
         let check = "settings/private-vulnerability-reporting-disabled";
         match (pvr.ok(), bool_at(&pvr.body, &["enabled"])) {
@@ -1471,8 +1535,7 @@ mod tests {
         security_checks(
             &mut c,
             &repo,
-            false,
-            false,
+            public(false),
             &probe(404, json!({})),
             &probe(404, json!({})),
             &pvr,
@@ -1498,8 +1561,7 @@ mod tests {
         security_checks(
             &mut c,
             &repo,
-            false,
-            true,
+            public(true),
             &probe(
                 404,
                 json!({"message": "Vulnerability alerts are disabled."}),
@@ -1522,6 +1584,110 @@ mod tests {
         assert_eq!(
             status(&c, "settings/dependabot-updates-disabled"),
             Some(CheckStatus::Pass)
+        );
+    }
+
+    fn public(admin: bool) -> Access {
+        Access {
+            private: false,
+            admin,
+            archived: false,
+        }
+    }
+
+    #[test]
+    fn secret_scanning_missing_for_an_admin_is_a_plan_gap_not_a_permission_gap() {
+        let mut c = ctx();
+        let access = Access {
+            private: true,
+            ..public(true)
+        };
+        let ok = probe(200, json!({"enabled": true, "paused": false}));
+        security_checks(
+            &mut c,
+            &json!({}),
+            access,
+            &probe(204, Value::Null),
+            &ok,
+            &ok,
+        );
+        let detail = c
+            .audit
+            .checks
+            .iter()
+            .find(|x| x.check == "settings/secret-scanning-disabled")
+            .and_then(|x| x.detail.clone())
+            .unwrap();
+        assert!(detail.contains("not available"), "{detail}");
+        assert!(!detail.contains("needs admin"), "{detail}");
+        assert_eq!(
+            status(&c, "settings/dependabot-alerts-disabled"),
+            Some(CheckStatus::Pass)
+        );
+    }
+
+    #[test]
+    fn archived_repositories_skip_dependabot_and_vulnerability_reporting() {
+        let mut c = ctx();
+        let access = Access {
+            archived: true,
+            ..public(true)
+        };
+        let unprocessable = probe(
+            422,
+            json!({"message": "Repository must be public and not archived"}),
+        );
+        let off = probe(404, json!({}));
+        security_checks(&mut c, &json!({}), access, &off, &off, &unprocessable);
+        for check in [
+            "settings/dependabot-alerts-disabled",
+            "settings/dependabot-updates-disabled",
+            "settings/private-vulnerability-reporting-disabled",
+        ] {
+            assert_eq!(status(&c, check), None, "{check}");
+        }
+        assert!(
+            c.audit
+                .findings
+                .iter()
+                .all(|f| !f.rule_id.contains("dependabot"))
+        );
+    }
+
+    #[test]
+    fn branch_protection_unavailable_on_the_plan_is_a_medium_finding() {
+        let mut c = ctx();
+        let info = probe(200, json!({"protected": false}));
+        let upgrade = probe(
+            403,
+            json!({"message": "Upgrade to GitHub Pro or make this repository public to enable this feature."}),
+        );
+        branch_checks(&mut c, "main", &info, &upgrade, None, true);
+        assert_eq!(c.audit.findings.len(), 1);
+        let f = &c.audit.findings[0];
+        assert_eq!(f.rule_id, "settings/default-branch-unprotected");
+        assert_eq!(f.severity, Severity::Medium);
+        assert!(f.message.contains("current plan"), "{}", f.message);
+        assert!(
+            f.remediation
+                .as_deref()
+                .is_some_and(|r| r.contains("GitHub Pro"))
+        );
+    }
+
+    #[test]
+    fn unreadable_rulesets_are_not_assessable_not_unprotected() {
+        let mut c = ctx();
+        let info = probe(200, json!({"protected": false}));
+        let denied = probe(
+            403,
+            json!({"message": "Resource not accessible by integration"}),
+        );
+        branch_checks(&mut c, "main", &info, &denied, None, false);
+        assert!(c.audit.findings.is_empty());
+        assert_eq!(
+            status(&c, "settings/default-branch-unprotected"),
+            Some(CheckStatus::NotAssessable)
         );
     }
 
