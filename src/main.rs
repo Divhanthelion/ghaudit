@@ -3,7 +3,7 @@
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ghaudit::analyzer::{rules, workflows};
-use ghaudit::config::{Config, FailOn, SUPPORTED_LANGUAGES};
+use ghaudit::config::{Config, FailOn, SUPPORTED_LANGUAGES, TrustRepo};
 use ghaudit::model::{ScanReport, Severity};
 use ghaudit::report::{self, Format};
 use ghaudit::scanner::Scanner;
@@ -157,6 +157,16 @@ struct ScanArgs {
     /// Exit with status 1 if a finding is at or above this severity [default: high; or never]
     #[arg(long, value_name = "SEVERITY")]
     fail_on: Option<FailOn>,
+
+    /// Honor the scanned repository's own .gitignore, ghaudit:ignore comments and
+    /// osv-scanner.toml, even for cloned repositories [default: only for local directories]
+    #[arg(long, conflicts_with = "no_trust_repo")]
+    trust_repo: bool,
+
+    /// Ignore the scanned repository's own .gitignore, ghaudit:ignore comments and
+    /// osv-scanner.toml, even for local directories
+    #[arg(long)]
+    no_trust_repo: bool,
 }
 
 #[derive(Args, Default)]
@@ -192,7 +202,7 @@ fn main() -> ExitCode {
     let outcome = runtime.block_on(async {
         tokio::select! {
             result = run(cli) => Some(result),
-            _ = tokio::signal::ctrl_c() => None,
+            _ = interrupted() => None,
         }
     });
     // Dropping the scan future above removed temporary clones and killed child
@@ -210,6 +220,23 @@ fn main() -> ExitCode {
             ExitCode::from(EXIT_ERROR)
         }
     }
+}
+
+/// Ctrl-C, or SIGTERM (sent by `timeout`, CI cancellation and container shutdown).
+/// Either way the scan future is dropped, which removes temporary clones.
+async fn interrupted() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let Ok(mut term) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 async fn run(cli: Cli) -> anyhow::Result<u8> {
@@ -246,7 +273,7 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
             return Ok(0);
         }
         Command::Scan { target, scan } => (
-            target::parse_scan_target(&target)?,
+            target::parse_scan_target(&target, &ghaudit::github::web_host(&config.github.api_url))?,
             scan,
             MultiArgs::default(),
         ),
@@ -260,7 +287,7 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
     // Fail on an unwritable output path now, not after a long scan.
     let output = g.output.as_deref().map(prepare_output).transpose()?;
 
-    let scanner = Scanner::new(config)?;
+    let scanner = Scanner::new(config)?.with_progress(!g.quiet);
     let report = scanner.scan(&target).await?;
 
     match output {
@@ -318,6 +345,12 @@ fn apply_scan_args(config: &mut Config, scan: ScanArgs, multi: MultiArgs) -> any
     }
     if let Some(f) = scan.fail_on {
         config.report.fail_on = f;
+    }
+    if scan.trust_repo {
+        config.analysis.trust_repo = TrustRepo::Always;
+    }
+    if scan.no_trust_repo {
+        config.analysis.trust_repo = TrustRepo::Never;
     }
     let gh = &mut config.github;
     if let Some(n) = multi.max_repos {

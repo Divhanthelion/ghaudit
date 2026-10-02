@@ -6,8 +6,13 @@
 //!   The engine's tests run both lists, so a rule cannot silently stop working.
 //!
 //! The set favors precision over recall: a rule that fires on ordinary code trains
-//! people to ignore the tool. Patterns that need data-flow tracking to be useful
+//! people to ignore the tool. Patterns that need real data-flow tracking to be useful
 //! (e.g. "any file read is path traversal") are deliberately left out.
+//!
+//! One step of data flow is supported: a rule's `bindings` query marks variables
+//! assigned a dangerous value (capture `@var`), and its main query can then require
+//! `(#bound? @x)`: `@x` names such a variable, assigned earlier in the same function.
+//! That catches `q = f"SELECT ... {x}"` followed later by `cursor.execute(q)`.
 
 mod go;
 mod javascript;
@@ -41,6 +46,8 @@ pub struct Rule {
     pub query: &'static str,
     /// Only run when the file matches this regex (e.g. an import is present).
     pub requires: Option<&'static str>,
+    /// Query marking variables that hold a dangerous value, for `#bound?` (see above).
+    pub bindings: Option<&'static str>,
     /// Uses JSX syntax: skipped for plain `.ts` files.
     pub jsx: bool,
     pub examples: &'static [&'static str],

@@ -1,5 +1,6 @@
 //! Human-readable terminal report.
 
+use super::terminal_safe as safe;
 use crate::model::{AnalyzerState, Category, Finding, ScanReport, Severity};
 use std::fmt::Write;
 
@@ -52,7 +53,7 @@ pub fn render(report: &ScanReport, opts: &TextOptions) -> String {
         "{} {} scan of {}{commit}",
         s.bold(&report.tool),
         report.version,
-        report.target
+        safe(&report.target)
     );
     let _ = writeln!(
         out,
@@ -75,7 +76,7 @@ pub fn render(report: &ScanReport, opts: &TextOptions) -> String {
             if f.repository.as_deref() != current_repo {
                 current_repo = f.repository.as_deref();
                 if let Some(r) = current_repo {
-                    let _ = writeln!(out, "{}\n", s.bold(&format!("== {r} ==")));
+                    let _ = writeln!(out, "{}\n", s.bold(&format!("== {} ==", safe(r))));
                 }
             }
             write_finding(&mut out, &s, f);
@@ -93,14 +94,16 @@ fn write_finding(out: &mut String, s: &Style, f: &Finding) {
         "{} {} {}  {}",
         s.severity(f.severity),
         s.dim(&format!("{:<10}", f.category.label())),
-        s.bold(&f.title),
-        s.dim(&format!("[{}]", f.rule_id))
+        s.bold(&safe(&f.title)),
+        s.dim(&format!("[{}]", safe(&f.rule_id)))
     );
     let loc = &f.location;
     let _ = writeln!(
         out,
         "{INDENT}  {}:{}:{}",
-        loc.path, loc.start_line, loc.start_column
+        safe(&loc.path),
+        loc.start_line,
+        loc.start_column
     );
 
     if let Some(snippet) = &f.snippet {
@@ -108,11 +111,11 @@ fn write_finding(out: &mut String, s: &Style, f: &Finding) {
         for (i, line) in snippet.lines.iter().enumerate() {
             let n = snippet.first_line + i;
             let marker = if n == loc.start_line { ">" } else { " " };
-            let text: String = line.chars().take(160).collect();
+            let text: String = line.chars().take(240).collect();
             let _ = writeln!(
                 out,
                 "{INDENT}  {}",
-                s.dim(&format!("{marker} {n:>width$} | ")) + &text
+                s.dim(&format!("{marker} {n:>width$} | ")) + &safe(&text)
             );
         }
     }
@@ -126,16 +129,16 @@ fn write_finding(out: &mut String, s: &Style, f: &Finding) {
             .cvss_score
             .map(|c| format!("  CVSS {c:.1}"))
             .unwrap_or_default();
-        let _ = writeln!(out, "{INDENT}  {ids}{score}");
-        let _ = writeln!(out, "{INDENT}  {}", s.dim(&dep.url));
+        let _ = writeln!(out, "{INDENT}  {}{score}", safe(&ids));
+        let _ = writeln!(out, "{INDENT}  {}", s.dim(&safe(&dep.url)));
     } else {
-        for line in wrap(&f.message, 88) {
+        for line in wrap(&safe(&f.message), 88) {
             let _ = writeln!(out, "{INDENT}  {line}");
         }
     }
     if let Some(fix) = &f.remediation {
         let mut first = true;
-        for line in wrap(fix, 83) {
+        for line in wrap(&safe(fix), 83) {
             let prefix = if first { "Fix: " } else { "     " };
             first = false;
             let _ = writeln!(out, "{INDENT}  {}{line}", s.dim(prefix));
@@ -193,8 +196,53 @@ fn write_summary(out: &mut String, s: &Style, report: &ScanReport) {
     let _ = writeln!(out, "{} {}", s.bold("Analyzers:"), analyzers.join("  "));
     for a in &report.analyzers {
         if let (AnalyzerState::Completed, Some(detail)) = (a.state, &a.detail) {
-            let _ = writeln!(out, "  {}", s.dim(&format!("{}: {detail}", a.analyzer)));
+            let _ = writeln!(
+                out,
+                "  {}",
+                s.dim(&format!("{}: {}", a.analyzer, safe(detail)))
+            );
         }
+    }
+    let stats = &report.stats;
+    if stats.files_skipped > 0 || stats.findings_omitted > 0 || stats.findings_suppressed > 0 {
+        let mut notes = Vec::new();
+        if stats.files_skipped > 0 {
+            let shown: Vec<String> = report
+                .skipped
+                .iter()
+                .take(3)
+                .map(|f| safe(&f.path).into_owned())
+                .collect();
+            let more = if report.skipped.len() > 3 {
+                ", ..."
+            } else {
+                ""
+            };
+            notes.push(format!(
+                "{} files not fully analyzed ({}{more})",
+                stats.files_skipped,
+                shown.join(", ")
+            ));
+        }
+        if stats.findings_omitted > 0 {
+            notes.push(format!(
+                "{} repeated findings omitted (over {} per rule and file)",
+                stats.findings_omitted,
+                crate::scanner::MAX_PER_RULE_AND_FILE
+            ));
+        }
+        if stats.findings_suppressed > 0 {
+            notes.push(format!(
+                "{} findings suppressed by ghaudit:ignore comments",
+                stats.findings_suppressed
+            ));
+        }
+        let _ = writeln!(
+            out,
+            "{} {}",
+            s.bold("Notes:"),
+            s.dim(&format!("{} (details in -f json)", notes.join("; ")))
+        );
     }
 
     if !report.repositories.is_empty() {
@@ -219,7 +267,7 @@ fn write_summary(out: &mut String, s: &Style, report: &ScanReport) {
             s.paint("1;31", "INCOMPLETE SCAN: parts of this scan did not run, so a short report is not a clean one.")
         );
         for f in failures {
-            let _ = writeln!(out, "  - {f}");
+            let _ = writeln!(out, "  - {}", safe(&f));
         }
     }
 }
@@ -297,6 +345,44 @@ mod tests {
         let out = render(&r, &TextOptions { color: false });
         assert!(out.contains("No findings"));
         assert!(!out.contains("INCOMPLETE"));
+    }
+
+    #[test]
+    fn hostile_text_cannot_drive_the_terminal() {
+        let mut r = ScanReport::new("x");
+        r.findings.push(
+            Finding::new(
+                "python/eval",
+                Category::Sast,
+                Severity::High,
+                Confidence::Medium,
+                "eval",
+                "m",
+                Location::new("evil\x1b[2J.py", 1, 1),
+                "x",
+            )
+            .with_snippet(Snippet::around("x = 1 # \x1b]0;owned\x07\n", 1, 0)),
+        );
+        r.finalize(Severity::Low);
+        let out = render(&r, &TextOptions { color: false });
+        assert!(!out.contains('\x1b') && !out.contains('\x07'), "{out:?}");
+        assert!(out.contains("evil<U+001B>[2J.py"));
+    }
+
+    #[test]
+    fn skipped_and_omitted_are_mentioned() {
+        let mut r = ScanReport::new("x");
+        r.skipped.push(crate::model::SkippedFile {
+            repository: None,
+            path: "big.js".into(),
+            reason: "too large".into(),
+        });
+        r.stats.files_skipped = 1;
+        r.stats.findings_omitted = 40;
+        r.finalize(Severity::Low);
+        let out = render(&r, &TextOptions { color: false });
+        assert!(out.contains("1 files not fully analyzed (big.js)"), "{out}");
+        assert!(out.contains("40 repeated findings omitted"), "{out}");
     }
 
     #[test]

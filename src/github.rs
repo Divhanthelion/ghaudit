@@ -215,6 +215,13 @@ async fn api_error(resp: Response) -> Error {
 
 /// Web base URL for an API base URL: `https://api.github.com` -> `https://github.com`,
 /// `https://ghe.example.com/api/v3` -> `https://ghe.example.com`.
+/// Host of the configured GitHub web UI (`github.com`, or a GitHub Enterprise host).
+pub fn web_host(api_url: &str) -> String {
+    let web = web_url(api_url);
+    let rest = web.split_once("://").map_or(web.as_str(), |(_, r)| r);
+    rest.split('/').next().unwrap_or(rest).to_ascii_lowercase()
+}
+
 pub fn web_url(api_url: &str) -> String {
     let api = api_url.trim_end_matches('/');
     if let Some(rest) = api.strip_prefix("https://api.") {
@@ -365,6 +372,8 @@ mod tests {
         assert_eq!(web_url("https://api.github.com"), "https://github.com");
         assert_eq!(web_url("https://api.github.com/"), "https://github.com");
         assert_eq!(web_url("https://ghe.corp/api/v3"), "https://ghe.corp");
+        assert_eq!(web_host("https://api.github.com"), "github.com");
+        assert_eq!(web_host("https://GHE.corp:8443/api/v3"), "ghe.corp:8443");
     }
 
     #[test]

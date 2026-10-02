@@ -183,10 +183,97 @@ impl Location {
 }
 
 /// Convert a platform path to the `a/b/c` form used in reports.
+///
+/// Backslashes are separators only on Windows. Elsewhere they are ordinary file-name
+/// characters, and rewriting them would let a file named `src\\app.py` pose as
+/// `src/app.py`.
 pub fn normalize_path(path: &str) -> String {
-    let p = path.replace('\\', "/");
+    let p = if cfg!(windows) {
+        path.replace('\\', "/")
+    } else {
+        path.to_string()
+    };
     p.strip_prefix("./").unwrap_or(&p).to_string()
 }
+
+/// Line lookups for one file: built once, then each position or line costs
+/// O(log n) or O(1) instead of a scan from the start of the file.
+pub struct LineIndex<'a> {
+    text: &'a str,
+    /// Byte offset where each line starts.
+    starts: Vec<usize>,
+}
+
+impl<'a> LineIndex<'a> {
+    pub fn new(text: &'a str) -> Self {
+        let mut starts = vec![0];
+        starts.extend(text.match_indices('\n').map(|(i, _)| i + 1));
+        // Like `str::lines`, a trailing newline does not start another line.
+        if starts.len() > 1 && starts.last() == Some(&text.len()) {
+            starts.pop();
+        }
+        Self { text, starts }
+    }
+
+    pub fn text(&self) -> &'a str {
+        self.text
+    }
+
+    /// Number of lines, counted like `str::lines`.
+    pub fn len(&self) -> usize {
+        if self.text.is_empty() {
+            0
+        } else {
+            self.starts.len()
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    /// The 1-based `line`, without its line terminator.
+    pub fn line(&self, line: usize) -> Option<&'a str> {
+        let i = line.checked_sub(1)?;
+        if i >= self.len() {
+            return None;
+        }
+        let start = self.starts[i];
+        let end = self.starts.get(i + 1).copied().unwrap_or(self.text.len());
+        let s = &self.text[start..end];
+        let s = s.strip_suffix('\n').unwrap_or(s);
+        Some(s.strip_suffix('\r').unwrap_or(s))
+    }
+
+    /// 1-based (line, column) of a byte offset. The column counts characters.
+    pub fn position(&self, offset: usize) -> (usize, usize) {
+        let offset = offset.min(self.text.len());
+        let i = self
+            .starts
+            .partition_point(|&s| s <= offset)
+            .saturating_sub(1);
+        let col = self.text[self.starts[i]..offset].chars().count() + 1;
+        (i + 1, col)
+    }
+
+    /// Byte offset of a 1-based line and a 0-based character column.
+    pub fn offset(&self, line: usize, char_col: usize) -> Option<usize> {
+        let text = self.line(line)?;
+        let start = self.starts[line - 1];
+        let within = text
+            .char_indices()
+            .nth(char_col)
+            .map_or(text.len(), |(b, _)| b);
+        Some(start + within)
+    }
+}
+
+/// Characters of one snippet line kept while analyzers run. Generous, so that secret
+/// redaction (which runs afterwards) sees whole values; [`Snippet::clip`] then
+/// shortens lines for display.
+const WORKING_LINE_CHARS: usize = 4096;
+/// Characters of one snippet line in a report.
+pub const DISPLAY_LINE_CHARS: usize = 200;
 
 /// A few lines of source around a finding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,21 +281,69 @@ pub struct Snippet {
     /// Line number of the first entry in `lines`.
     pub first_line: usize,
     pub lines: Vec<String>,
+    /// Characters cut from the start of the finding's line by [`Snippet::from_index`],
+    /// so [`Snippet::clip`] can still find the column.
+    #[serde(skip)]
+    shift: usize,
 }
 
 impl Snippet {
     /// Take `context` lines on each side of the 1-based `line`.
+    /// Builds a [`LineIndex`]; analyzers that create many snippets should build one
+    /// index per file and call [`Snippet::from_index`].
     pub fn around(content: &str, line: usize, context: usize) -> Option<Self> {
-        let all: Vec<&str> = content.lines().collect();
-        if line == 0 || line > all.len() {
+        Self::from_index(&LineIndex::new(content), line, 1, context)
+    }
+
+    /// Take `context` lines on each side of the 1-based `line`. Very long lines (minified
+    /// code) are cut to a window around `column` on the finding's line, and to their
+    /// start on context lines.
+    pub fn from_index(
+        index: &LineIndex,
+        line: usize,
+        column: usize,
+        context: usize,
+    ) -> Option<Self> {
+        if line == 0 || line > index.len() {
             return None;
         }
         let first = line.saturating_sub(context).max(1);
-        let last = (line + context).min(all.len());
+        let last = (line + context).min(index.len());
+        let mut shift = 0;
+        let lines = (first..=last)
+            .map(|n| {
+                let text = index.line(n).unwrap_or_default();
+                if n != line {
+                    return window(text, 1, WORKING_LINE_CHARS).0;
+                }
+                let (cut, start) = window(text, column, WORKING_LINE_CHARS);
+                shift = start;
+                cut
+            })
+            .collect();
         Some(Self {
             first_line: first,
-            lines: all[first - 1..last].iter().map(|l| l.to_string()).collect(),
+            lines,
+            shift,
         })
+    }
+
+    /// Shorten lines for display (after secrets have been redacted). The line holding
+    /// the finding keeps the part around `column`.
+    pub fn clip(&mut self, line: usize, column: usize) {
+        for (i, text) in self.lines.iter_mut().enumerate() {
+            let focus = if self.first_line + i != line {
+                1
+            } else if self.shift > 0 {
+                // Past the leading `…` of the working window.
+                column.saturating_sub(self.shift) + 1
+            } else {
+                column
+            };
+            if text.chars().count() > DISPLAY_LINE_CHARS {
+                *text = window(text, focus, DISPLAY_LINE_CHARS).0;
+            }
+        }
     }
 
     /// Replace every occurrence of `needle` with `replacement` (used to redact secrets).
@@ -220,6 +355,28 @@ impl Snippet {
         }
         self
     }
+}
+
+/// At most `max` characters of `text`, around the 1-based character `column`, with `…`
+/// marking each cut. Also returns how many characters were cut from the start.
+fn window(text: &str, column: usize, max: usize) -> (String, usize) {
+    let total = text.chars().count();
+    if total <= max {
+        return (text.to_string(), 0);
+    }
+    let start = column
+        .saturating_sub(1)
+        .saturating_sub(max / 4)
+        .min(total - max);
+    let mut out = String::new();
+    if start > 0 {
+        out.push('…');
+    }
+    out.extend(text.chars().skip(start).take(max));
+    if start + max < total {
+        out.push('…');
+    }
+    (out, start)
 }
 
 /// Extra data attached to dependency findings.
@@ -316,6 +473,11 @@ impl Finding {
         self.remediation = Some(remediation.into());
         self
     }
+
+    /// Recompute the fingerprint from a new basis (see [`Finding::new`]).
+    pub fn refingerprint(&mut self, basis: &str) {
+        self.fingerprint = fingerprint(&[&self.rule_id, &self.location.path, basis.trim()]);
+    }
 }
 
 /// Hex-encoded SHA-256 (truncated to 128 bits) of the NUL-joined parts.
@@ -400,11 +562,41 @@ pub struct ScanStats {
     pub lines_scanned: usize,
     /// Packages osv-scanner checked against the vulnerability database.
     pub dependencies_scanned: usize,
+    /// Files that were not (fully) analyzed; listed in [`ScanReport::skipped`].
+    #[serde(default)]
+    pub files_skipped: usize,
+    /// Findings silenced by `ghaudit:ignore` comments.
+    #[serde(default)]
+    pub findings_suppressed: usize,
+    /// Repeats of one rule in one file beyond the per-file limit; see [`ScanReport::omitted`].
+    #[serde(default)]
+    pub findings_omitted: usize,
     /// Findings per severity after filtering.
     pub by_severity: HashMap<Severity, usize>,
     /// Findings per category after filtering.
     pub by_category: HashMap<Category, usize>,
     pub duration_ms: u64,
+}
+
+/// A file that was not (fully) analyzed, and why. Listed so that a report never looks
+/// cleaner than the scan was: a hostile repository could otherwise hide code in files
+/// the scanner quietly passed over.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedFile {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    pub path: String,
+    pub reason: String,
+}
+
+/// Findings left out because one rule fired too often in one file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Omitted {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    pub path: String,
+    pub rule_id: String,
+    pub count: usize,
 }
 
 /// Everything a reporter needs.
@@ -423,6 +615,10 @@ pub struct ScanReport {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub repositories: Vec<RepositorySummary>,
     pub findings: Vec<Finding>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub skipped: Vec<SkippedFile>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub omitted: Vec<Omitted>,
 }
 
 impl ScanReport {
@@ -439,6 +635,8 @@ impl ScanReport {
             analyzers: Vec::new(),
             repositories: Vec::new(),
             findings: Vec::new(),
+            skipped: Vec::new(),
+            omitted: Vec::new(),
         }
     }
 
@@ -564,9 +762,47 @@ mod tests {
 
     #[test]
     fn paths_are_normalized() {
-        assert_eq!(Location::new("src\\a\\b.rs", 0, 0).path, "src/a/b.rs");
-        assert_eq!(Location::new("./x.py", 3, 2).start_line, 3);
+        let expected = if cfg!(windows) {
+            "src/a/b.rs"
+        } else {
+            "src\\a\\b.rs" // a legal file name, not a path, outside Windows
+        };
+        assert_eq!(Location::new("src\\a\\b.rs", 0, 0).path, expected);
+        assert_eq!(Location::new("./x.py", 3, 2).path, "x.py");
         assert_eq!(Location::new("x.py", 0, 0).start_line, 1);
+    }
+
+    #[test]
+    fn line_index_matches_str_lines() {
+        for text in ["", "a", "a\n", "a\n\n", "a\r\nbé\r\n\nlast", "\n\n"] {
+            let index = LineIndex::new(text);
+            let lines: Vec<&str> = text.lines().collect();
+            assert_eq!(index.len(), lines.len(), "{text:?}");
+            for (i, l) in lines.iter().enumerate() {
+                assert_eq!(index.line(i + 1), Some(*l), "{text:?} line {}", i + 1);
+            }
+            assert_eq!(index.line(lines.len() + 1), None);
+        }
+        let index = LineIndex::new("ab\ncé = x\n");
+        assert_eq!(index.position(0), (1, 1));
+        assert_eq!(index.position(3), (2, 1));
+        // `x` is the 6th character of line 2 but its 7th byte.
+        assert_eq!(index.position(9), (2, 6));
+        assert_eq!(index.offset(2, 5), Some(9));
+    }
+
+    #[test]
+    fn long_lines_are_windowed_around_the_finding() {
+        let line = format!("{}eval(x){}", "a".repeat(10_000), "b".repeat(10_000));
+        let index = LineIndex::new(&line);
+        let mut s = Snippet::from_index(&index, 1, 10_001, 2).unwrap();
+        assert!(s.lines[0].contains("eval(x)"));
+        assert!(s.lines[0].chars().count() <= WORKING_LINE_CHARS + 2);
+        s.clip(1, 10_001);
+        assert!(s.lines[0].contains("eval(x)"), "{}", s.lines[0]);
+        assert!(s.lines[0].starts_with('…') && s.lines[0].ends_with('…'));
+        assert!(s.lines[0].chars().count() <= DISPLAY_LINE_CHARS + 2);
+        assert_eq!(window("short", 3, 10), ("short".to_string(), 0));
     }
 
     #[test]

@@ -4,18 +4,37 @@
 //! so `eval(x)` in code matches but the word "eval" in a comment or string does not.
 //! Queries are compiled once per grammar when the engine is built; parsers are
 //! cached per thread because analysis runs on a rayon thread pool.
+//!
+//! Parsing and querying run under a per-file time budget: input crafted to make
+//! tree-sitter slow (deep nesting, huge generated files) costs at most that long, and
+//! the file is reported as not fully analyzed.
 
 use super::rules::{self, Rule, RuleLanguage};
 use crate::discovery::Language;
-use crate::model::{Category, Finding, Location, Snippet};
+use crate::model::{Category, Finding, LineIndex, Location, Snippet};
 use regex::Regex;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use streaming_iterator::StreamingIterator;
-use tree_sitter::{Parser, Query, QueryCursor};
+use tree_sitter::{
+    ParseOptions, Parser, Query, QueryCursor, QueryCursorOptions, QueryPredicateArg,
+};
 
 /// Lines of context on each side of a finding.
 const SNIPPET_CONTEXT: usize = 2;
+/// Time for parsing and running every rule on one file. Real files take milliseconds.
+pub const FILE_BUDGET: Duration = Duration::from_secs(5);
+
+/// Findings for one file.
+#[derive(Debug, Default)]
+pub struct SastResult {
+    pub findings: Vec<Finding>,
+    /// Analysis stopped early (time budget exceeded or scan cancelled).
+    pub incomplete: bool,
+}
 
 thread_local! {
     static PARSERS: RefCell<HashMap<Language, Parser>> = RefCell::new(HashMap::new());
@@ -48,7 +67,39 @@ struct CompiledRule {
     /// Index of the `@finding` capture: the node whose position is reported.
     finding_capture: u32,
     requires: Option<Regex>,
+    /// The rule's `bindings` query and the index of its `@var` capture.
+    bindings: Option<(Query, u32)>,
 }
+
+/// Nodes that start a new variable scope, per grammar.
+fn is_scope(kind: &str) -> bool {
+    matches!(
+        kind,
+        // Python
+        "function_definition" | "lambda"
+        // JavaScript / TypeScript
+        | "function_declaration" | "function_expression" | "function" | "arrow_function"
+        | "method_definition" | "generator_function_declaration" | "generator_function"
+        // Go
+        | "method_declaration" | "func_literal"
+        // Rust
+        | "function_item" | "closure_expression"
+    )
+}
+
+fn scope_of(node: tree_sitter::Node) -> usize {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if is_scope(parent.kind()) {
+            return parent.id();
+        }
+        current = parent;
+    }
+    current.id()
+}
+
+/// Variables (scope, name) assigned a dangerous value, with where each assignment starts.
+type Bound = HashMap<(usize, String), Vec<usize>>;
 
 pub struct SastEngine {
     rules: HashMap<Language, Vec<CompiledRule>>,
@@ -83,24 +134,78 @@ impl SastEngine {
 
     /// Run every applicable rule over one file.
     pub fn analyze(&self, path: &str, language: Language, source: &str) -> Vec<Finding> {
+        self.analyze_with(path, language, source, &AtomicBool::new(false))
+            .findings
+    }
+
+    /// Run every applicable rule over one file, within [`FILE_BUDGET`], stopping early
+    /// when `cancel` is set.
+    pub fn analyze_with(
+        &self,
+        path: &str,
+        language: Language,
+        source: &str,
+        cancel: &AtomicBool,
+    ) -> SastResult {
+        let mut out = SastResult::default();
         let Some(rules) = self.rules.get(&language) else {
-            return Vec::new();
+            return out;
         };
-        let Some(tree) = parse(language, source) else {
-            return Vec::new();
+        let deadline = Instant::now() + FILE_BUDGET;
+        let expired = || cancel.load(Ordering::Relaxed) || Instant::now() > deadline;
+        let Some(tree) = parse(language, source, &expired) else {
+            out.incomplete = true;
+            return out;
         };
-        let lines: Vec<&str> = source.lines().collect();
-        let mut findings = Vec::new();
+        let index = LineIndex::new(source);
         let mut seen = HashSet::new();
         let mut cursor = QueryCursor::new();
+        let mut stop = |_: &tree_sitter::QueryCursorState| {
+            if expired() {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        };
 
         for compiled in rules {
+            if expired() {
+                out.incomplete = true;
+                break;
+            }
             if let Some(re) = &compiled.requires
                 && !re.is_match(source)
             {
                 continue;
             }
-            let mut matches = cursor.matches(&compiled.query, tree.root_node(), source.as_bytes());
+            let bound = match &compiled.bindings {
+                Some((query, var)) => {
+                    let mut bound = Bound::new();
+                    let mut matches = cursor.matches_with_options(
+                        query,
+                        tree.root_node(),
+                        source.as_bytes(),
+                        QueryCursorOptions::new().progress_callback(&mut stop),
+                    );
+                    while let Some(m) = matches.next() {
+                        for c in m.captures.iter().filter(|c| c.index == *var) {
+                            let name = source[c.node.byte_range()].to_string();
+                            bound
+                                .entry((scope_of(c.node), name))
+                                .or_default()
+                                .push(c.node.start_byte());
+                        }
+                    }
+                    bound
+                }
+                None => Bound::new(),
+            };
+            let mut matches = cursor.matches_with_options(
+                &compiled.query,
+                tree.root_node(),
+                source.as_bytes(),
+                QueryCursorOptions::new().progress_callback(&mut stop),
+            );
             while let Some(m) = matches.next() {
                 let Some(capture) = m
                     .captures
@@ -109,6 +214,24 @@ impl SastEngine {
                 else {
                     continue;
                 };
+                let all_bound = compiled
+                    .query
+                    .general_predicates(m.pattern_index)
+                    .iter()
+                    .all(|p| match p.args.first() {
+                        Some(QueryPredicateArg::Capture(i)) => {
+                            m.captures.iter().filter(|c| c.index == *i).all(|c| {
+                                let name = &source[c.node.byte_range()];
+                                bound
+                                    .get(&(scope_of(c.node), name.to_string()))
+                                    .is_some_and(|at| at.iter().any(|&s| s < c.node.start_byte()))
+                            })
+                        }
+                        _ => false,
+                    });
+                if !all_bound {
+                    continue;
+                }
                 let node = capture.node;
                 // Alternations in a query can match the same node more than once.
                 if !seen.insert((compiled.rule.id, node.start_byte())) {
@@ -117,9 +240,13 @@ impl SastEngine {
                 let start = node.start_position();
                 let end = node.end_position();
                 let line = start.row + 1;
-                let line_text = lines.get(start.row).copied().unwrap_or_default();
+                let line_text = index.line(line).unwrap_or_default();
+                // tree-sitter columns count bytes; reports count characters.
+                let column = char_column(line_text, start.column);
+                let end_column =
+                    char_column(index.line(end.row + 1).unwrap_or_default(), end.column);
                 let rule = compiled.rule;
-                findings.push(
+                out.findings.push(
                     Finding::new(
                         rule.id,
                         Category::Sast,
@@ -127,18 +254,25 @@ impl SastEngine {
                         rule.confidence,
                         rule.name,
                         rule.message,
-                        Location::new(path, line, start.column + 1)
-                            .with_end(end.row + 1, end.column + 1),
+                        Location::new(path, line, column).with_end(end.row + 1, end_column),
                         line_text,
                     )
-                    .with_snippet(Snippet::around(source, line, SNIPPET_CONTEXT))
+                    .with_snippet(Snippet::from_index(&index, line, column, SNIPPET_CONTEXT))
                     .with_cwe(rule.cwe.iter().copied())
                     .with_remediation(rule.remediation),
                 );
             }
         }
-        findings
+        if expired() {
+            out.incomplete = true;
+        }
+        out
     }
+}
+
+/// 1-based character column of a byte offset within a line.
+fn char_column(line: &str, byte: usize) -> usize {
+    line.get(..byte).map_or(byte, |s| s.chars().count()) + 1
 }
 
 fn compile(rule: &'static Rule, lang: Language) -> Result<CompiledRule, String> {
@@ -152,15 +286,45 @@ fn compile(rule: &'static Rule, lang: Language) -> Result<CompiledRule, String> 
         .map(Regex::new)
         .transpose()
         .map_err(|e| format!("rule {} has an invalid `requires` regex: {e}", rule.id))?;
+    let bindings = match rule.bindings {
+        Some(text) => {
+            let q = Query::new(&grammar(lang), text).map_err(|e| {
+                format!("rule {} bindings do not compile for {lang:?}: {e}", rule.id)
+            })?;
+            let var = q
+                .capture_index_for_name("var")
+                .ok_or_else(|| format!("rule {} bindings have no @var capture", rule.id))?;
+            Some((q, var))
+        }
+        None => None,
+    };
+    for i in 0..query.pattern_count() {
+        for p in query.general_predicates(i) {
+            let ok = &*p.operator == "bound?"
+                && bindings.is_some()
+                && matches!(p.args.as_ref(), [QueryPredicateArg::Capture(_)]);
+            if !ok {
+                return Err(format!(
+                    "rule {}: unsupported predicate #{} (only #bound? @capture, with `bindings`)",
+                    rule.id, p.operator
+                ));
+            }
+        }
+    }
     Ok(CompiledRule {
         rule,
         query,
         finding_capture,
         requires,
+        bindings,
     })
 }
 
-fn parse(language: Language, source: &str) -> Option<tree_sitter::Tree> {
+fn parse(
+    language: Language,
+    source: &str,
+    expired: &dyn Fn() -> bool,
+) -> Option<tree_sitter::Tree> {
     PARSERS.with(|cell| {
         let mut parsers = cell.borrow_mut();
         let parser = match parsers.entry(language) {
@@ -171,7 +335,24 @@ fn parse(language: Language, source: &str) -> Option<tree_sitter::Tree> {
                 e.insert(p)
             }
         };
-        parser.parse(source, None)
+        let bytes = source.as_bytes();
+        let mut stop = |_: &tree_sitter::ParseState| {
+            if expired() {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        };
+        let tree = parser.parse_with_options(
+            &mut |i, _| bytes.get(i..).unwrap_or_default(),
+            None,
+            Some(ParseOptions::new().progress_callback(&mut stop)),
+        );
+        if tree.is_none() {
+            // A halted parse would otherwise resume on the next call.
+            parser.reset();
+        }
+        tree
     })
 }
 
@@ -277,6 +458,29 @@ mod tests {
             engine
                 .analyze("a.rs", Language::Rust, "fn f(){ unsafe { g() } }")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn columns_count_characters_not_bytes() {
+        let src = "msg = \"héllo wörld\"; eval(x)\n";
+        let f = engine().analyze("a.py", Language::Python, src);
+        let eval = f.iter().find(|f| f.rule_id == "python/eval").unwrap();
+        assert_eq!(eval.location.start_column, 22);
+    }
+
+    #[test]
+    fn cancelled_analysis_is_marked_incomplete() {
+        let cancel = AtomicBool::new(true);
+        let r = engine().analyze_with("a.py", Language::Python, "eval(x)\n", &cancel);
+        assert!(r.incomplete);
+        assert!(r.findings.is_empty());
+        // The thread's cached parser still works afterwards.
+        assert_eq!(
+            engine()
+                .analyze("a.py", Language::Python, "eval(x)\n")
+                .len(),
+            1
         );
     }
 

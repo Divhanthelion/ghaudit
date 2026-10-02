@@ -13,6 +13,7 @@ pub static RULES: &[Rule] = &[
         remediation: "Keep unsafe blocks minimal and document the invariants they rely on in a `// SAFETY:` comment.",
         query: r#"(unsafe_block) @finding"#,
         requires: None,
+        bindings: None,
         jsx: false,
         examples: &["fn f() { unsafe { libc::free(p) } }"],
         counter_examples: &["fn f() { let unsafe_count = 1; }"],
@@ -28,6 +29,7 @@ pub static RULES: &[Rule] = &[
         remediation: "Confirm the type really upholds the trait's safety contract and document why.",
         query: r#"(impl_item "unsafe") @finding"#,
         requires: None,
+        bindings: None,
         jsx: false,
         examples: &["struct P(*mut u8);\nunsafe impl Send for P {}"],
         counter_examples: &["impl Send for P {}", "unsafe fn f() {}"],
@@ -51,6 +53,7 @@ pub static RULES: &[Rule] = &[
   (#eq? @f "transmute")) @finding
 "#,
         requires: None,
+        bindings: None,
         jsx: false,
         examples: &[
             "fn f(x: u32) -> f32 { unsafe { std::mem::transmute(x) } }",
@@ -80,6 +83,7 @@ pub static RULES: &[Rule] = &[
   (#match? @prog "^(sh|bash|zsh|dash|ksh|fish|cmd|cmd\\.exe|powershell|powershell\\.exe|pwsh|/bin/sh|/bin/bash|/usr/bin/bash)$")) @finding
 "#,
         requires: None,
+        bindings: None,
         jsx: false,
         examples: &[
             "fn f(c: &str) { Command::new(\"sh\").arg(\"-c\").arg(c).status(); }",
@@ -114,18 +118,40 @@ pub static RULES: &[Rule] = &[
   (#match? @m "^(query|query_as|query_scalar|query_one|query_opt|query_row|query_map|execute|execute_batch|batch_execute|simple_query|prepare|prepare_cached|raw_sql|sql_query)$")
   (#eq? @mac "format")
   (#match? @fmt "(?i)\\b(select|insert|update|delete|drop|create|alter|replace)\\b")) @finding
+
+(call_expression
+  function: [
+    (identifier) @m
+    (field_expression field: (field_identifier) @m)
+    (scoped_identifier name: (identifier) @m)
+    (generic_function function: [(identifier) @m (field_expression field: (field_identifier) @m) (scoped_identifier name: (identifier) @m)])
+  ]
+  arguments: (arguments . [(identifier) @arg (reference_expression value: (identifier) @arg)])
+  (#match? @m "^(query|query_as|query_scalar|query_one|query_opt|query_row|query_map|execute|execute_batch|batch_execute|simple_query|prepare|prepare_cached|raw_sql|sql_query)$")
+  (#bound? @arg)) @finding
 "#,
         requires: None,
+        bindings: Some(
+            r#"
+(let_declaration
+  pattern: (identifier) @var
+  value: (macro_invocation macro: (identifier) @mac (token_tree . (string_literal) @fmt))
+  (#eq? @mac "format")
+  (#match? @fmt "(?i)\\b(select|insert|update|delete|drop|create|alter|replace)\\b"))
+"#,
+        ),
         jsx: false,
         examples: &[
             "async fn f(p: &PgPool, id: &str) { sqlx::query(&format!(\"SELECT * FROM users WHERE id = '{}'\", id)).fetch_all(p).await; }",
             "fn f(c: &Connection, n: &str) { c.execute(&format!(\"DELETE FROM t WHERE name = '{n}'\"), []); }",
             "fn f(c: &mut Client, t: &str) { c.batch_execute(&format!(\"DROP TABLE {}\", t)); }",
+            "async fn f(p: &PgPool, id: &str) -> R {\n    let sql = format!(\"SELECT * FROM users WHERE id = '{id}'\");\n    let rows = sqlx::query(&sql).fetch_all(p).await?;\n    Ok(rows)\n}",
         ],
         counter_examples: &[
             "async fn f(p: &PgPool, id: i32) { sqlx::query(\"SELECT * FROM users WHERE id = $1\").bind(id).fetch_all(p).await; }",
             "fn f(c: &Connection, n: &str) { c.execute(\"DELETE FROM t WHERE name = ?1\", params![n]); }",
             "fn f(s: &Search, q: &str) { s.query(&format!(\"title:{}\", q)); }",
+            "fn f(c: &Connection, n: &str) {\n    let sql = \"DELETE FROM t WHERE name = ?1\";\n    c.execute(sql, params![n]);\n}",
         ],
     },
     Rule {
@@ -151,6 +177,7 @@ pub static RULES: &[Rule] = &[
   (#eq? @mode "NONE")) @finding
 "#,
         requires: None,
+        bindings: None,
         jsx: false,
         examples: &[
             "fn f() { reqwest::Client::builder().danger_accept_invalid_certs(true).build(); }",
@@ -175,6 +202,7 @@ pub static RULES: &[Rule] = &[
   (#match? @arg "(^|::|\\{|,\\s*)(md5|md4|sha1|sha1_smol|Md5|Md4|Sha1)(::|\\}|,|$)")) @finding
 "#,
         requires: None,
+        bindings: None,
         jsx: false,
         examples: &[
             "use md5::{Md5, Digest};",
@@ -201,6 +229,7 @@ pub static RULES: &[Rule] = &[
   (#match? @arg "(^|::|\\{|,\\s*)(des|rc4|Des|TdesEde2|TdesEde3|TdesEee3|Rc4)(::|\\}|,|$)")) @finding
 "#,
         requires: None,
+        bindings: None,
         jsx: false,
         examples: &[
             "use des::Des;",

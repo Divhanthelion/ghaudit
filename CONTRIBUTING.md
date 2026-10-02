@@ -36,7 +36,10 @@ Rules live in `src/analyzer/rules/<language>.rs`.
 
 2. Write a tree-sitter query that matches it. Capture the node to report as
    `@finding`. Narrow the match with predicates (`#eq?`, `#match?`, `#not-match?`), and
-   use `requires` for file-level conditions such as an import.
+   use `requires` for file-level conditions such as an import. To follow a value
+   through a variable, give the rule a `bindings` query that captures the assigned
+   variable as `@var`, and require `(#bound? @arg)` in the main query (see the SQL
+   rules).
 
 3. Fill in the `Rule`:
    - `id`: `<language>/<kebab-name>`;

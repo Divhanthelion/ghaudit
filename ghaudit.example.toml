@@ -10,10 +10,14 @@ sca = true         # dependency vulnerabilities via osv-scanner
 workflows = true   # GitHub Actions workflow checks
 ai = false         # LLM review (see [ai])
 languages = ["rust", "python", "javascript", "typescript", "go"]
-# Gitignore-style patterns to skip, on top of .gitignore and the built-in list
+# Gitignore-style patterns to skip, on top of the built-in list
 # (node_modules, vendor, target, dist, build, .venv, ...).
 exclude = []       # e.g. ["docs/**", "tests/fixtures/"]
-max_file_size = 1048576
+max_file_size = 1048576   # larger files are skipped and listed in the report
+# Honor the scanned repository's own .gitignore/.ignore files, ghaudit:ignore comments
+# and osv-scanner.toml? "auto": yes for local directories, no for cloned repositories
+# (their author could use them to hide findings). Or "always" / "never".
+trust_repo = "auto"
 
 [report]
 min_severity = "low"   # info | low | medium | high | critical
@@ -31,6 +35,7 @@ max_repos = 100
 include_forks = false
 include_archived = false
 concurrency = 4     # repositories cloned and scanned at once
+repo_timeout_secs = 1800   # give up on one repository after this long
 
 [ai]
 url = "http://localhost:1234/v1/chat/completions"   # any OpenAI-compatible endpoint
