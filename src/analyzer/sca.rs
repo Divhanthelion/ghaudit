@@ -284,6 +284,20 @@ fn group_finding(
             .max()
             .unwrap_or(Severity::Unknown),
     };
+    // RustSec marks advisories that are not vulnerability reports (`unmaintained`,
+    // `unsound`, `notice`) in each affected entry.
+    let informational = in_group
+        .iter()
+        .flat_map(|v| &v.affected)
+        .find_map(Affected::informational);
+    // An unmaintained crate has no known flaw: cargo-audit only warns about it and
+    // GitHub's advisory database does not republish it, so unrated it is low, not
+    // unknown. Unsound advisories are memory-safety bugs whose impact ranges from
+    // theoretical to exploitable, so they keep their rating (or stay unknown).
+    let severity = match informational {
+        Some("unmaintained") if severity == Severity::Unknown => Severity::Low,
+        _ => severity,
+    };
 
     let version = if pkg.version.is_empty() {
         pkg.commit
@@ -331,16 +345,37 @@ fn group_finding(
     } else {
         format!(" (also {})", aliases.join(", "))
     };
-    let message = format!(
-        "{} {}@{} is affected by {advisory}{also}: {summary}",
-        pkg.ecosystem, pkg.name, version
-    );
+    let subject = format!("{} {}@{}", pkg.ecosystem, pkg.name, version);
+    let said = summary.trim_end_matches('.');
+    let message = match informational {
+        Some("unmaintained") => format!(
+            "{subject} is flagged as unmaintained by {advisory}{also}: {said}. No vulnerability is known, but security fixes are unlikely to come."
+        ),
+        Some("unsound") => format!(
+            "{subject} is flagged as unsound by {advisory}{also}: {said}. Safe code calling it can cause undefined behavior; whether that is exploitable depends on how it is used."
+        ),
+        Some(kind) => format!("{subject} has a {kind} advisory, {advisory}{also}: {summary}"),
+        None => format!("{subject} is affected by {advisory}{also}: {summary}"),
+    };
+    let title = match informational {
+        Some(kind) => format!(
+            "{} {} ({kind}): {}",
+            pkg.name,
+            version,
+            truncate(&summary, 100)
+        ),
+        None => format!("{} {}: {}", pkg.name, version, truncate(&summary, 100)),
+    };
     let remediation = match fixed_versions.first() {
         _ if malicious => format!(
             "Remove {} immediately. Treat every machine and CI runner that installed it as compromised: rotate the credentials they could reach.",
             pkg.name
         ),
         Some(v) => format!("Upgrade {} to {v} or later.", pkg.name),
+        None if informational == Some("unmaintained") => format!(
+            "No fix is coming: plan to replace {} with a maintained alternative (the advisory often names one).",
+            pkg.name
+        ),
         None => "No fixed version is published. Check the advisory for workarounds, or replace the package.".to_string(),
     };
     let url = format!("https://osv.dev/vulnerability/{advisory}");
@@ -350,7 +385,7 @@ fn group_finding(
         Category::Dependency,
         severity,
         Confidence::High,
-        format!("{} {}: {}", pkg.name, version, truncate(&summary, 100)),
+        title,
         message,
         Location::new(path, line, 1),
         &format!("{}|{}|{}|{}", pkg.ecosystem, pkg.name, version, advisory),
@@ -366,6 +401,7 @@ fn group_finding(
         fixed_versions,
         cvss_score,
         url,
+        informational: informational.map(str::to_string),
     });
     finding
 }
@@ -592,6 +628,19 @@ pub struct Affected {
     pub package: Option<AffectedPackage>,
     #[serde(default)]
     pub ranges: Vec<Range>,
+    #[serde(default)]
+    pub database_specific: Option<serde_json::Value>,
+}
+
+impl Affected {
+    /// RustSec's `informational` kind; null for vulnerability reports.
+    fn informational(&self) -> Option<&str> {
+        self.database_specific
+            .as_ref()?
+            .get("informational")?
+            .as_str()
+            .filter(|s| !s.is_empty())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -766,6 +815,68 @@ mod tests {
                 .unwrap()
                 .contains("compromised")
         );
+    }
+
+    fn rustsec(id: &str, kind: &str) -> String {
+        format!(
+            r#"{{"id":"{id}","summary":"{id} summary.","affected":[{{"package":{{"name":"some-crate","ecosystem":"crates.io"}},
+                "database_specific":{{"categories":[],"cvss":null,"informational":"{kind}"}},"ranges":[]}}]}}"#
+        )
+    }
+
+    fn informational_outcome() -> ScaOutcome {
+        let json = format!(
+            r#"{{"results":[{{"source":{{"path":"/r/Cargo.lock"}},"packages":[{{"package":{{"name":"some-crate","version":"1.0.0","ecosystem":"crates.io"}},
+            "groups":[{{"ids":["RUSTSEC-2024-0001"],"aliases":[],"max_severity":""}},{{"ids":["RUSTSEC-2024-0002"],"aliases":[],"max_severity":""}}],
+            "vulnerabilities":[{},{}]}}]}}]}}"#,
+            rustsec("RUSTSEC-2024-0001", "unmaintained"),
+            rustsec("RUSTSEC-2024-0002", "unsound"),
+        );
+        convert(&parse_output(&json).unwrap(), Path::new("/r"))
+    }
+
+    #[test]
+    fn unrated_unmaintained_advisories_are_low_and_labeled() {
+        let o = informational_outcome();
+        let f = find(&o, "RUSTSEC-2024-0001");
+        assert_eq!(f.severity, Severity::Low);
+        assert_eq!(
+            f.dependency.as_ref().unwrap().informational.as_deref(),
+            Some("unmaintained")
+        );
+        assert!(f.title.contains("(unmaintained)"), "{}", f.title);
+        assert!(
+            f.message.contains("flagged as unmaintained"),
+            "{}",
+            f.message
+        );
+        assert!(!f.message.contains("affected by"), "{}", f.message);
+        assert!(!f.message.contains(".."), "{}", f.message);
+        assert!(
+            f.remediation
+                .as_deref()
+                .unwrap()
+                .contains("maintained alternative")
+        );
+    }
+
+    #[test]
+    fn unsound_advisories_keep_their_rating() {
+        let o = informational_outcome();
+        let unrated = find(&o, "RUSTSEC-2024-0002");
+        assert_eq!(unrated.severity, Severity::Unknown);
+        assert!(unrated.message.contains("flagged as unsound"));
+        // RUSTSEC-2018-0018 is unsound too, but rated 7.5 through its GHSA alias.
+        let fixture = converted();
+        let rated = find(&fixture, "RUSTSEC-2018-0018");
+        assert_eq!(rated.severity, Severity::High);
+        assert_eq!(
+            rated.dependency.as_ref().unwrap().informational.as_deref(),
+            Some("unsound")
+        );
+        let plain = find(&fixture, "RUSTSEC-2019-0009");
+        assert_eq!(plain.dependency.as_ref().unwrap().informational, None);
+        assert!(plain.message.contains("is affected by"));
     }
 
     #[test]
