@@ -121,16 +121,7 @@ pub fn discover(root: &Path, opts: &DiscoveryOptions) -> Result<Discovered> {
         )));
     }
 
-    let mut overrides = OverrideBuilder::new(root);
-    for pattern in &opts.exclude {
-        // In an override set, a leading `!` means "exclude".
-        overrides
-            .add(&format!("!{}", pattern.trim_start_matches('!')))
-            .map_err(|e| Error::Config(format!("invalid exclude pattern '{pattern}': {e}")))?;
-    }
-    let overrides = overrides
-        .build()
-        .map_err(|e| Error::Config(format!("invalid exclude patterns: {e}")))?;
+    let overrides = exclude_overrides(root, &opts.exclude)?;
 
     let honor = opts.honor_ignore_files;
     let walker = WalkBuilder::new(root)
@@ -219,6 +210,34 @@ fn add(
         abs_path: abs.to_path_buf(),
         size,
     });
+}
+
+fn exclude_overrides(root: &Path, exclude: &[String]) -> Result<Override> {
+    let mut overrides = OverrideBuilder::new(root);
+    for pattern in exclude {
+        // In an override set, a leading `!` means "exclude".
+        overrides
+            .add(&format!("!{}", pattern.trim_start_matches('!')))
+            .map_err(|e| Error::Config(format!("invalid exclude pattern '{pattern}': {e}")))?;
+    }
+    overrides
+        .build()
+        .map_err(|e| Error::Config(format!("invalid exclude patterns: {e}")))
+}
+
+/// The default excluded directories and `--exclude` patterns, for paths that are not
+/// walked (files in git history).
+pub struct PathFilter(Override);
+
+impl PathFilter {
+    pub fn new(root: &Path, exclude: &[String]) -> Result<Self> {
+        exclude_overrides(root, exclude).map(Self)
+    }
+
+    /// Whether `rel` (relative, `/`-separated) would be scanned.
+    pub fn keeps(&self, rel: &str) -> bool {
+        keep_tracked(rel, &self.0)
+    }
 }
 
 fn is_excluded_dir(name: Option<&str>) -> bool {

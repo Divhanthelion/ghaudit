@@ -62,6 +62,25 @@ Add a `provider(...)` entry in `src/analyzer/secrets.rs` and a test. Keep test t
 out of the source: assemble them at runtime with `tok(&["prefix_", "rest"])`, as the
 existing tests do, so ghaudit's own scans stay clean.
 
+Avoid counting runs (`12345`, `abcdef`) in test tokens: the detector treats them as
+placeholders.
+
+## Adding a settings check
+
+Add a `SettingsRule` to `RULES` in `src/analyzer/settings.rs`, then the check itself in
+the helper for its area (`branch_checks`, `actions_checks`, ...). Every check must end
+in `pass`, `fail` or `na` (not assessable): read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#settings-analyzersettingsrs)
+for when a 404 or 403 may count as "off". Check field names against GitHub's
+[OpenAPI description](https://github.com/github/rest-api-description), and test the
+pass, fail and not-assessable cases with canned responses.
+
+## Adding an agent-config check
+
+Agent and editor configs are handled in `src/analyzer/agents.rs`: map the file in
+`kind()`, read it in the tool's method, and report through `push` (or `command` for
+anything that runs a command, so the download-and-execute check applies). Cite the
+tool's documentation for the setting in the test.
+
 ## Commit style
 
 Small, focused commits with an imperative subject line ("Add go/weak-random rule").

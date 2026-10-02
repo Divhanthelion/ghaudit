@@ -8,6 +8,9 @@ sast = true        # code rules
 secrets = true     # credential detection
 sca = true         # dependency vulnerabilities via osv-scanner
 workflows = true   # GitHub Actions workflow checks
+agents = true      # committed AI-agent/editor configs (MCP servers, auto-approval, ...)
+settings = true    # repository and organization settings via the GitHub API (needs a token)
+history = false    # also search every commit for removed credentials (clones full history)
 ai = false         # LLM review (see [ai])
 languages = ["rust", "python", "javascript", "typescript", "go"]
 # Gitignore-style patterns to skip, on top of the built-in list
@@ -22,6 +25,7 @@ trust_repo = "auto"
 [report]
 min_severity = "low"   # info | low | medium | high | critical
 fail_on = "high"       # exit 1 at or above this severity; "never" to disable
+# baseline = "ghaudit-baseline.json"   # a previous `-f json` report: report only new findings
 
 [sca]
 osv_scanner = "osv-scanner"   # name on PATH, or a full path

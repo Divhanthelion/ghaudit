@@ -1,5 +1,62 @@
 # Changelog
 
+## 0.3.0
+
+Three new analyzers and two new modes, aimed at auditing the repositories you own.
+
+### New
+
+- **Repository and organization settings audit** (`settings`, on by default, needs a
+  token). 38 checks read from the GitHub API, read-only:
+  - default branch protection, via rulesets (including organization rulesets) or
+    classic protection;
+  - secret scanning, push protection, Dependabot, private vulnerability reporting;
+  - Actions: default token permissions, workflows approving pull requests, SHA pinning,
+    allowed actions, fork pull request approval and secrets, self-hosted runners on
+    public repositories;
+  - deploy keys, webhooks, outside collaborators with admin, environments;
+  - for `ghaudit org`, the organization itself: 2FA requirement and members without
+    2FA, default member permission, Actions and webhooks.
+
+  Each check is pass, fail or **not assessable**; a check the token cannot see is never
+  counted as a pass. Failures link to the settings page that fixes them, in text and
+  SARIF output, and the JSON report lists every check in a new `settings` section.
+  Local directories are audited through their `origin` remote. `--no-settings` turns it
+  off.
+- **AI agent and editor config checks** (`agents`, on by default): download-and-run
+  commands in hooks, helpers, tasks and MCP servers; auto-approval (VS Code
+  `chat.tools.autoApprove`, Codex `approval_policy = "never"`, Claude Code `Bash`
+  allow-all and `enableAllProjectMcpServers`, Gemini `autoAccept`, MCP `trust: true`);
+  VS Code tasks that run on folder open; MCP servers from unpinned `npx`/`uvx`/`docker`
+  packages or over plain HTTP. Covers `.mcp.json` and other MCP configs, `.claude/`,
+  `.vscode/`, `.gemini/`, `.zed/` and `.codex/`. `--no-agents` turns it off.
+- **Git history search** (`--history`, `history = true`): every commit on every branch
+  is searched for credentials that are gone from the current files. Each is reported
+  once, at the newest commit that added it, with the commit in the text, JSON
+  (`commit`) and SARIF output. Repositories are cloned with full history in this mode.
+  Diff drivers, textconv filters and signature checks are off, so a repository's git
+  config cannot run anything, and the search stops at 1 GiB or 10 minutes, saying so.
+- **Baselines** (`--baseline report.json`, `baseline = "..."`): report and gate only on
+  findings that are not in an earlier JSON report. Matching uses fingerprints, which
+  ignore line numbers; the report counts the findings the baseline hid.
+- **`ghaudit user <your-login>` includes your private repositories** when the token is
+  yours (GitHub's public listing omits them).
+
+### Improved
+
+- Secret placeholders: values with counting or keyboard runs (`12345`, `abcdef`,
+  `a1b2c3`, `qwerty`) are treated as test data, which removes the most common false
+  positives in fixtures and code dumps.
+- `ghaudit rules` lists the agent and settings checks too, and sizes its columns to fit.
+- The text report ends with a settings summary (passed, failed, not assessable).
+
+### For developers
+
+- `GitHub::probe` returns any 4xx response for the caller to judge, while rate limits
+  and server errors stay errors.
+- Analyzer order in reports: `sast`, `secrets`, `history`, `sca`, `workflows`,
+  `agents`, `settings`, `ai`. Scripts that index `analyzers` by position need updating.
+
 ## 0.2.1
 
 Hardening for scanning repositories you don't control, plus accuracy work across every

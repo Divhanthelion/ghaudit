@@ -32,6 +32,29 @@ pub struct GitHub {
     token: Option<String>,
 }
 
+/// Response of an endpoint whose failure statuses carry meaning: on settings
+/// endpoints, 404 can mean "disabled" and 403 "this token may not look".
+#[derive(Debug, Clone)]
+pub struct Probe {
+    pub status: u16,
+    /// JSON body; `Null` for an empty body (e.g. 204).
+    pub body: serde_json::Value,
+}
+
+impl Probe {
+    pub fn ok(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
+
+    /// GitHub's `message`, for 4xx responses.
+    pub fn message(&self) -> &str {
+        self.body
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or_default()
+    }
+}
+
 impl GitHub {
     pub fn new(api_url: &str, token: Option<String>) -> Result<Self> {
         let mut headers = header::HeaderMap::new();
@@ -63,6 +86,11 @@ impl GitHub {
         self.token.is_some()
     }
 
+    /// Web base URL of the configured host (`https://github.com`).
+    pub fn web_url(&self) -> String {
+        web_url(&self.api_url)
+    }
+
     /// Clone URL for `owner/name` on the configured GitHub host.
     pub fn clone_url(&self, owner: &str, name: &str) -> String {
         format!("{}/{owner}/{name}.git", web_url(&self.api_url))
@@ -86,7 +114,24 @@ impl GitHub {
         .await
     }
 
+    /// Repositories owned by `user`. GitHub lists only public repositories for
+    /// `/users/{name}/repos`, so when the token belongs to `user` their own listing is
+    /// used instead, which includes private repositories.
     pub async fn user_repos(&self, user: &str, limit: usize) -> Result<Vec<RepoInfo>> {
+        if self
+            .authenticated_login()
+            .await
+            .is_some_and(|me| me.eq_ignore_ascii_case(user))
+        {
+            return self
+                .paginate(
+                    "/user/repos",
+                    &[("affiliation", "owner"), ("sort", "pushed")],
+                    limit,
+                    false,
+                )
+                .await;
+        }
         self.paginate(
             &format!("/users/{user}/repos"),
             &[("type", "owner"), ("sort", "pushed")],
@@ -94,6 +139,21 @@ impl GitHub {
             false,
         )
         .await
+    }
+
+    /// Login of the token's user. `None` without a token, or for tokens that are not a
+    /// user's (e.g. GitHub App installation tokens).
+    async fn authenticated_login(&self) -> Option<String> {
+        #[derive(Deserialize)]
+        struct Me {
+            login: String,
+        }
+        self.token.as_ref()?;
+        let resp = self.send("/user", &[]).await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        resp.json::<Me>().await.ok().map(|m| m.login)
     }
 
     /// Repositories matching a search query (GitHub caps search at 1000 results).
@@ -156,6 +216,14 @@ impl GitHub {
     }
 
     async fn get(&self, path: &str, query: &[(&str, &str)]) -> Result<Response> {
+        let resp = self.send(path, query).await?;
+        if resp.status().is_success() {
+            return Ok(resp);
+        }
+        Err(api_error(resp).await)
+    }
+
+    async fn send(&self, path: &str, query: &[(&str, &str)]) -> Result<Response> {
         let mut req = self
             .client
             .get(format!("{}{path}", self.api_url))
@@ -163,11 +231,34 @@ impl GitHub {
         if let Some(token) = &self.token {
             req = req.bearer_auth(token);
         }
-        let resp = req.send().await?;
-        if resp.status().is_success() {
-            return Ok(resp);
+        Ok(req.send().await?)
+    }
+
+    /// GET that returns 4xx responses instead of failing on them. Rate limiting, server
+    /// errors and network failures are still errors: they say nothing about the setting.
+    pub async fn probe(&self, path: impl AsRef<str>, query: &[(&str, &str)]) -> Result<Probe> {
+        let resp = self.send(path.as_ref(), query).await?;
+        let status = resp.status();
+        let limited = resp
+            .headers()
+            .get("x-ratelimit-remaining")
+            .is_some_and(|v| v.as_bytes() == b"0");
+        if status.is_server_error()
+            || status == StatusCode::TOO_MANY_REQUESTS
+            || (status == StatusCode::FORBIDDEN && limited)
+        {
+            return Err(api_error(resp).await);
         }
-        Err(api_error(resp).await)
+        let text = resp.text().await?;
+        let body = if text.trim().is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_str(&text).unwrap_or(serde_json::Value::Null)
+        };
+        Ok(Probe {
+            status: status.as_u16(),
+            body,
+        })
     }
 }
 
@@ -213,8 +304,6 @@ async fn api_error(resp: Response) -> Error {
     Error::GitHub(format!("{status}: {message}"))
 }
 
-/// Web base URL for an API base URL: `https://api.github.com` -> `https://github.com`,
-/// `https://ghe.example.com/api/v3` -> `https://ghe.example.com`.
 /// Host of the configured GitHub web UI (`github.com`, or a GitHub Enterprise host).
 pub fn web_host(api_url: &str) -> String {
     let web = web_url(api_url);
@@ -222,6 +311,8 @@ pub fn web_host(api_url: &str) -> String {
     rest.split('/').next().unwrap_or(rest).to_ascii_lowercase()
 }
 
+/// Web base URL for an API base URL: `https://api.github.com` -> `https://github.com`,
+/// `https://ghe.example.com/api/v3` -> `https://ghe.example.com`.
 pub fn web_url(api_url: &str) -> String {
     let api = api_url.trim_end_matches('/');
     if let Some(rest) = api.strip_prefix("https://api.") {
@@ -353,6 +444,34 @@ mod tests {
             err.contains("rate limit exhausted") && err.contains("GITHUB_TOKEN"),
             "{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn your_own_user_listing_includes_private_repositories() {
+        let (url, log) = mock(|line| {
+            if line.starts_with("GET /user/repos?") {
+                (200, vec![], repos_json(0, 3))
+            } else if line.starts_with("GET /user ") || line == "GET /user" {
+                (200, vec![], r#"{"login":"Me"}"#.into())
+            } else if line.starts_with("GET /users/") {
+                (200, vec![], repos_json(0, 1))
+            } else {
+                (404, vec![], "{}".into())
+            }
+        })
+        .await;
+        let gh = GitHub::new(&url, Some("t0ken".into())).unwrap();
+        assert_eq!(gh.user_repos("me", 10).await.unwrap().len(), 3);
+        assert_eq!(gh.user_repos("someone-else", 10).await.unwrap().len(), 1);
+        let log = log.lock().unwrap().clone();
+        assert!(
+            log.iter()
+                .any(|l| l.contains("/user/repos?") && l.contains("affiliation=owner")),
+            "{log:?}"
+        );
+        // Without a token, no /user call is made.
+        let gh = GitHub::new(&url, None).unwrap();
+        assert_eq!(gh.user_repos("me", 10).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

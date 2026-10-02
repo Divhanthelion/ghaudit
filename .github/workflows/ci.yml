@@ -68,6 +68,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0 # full history for the --history self-scan
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
         with:
           toolchain: stable
@@ -82,8 +83,8 @@ jobs:
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
       - name: Integration tests against the real osv-scanner
         run: cargo test --locked --test cli -- --include-ignored
-      - name: Scan this repository with ghaudit (fails on high-severity findings)
-        run: cargo run --locked --release -- scan . --exclude tests/fixtures -f sarif -o ghaudit.sarif
+      - name: Scan this repository and its history with ghaudit (fails on high-severity findings)
+        run: cargo run --locked --release -- scan . --history --exclude tests/fixtures -f sarif -o ghaudit.sarif
       - name: Validate the SARIF report against the official schema
         if: always()
         run: pipx run check-jsonschema --schemafile https://www.schemastore.org/sarif-2.1.0.json ghaudit.sarif

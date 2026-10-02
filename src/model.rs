@@ -134,6 +134,11 @@ pub enum Category {
     Dependency,
     /// Insecure GitHub Actions workflow configuration.
     Workflow,
+    /// Risky AI-agent or editor configuration committed to the repository
+    /// (MCP servers, auto-approval, commands run on open).
+    Agent,
+    /// A repository or organization security setting, read from the GitHub API.
+    Settings,
     /// Issue suggested by a language model. Always needs human review.
     Ai,
 }
@@ -145,6 +150,8 @@ impl Category {
             Category::Secret => "secret",
             Category::Dependency => "dependency",
             Category::Workflow => "workflow",
+            Category::Agent => "agent",
+            Category::Settings => "settings",
             Category::Ai => "ai",
         }
     }
@@ -420,6 +427,12 @@ pub struct Finding {
     /// Set when the finding comes from a multi-repository scan (`owner/name`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repository: Option<String>,
+    /// Where to fix it, when that is a web page rather than a file (settings findings).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub help_url: Option<String>,
+    /// The commit that added it, when found in git history rather than the current files.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub commit: Option<String>,
 }
 
 impl Finding {
@@ -452,6 +465,8 @@ impl Finding {
             remediation: None,
             dependency: None,
             repository: None,
+            help_url: None,
+            commit: None,
         }
     }
 
@@ -571,11 +586,38 @@ pub struct ScanStats {
     /// Repeats of one rule in one file beyond the per-file limit; see [`ScanReport::omitted`].
     #[serde(default)]
     pub findings_omitted: usize,
+    /// Findings left out because they are in the `--baseline` report.
+    #[serde(default)]
+    pub findings_baselined: usize,
     /// Findings per severity after filtering.
     pub by_severity: HashMap<Severity, usize>,
     /// Findings per category after filtering.
     pub by_category: HashMap<Category, usize>,
     pub duration_ms: u64,
+}
+
+/// Result of one settings check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckStatus {
+    Pass,
+    Fail,
+    /// The token cannot read the setting (usually: it lacks admin access). Never
+    /// counted as a pass.
+    NotAssessable,
+}
+
+/// One security setting of a repository or organization, checked through the API.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettingsCheck {
+    /// `owner/name`, or `org:name` for organization settings.
+    pub target: String,
+    /// Rule ID of the check, e.g. `settings/default-branch-unprotected`.
+    pub check: String,
+    pub status: CheckStatus,
+    /// Why it failed or could not be assessed.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub detail: Option<String>,
 }
 
 /// A file that was not (fully) analyzed, and why. Listed so that a report never looks
@@ -619,6 +661,9 @@ pub struct ScanReport {
     pub skipped: Vec<SkippedFile>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub omitted: Vec<Omitted>,
+    /// Every settings check run, with its outcome. Failures are also findings.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub settings: Vec<SettingsCheck>,
 }
 
 impl ScanReport {
@@ -637,6 +682,7 @@ impl ScanReport {
             findings: Vec::new(),
             skipped: Vec::new(),
             omitted: Vec::new(),
+            settings: Vec::new(),
         }
     }
 
@@ -702,7 +748,26 @@ impl ScanReport {
                 .then_with(|| a.location.start_line.cmp(&b.location.start_line))
                 .then_with(|| a.rule_id.cmp(&b.rule_id))
         });
+        self.recount();
+    }
 
+    /// Leave out findings that are also in `baseline` (same fingerprint, same
+    /// repository), so the report and the exit code cover only new findings.
+    /// Fingerprints follow line content, not line numbers, so moved code still matches.
+    pub fn apply_baseline(&mut self, baseline: &ScanReport) {
+        let known: std::collections::HashSet<(Option<&str>, &str)> = baseline
+            .findings
+            .iter()
+            .map(|f| (f.repository.as_deref(), f.fingerprint.as_str()))
+            .collect();
+        let before = self.findings.len();
+        self.findings
+            .retain(|f| !known.contains(&(f.repository.as_deref(), f.fingerprint.as_str())));
+        self.stats.findings_baselined = before - self.findings.len();
+        self.recount();
+    }
+
+    fn recount(&mut self) {
         self.stats.by_severity.clear();
         self.stats.by_category.clear();
         for f in &self.findings {
@@ -876,6 +941,27 @@ mod tests {
             (4, vec!["d".to_string(), "e".to_string()])
         );
         assert!(Snippet::around(content, 9, 1).is_none());
+    }
+
+    #[test]
+    fn baseline_keeps_only_new_findings() {
+        let mut old = ScanReport::new("t");
+        old.findings
+            .push(finding(Severity::High, "a.py", 3, "eval(x)"));
+        old.finalize(Severity::Low);
+        let mut new = ScanReport::new("t");
+        // The same issue, moved to another line, and a new one.
+        new.findings
+            .push(finding(Severity::High, "a.py", 40, "eval(x)"));
+        new.findings
+            .push(finding(Severity::Critical, "a.py", 41, "pickle.loads(d)"));
+        new.finalize(Severity::Low);
+        new.apply_baseline(&old);
+        assert_eq!(new.findings.len(), 1);
+        assert_eq!(new.findings[0].location.start_line, 41);
+        assert_eq!(new.stats.findings_baselined, 1);
+        assert_eq!(new.stats.by_severity.get(&Severity::High), None);
+        assert_eq!(new.count_at_least(Severity::High), 1);
     }
 
     #[test]

@@ -23,7 +23,8 @@ pub struct Checkout {
     pub commit: Option<String>,
 }
 
-/// Shallow-clone `url` (default branch, depth 1).
+/// Shallow-clone `url` (default branch, depth 1), or with `full_history`, clone every
+/// branch with all its commits.
 ///
 /// The token, when given, is passed to git through `GIT_CONFIG_*` environment
 /// variables as an HTTP header scoped to the clone URL's host. It never appears in
@@ -33,7 +34,7 @@ pub struct Checkout {
 /// The repository is untrusted, so the clone runs nothing it controls: no hooks or
 /// submodules (a plain clone fetches neither), no symlinks, no `ext::` transport, and
 /// no Git LFS downloads (the repository's `.lfsconfig` could point them anywhere).
-pub async fn clone(url: &str, token: Option<&str>) -> Result<Checkout> {
+pub async fn clone(url: &str, token: Option<&str>, full_history: bool) -> Result<Checkout> {
     let dir = tempfile::Builder::new().prefix("ghaudit-").tempdir()?;
     let path = dir.path().join("repo");
 
@@ -55,15 +56,14 @@ pub async fn clone(url: &str, token: Option<&str>) -> Result<Checkout> {
         "filter.lfs.required=false",
         "clone",
         "--quiet",
-        "--depth",
-        "1",
-        "--single-branch",
         "--no-tags",
-        "--",
-        url,
-    ])
-    .arg(&path)
-    .env("GIT_LFS_SKIP_SMUDGE", "1");
+    ]);
+    if !full_history {
+        cmd.args(["--depth", "1", "--single-branch"]);
+    }
+    cmd.args(["--", url])
+        .arg(&path)
+        .env("GIT_LFS_SKIP_SMUDGE", "1");
 
     if let Some(token) = token.filter(|t| !t.is_empty())
         && let Some(host) = url_origin(url)
@@ -120,6 +120,22 @@ pub async fn head_commit(path: &Path) -> Option<String> {
     }
     let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
     (sha.len() >= 40).then_some(sha)
+}
+
+/// URL of the `origin` remote of the git work tree at `path`, if any.
+pub async fn origin_url(path: &Path) -> Option<String> {
+    let output = git_command()
+        .arg("-C")
+        .arg(path)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!url.is_empty()).then_some(url)
 }
 
 fn git_command() -> Command {
@@ -231,14 +247,29 @@ mod tests {
         std::fs::write(src.path().join("a.txt"), "hello").unwrap();
         run(&["add", "."]);
         run(&["commit", "-q", "-m", "init"]);
+        std::fs::write(src.path().join("a.txt"), "again").unwrap();
+        run(&["commit", "-q", "-am", "second"]);
+        run(&["branch", "side"]);
 
         // file:///tmp/x on Unix, file:///C:/x on Windows.
         let path = src.path().to_string_lossy().replace('\\', "/");
         let url = format!("file:///{}", path.trim_start_matches('/'));
         // A token is never attached to a file:// URL (and must not make it fail).
-        let checkout = clone(&url, Some("ghp_unused")).await.unwrap();
+        let checkout = clone(&url, Some("ghp_unused"), false).await.unwrap();
         assert!(checkout.path.join("a.txt").exists());
         assert_eq!(checkout.commit.as_deref().map(str::len), Some(40));
+        let count = |dir: &Path, rev: &str| {
+            let out = std::process::Command::new("git")
+                .args(["rev-list", "--count", rev])
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_eq!(count(&checkout.path, "--all"), "1");
+        let full = clone(&url, None, true).await.unwrap();
+        assert_eq!(count(&full.path, "--all"), "2");
+        assert_eq!(count(&full.path, "origin/side"), "2");
         let dir = checkout.path.clone();
         drop(checkout);
         assert!(!dir.exists(), "temporary clone should be removed on drop");
@@ -253,7 +284,7 @@ mod tests {
         {
             return;
         }
-        let err = clone("file:///definitely/not/a/repo", None)
+        let err = clone("file:///definitely/not/a/repo", None, false)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("failed"), "{err}");

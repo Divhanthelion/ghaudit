@@ -9,16 +9,21 @@ main design decisions. File references are to `src/`.
 flowchart LR
     CLI["main.rs<br/>parse flags, load config"] --> T["target.rs<br/>what to scan"]
     T -->|local dir| D
-    T -->|owner/repo| G["git.rs<br/>shallow clone to temp dir"]
+    T -->|owner/repo| G["git.rs<br/>clone to temp dir"]
     T -->|org / user / search| API["github.rs<br/>list repositories"] --> G
+    T --> SET["settings.rs<br/>GitHub API settings audit"]
     G --> D["discovery.rs<br/>pick files"]
-    D --> L["per-file analysis (rayon)<br/>sast.rs, secrets.rs,<br/>workflows/, unicode.rs"]
+    D --> L["per-file analysis (rayon)<br/>sast.rs, secrets.rs, workflows/,<br/>agents.rs, unicode.rs"]
     D --> S["sca.rs<br/>osv-scanner subprocess"]
+    D --> H["history.rs (--history)<br/>git log -p"]
     L --> AI["ai.rs (optional)<br/>LLM review"]
     L --> R["model.rs<br/>ScanReport"]
     S --> R
+    H --> R
+    SET --> R
     AI --> R
-    R --> OUT["report/<br/>text / JSON / SARIF"]
+    R --> B["baseline (optional)<br/>drop known findings"]
+    B --> OUT["report/<br/>text / JSON / SARIF"]
 ```
 
 ### 1. Command line (`main.rs`)
@@ -36,6 +41,9 @@ Then:
 - The scan runs inside `tokio::select!` together with a Ctrl-C and SIGTERM listener.
   Interrupting drops the scan future, which deletes temporary clones, kills child
   processes and tells analysis threads to stop.
+- With `--baseline FILE`, the earlier JSON report is read before the scan (a bad path
+  fails fast). After the scan, `ScanReport::apply_baseline` drops every finding whose
+  repository and fingerprint are in it, and counts them.
 - The exit code is computed last from the findings and the analyzer statuses. The
   table is in the README.
 
@@ -56,9 +64,12 @@ GitHub Enterprise host of `github.api_url`): `gitlab.com/a/b` is an error, not a
 
 - **Listing repositories.** `github.rs` is a small REST client (reqwest) with
   pagination. Rate-limit errors are turned into a readable message with the reset
-  time. Forks and archived repositories are skipped unless asked for.
+  time. Forks and archived repositories are skipped unless asked for. `user` targets
+  use `/users/{name}/repos`, which lists public repositories only, unless the token
+  belongs to that user: then `/user/repos?affiliation=owner` adds the private ones.
 - **Cloning.** `git.rs` runs the system `git`: `clone --depth 1 --single-branch
-  --no-tags` into a `TempDir`, which is deleted when it goes out of scope. The token is
+  --no-tags` (with `--history`, `clone --no-tags`: every branch, every commit) into a
+  `TempDir`, which is deleted when it goes out of scope. The token is
   passed as an HTTP header through `GIT_CONFIG_*` environment variables, so it never
   appears in `ps` output or in `.git/config`, and only for http(s) URLs. The repository
   is untrusted, so the clone runs nothing it controls: `core.symlinks=false` makes
@@ -97,13 +108,19 @@ since a NUL byte in front of a secret does not make it harmless.
 
 ### 5. Analysis (`scanner.rs` and `analyzer/`)
 
-`Scanner::scan_dir` runs two things concurrently:
+`Scanner::scan_dir` runs these concurrently:
 
 - **Per-file analysis** on a rayon thread pool. Each file is read once and given to the
   secret detector (unless it is a lockfile or minified), the SAST engine (if its
-  language has rules and the file is not minified), the hidden-Unicode check and the
-  workflow audit. A shared cancellation flag stops the threads when the scan is dropped.
+  language has rules and the file is not minified), the hidden-Unicode check, the
+  workflow audit and the agent-config audit. A shared cancellation flag stops the
+  threads when the scan is dropped.
 - **osv-scanner** as a subprocess, which walks the same tree for lockfiles.
+- **The history search** (`--history`), on a blocking thread with the same flag.
+
+Next to `scan_dir`, and concurrently with it, the **settings audit** reads the
+repository's settings from the GitHub API (for a local directory, the repository its
+`origin` remote names). Organization scans also audit the organization itself.
 
 The optional LLM review runs after that, one file at a time, on a copy of the file with
 detected credentials replaced by `********`.
@@ -261,6 +278,70 @@ the length. Fingerprints of every finding on a line holding a secret, whatever i
 rule, are computed from the line with each secret value replaced by `********`. So a
 published fingerprint can't be used to brute-force a weak password.
 
+Credentials are matched by value, not just by line: placeholders include counting and
+keyboard runs (`12345`, `abcdef`, `a1b2c3`, `qwerty`), which test fixtures are full of
+and random tokens practically never contain.
+
+#### Git history (`analyzer/history.rs`)
+
+`git log --all -p -U0` is streamed line by line, with a marker line per commit. Each
+`+++ b/path` header selects a file (deletions, excluded directories, `--exclude`
+patterns and lockfiles are skipped), `@@` headers give line numbers, and the added
+lines of one commit to one file are collected and run through the secret detector as
+one text. Findings are mapped back to their line in that version of the file, masked
+like any other, and deduplicated by value: git lists the newest commit first, so each
+credential is reported once, at the newest commit that added it.
+
+Values the scan of the current files found are then dropped (`drop_current`), so a
+credential is reported in history only when it is gone from the files. A history
+finding carries `commit`, and its fingerprint includes the commit, so a baseline that
+accepts one leak cannot hide another on a similar line.
+
+The repository is not trusted to configure git: `--no-ext-diff`, `--no-textconv`,
+`--no-show-signature` and `log.showSignature=false` keep diff drivers, textconv filters
+and `gpg.program` from running, and `--src-prefix`/`--dst-prefix`, `--no-renames`,
+`--no-color` and `core.quotePath=false` pin the output format. Limits: 1 GiB of diff,
+10 minutes, and 2 MiB of added text per file version; hitting one marks the result
+incomplete in the analyzer status. A shallow clone is reported as partial history.
+
+#### Agent and editor configs (`analyzer/agents.rs`)
+
+Files are recognized by name and parent directory (`.mcp.json`, `.claude/settings.json`,
+`.vscode/tasks.json`, `.codex/config.toml`, ...), parsed as JSON (comments and trailing
+commas stripped first) or TOML, and walked by tool:
+
+- MCP server definitions (`mcpServers`, VS Code's `servers`, Zed's `context_servers`,
+  Codex's `[mcp_servers.*]`): the command line is checked for download-and-run
+  patterns; `npx`/`uvx`/`pipx run`/`pnpm dlx`/`bunx`/`docker run` are checked for a
+  pinned version or digest; remote URLs for plain HTTP to a non-local host; `trust: true`.
+- Claude Code: hooks and command settings (`apiKeyHelper`, `statusLine`, ...),
+  `enableAllProjectMcpServers`, `Bash` allowed outright, `bypassPermissions`.
+- VS Code: `chat.tools.autoApprove` and tasks that run on `folderOpen`.
+- Codex `approval_policy`/`sandbox_mode`, Gemini `autoAccept`.
+
+Every command any of these runs goes through one download-and-execute regex first
+(`curl ... | sh`, `iex`, `base64 -d | sh`, `/dev/tcp`, `nc -e`, `powershell -enc`).
+
+#### Settings (`analyzer/settings.rs`)
+
+Each check reads one or more endpoints through `GitHub::probe`, which returns the status
+code and body instead of failing on 4xx. Rate limits and server errors are still errors.
+Every check ends as pass, fail or not assessable, and the rules for that are strict:
+
+- A 404 means "turned off" only when the repository's own `permissions.admin` says the
+  token is an admin's; otherwise GitHub hides settings behind 404 and the check is not
+  assessable.
+- 403s (missing token scopes or fine-grained permissions) are not assessable, with
+  GitHub's message as the detail.
+- `security_and_analysis` absent from the repository object means the token cannot see
+  it: not assessable.
+
+Branch protection is judged from `GET /repos/{o}/{r}/rules/branches/{branch}`, which
+includes organization rulesets, and classic protection. Probes for one repository run
+concurrently (`tokio::join!`). A failure becomes a finding with category `settings`, a
+synthetic location (the settings page path), and `help_url`, the page that fixes it.
+Archived repositories skip the branch and Actions checks.
+
 #### Dependencies (`analyzer/sca.rs`)
 
 ghaudit runs:
@@ -299,7 +380,8 @@ a manifest it could not resolve) are kept as warnings on the analyzer status.
 - per-repository summaries (for multi-repo scans);
 - `skipped`: files that were not fully analyzed, and why;
 - `omitted`: counts of findings beyond the per-rule, per-file limit;
-- stats, including suppressed, skipped and omitted counts.
+- `settings`: every settings check with its outcome (pass, fail, not assessable);
+- stats, including suppressed, skipped, omitted and baselined counts.
 
 `finalize()` drops findings below `min_severity`, makes fingerprints unique, sorts the
 findings (by severity, then repository, path and line) and recomputes the counts in
@@ -324,7 +406,10 @@ The three formats:
   - `columnKind: unicodeCodePoints`, matching ghaudit's character columns;
   - percent-encoded artifact URIs;
   - tool execution notifications for failed analyzers, skipped files and omitted
-    findings.
+    findings;
+  - settings findings with the "no file associated with this alert" location
+    (Scorecard's convention) and the settings page as `helpUri`; history findings with
+    their `commit` in `properties`.
 
   CI validates it against the official schema.
 
@@ -337,7 +422,8 @@ The three formats:
 | Delegate dependency scanning to osv-scanner | Lockfile parsing and per-ecosystem version matching are large, subtle problems that Google maintains well. The old hand-written version mis-parsed versions and lost all severities. |
 | Small, precise rule set | A scanner that flags every `unwrap()` or file read gets ignored. Every rule must ship with examples and near-misses. |
 | System `git` and pure-Rust TLS (rustls + ring) | No C libraries to build, so `cargo install` works on Windows, macOS and Linux. Proxies and credentials behave like the user's own git. |
-| Failures are loud | A security tool that turns "couldn't check" into "nothing found" is worse than no tool. |
+| Failures are loud | A security tool that turns "couldn't check" into "nothing found" is worse than no tool. The settings audit's "not assessable" is the same rule applied per check. |
+| History is opt-in | A full clone and a walk of every commit cost far more than a depth-1 scan; for repositories you own it is where deleted credentials still live. |
 | Cloned repositories are untrusted | Their ignore files, suppression comments and osv-scanner config are written by the party being audited. |
 | Every per-file step is linear and budgeted | One crafted file must not stall an org-wide scan or exhaust memory. |
 | Logs on stderr, reports on stdout | Reports can be piped and redirected safely. |
@@ -351,5 +437,7 @@ The three formats:
 | Rules | `analyzer/sast.rs` | every rule's examples and counter-examples, on every grammar it targets |
 | osv-scanner | `analyzer/sca.rs` | conversion of recorded real osv-scanner output (`tests/fixtures/osv-scanner/`), plus fake binaries for the error paths |
 | GitHub API | `github.rs` | pagination and errors against an in-process mock HTTP server |
-| End to end | `tests/cli.rs` | the real binary: exit codes, formats, exclusions, redaction, SARIF stability, untrusted clones, org scans against a mock API |
+| Settings | `analyzer/settings.rs` | each check's pass, fail and not-assessable outcomes from canned API responses |
+| Git history | `analyzer/history.rs` | real repositories built in a temp dir: deleted, renamed and still-present credentials, limits |
+| End to end | `tests/cli.rs` | the real binary: exit codes, formats, exclusions, redaction, SARIF stability, untrusted clones, org scans and settings audits against a mock API, baselines, history |
 | Live | `tests/cli.rs` (ignored by default) | the real osv-scanner; run in CI with `--include-ignored` |

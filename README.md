@@ -10,9 +10,10 @@ repository, or a whole organization, and it reports:
 - **Risky code**: SQL built from strings, shell commands from dynamic input, unsafe
   deserialization, disabled TLS verification, weak crypto and more. It uses 37
   syntax-aware rules across Rust, Python, JavaScript/TypeScript and Go.
-- **Leaked credentials** in any file, including `.env`, YAML, JSON and binaries. This
-  covers over 20 provider formats (GitHub, AWS, Stripe, OpenAI, Anthropic, GitLab, npm,
-  ...) plus secret-named assignments. Secrets are always masked in the output.
+- **Leaked credentials** in any file, including `.env`, YAML, JSON and binaries, and
+  with `--history` in every commit. This covers over 20 provider formats (GitHub, AWS,
+  Stripe, OpenAI, Anthropic, GitLab, npm, ...) plus secret-named assignments. Secrets
+  are always masked in the output.
 - **Vulnerable and malicious dependencies** in every common lockfile and manifest, via
   Google's [osv-scanner](https://github.com/google/osv-scanner) and the OSV database.
 - **Insecure GitHub Actions workflows and composite actions**. These are the patterns
@@ -21,6 +22,14 @@ repository, or a whole organization, and it reports:
   - "pwn request" checkouts;
   - unpinned or previously compromised actions;
   - over-broad tokens and secrets reachable by anyone.
+- **Weak repository and organization settings**, read from the GitHub API: an
+  unprotected default branch, secret scanning or Dependabot turned off, workflows that
+  get a write token or can approve pull requests, fork pull requests that see secrets,
+  webhooks without TLS or a secret, organizations that don't require 2FA, and more.
+- **Dangerous AI-agent and editor configs** committed to the repository: Claude Code
+  hooks and helpers, Copilot auto-approval (CVE-2025-53773), VS Code tasks that run when
+  the folder opens, Codex and Gemini "never ask" modes, and MCP servers started from
+  unpinned packages or reached over plain HTTP.
 - **Hidden Unicode**: Trojan Source bidi tricks and invisible code, and invisible
   instructions in AI-agent files such as `.cursorrules`, `CLAUDE.md` and `.mcp.json`.
 
@@ -34,7 +43,7 @@ bounded time and memory. See [Scanning repositories you don't control](#scanning
 
 ```text
 $ ghaudit scan ./shop
-ghaudit 0.2.1 scan of ./shop @ 3f9c1e27a0b4
+ghaudit 0.3.0 scan of ./shop @ 3f9c1e27a0b4
 5 files, 27 lines, 2 dependencies in 3.3s
 
 CRITICAL secret     Stripe live secret key  [secret/stripe-key]
@@ -53,24 +62,26 @@ HIGH     code       SQL built from strings  [python/sql-injection]
            Fix: Pass values as parameters: cursor.execute("... WHERE id = %s", (user_id,)), ...
 
 Findings: 4 critical, 12 high, 14 medium, 4 low  (5 code, 2 secret, 27 dependency)
-Analyzers: sast ok  secrets ok  sca ok  workflows ok  ai off
+Analyzers: sast ok  secrets ok  history off  sca ok  workflows ok  agents ok  settings ok  ai off
+Settings: 21 passed, 2 failed, 0 not assessable
 ```
 
 ## Install
 
-Download a binary for Linux, macOS or Windows from
-[Releases](https://github.com/Divhanthelion/ghaudit/releases). Every release ships
-`SHA256SUMS` and signed build provenance, so you can check that a binary was built by
-this repository's release workflow from the tagged source:
-
-```bash
-gh attestation verify ghaudit-v0.2.1-x86_64-unknown-linux-gnu.tar.gz --repo Divhanthelion/ghaudit
-```
-
-Or build from source (Rust 1.88+):
+Build from source (Rust 1.88+):
 
 ```bash
 cargo install --git https://github.com/Divhanthelion/ghaudit
+# or, from a checkout: cargo install --path .   (or run in place: cargo run --release -- scan .)
+```
+
+Tagged versions also publish binaries for Linux, macOS and Windows on
+[Releases](https://github.com/Divhanthelion/ghaudit/releases), with `SHA256SUMS` and
+signed build provenance, so you can check that a binary was built by this repository's
+release workflow from the tagged source:
+
+```bash
+gh attestation verify ghaudit-v0.3.0-x86_64-unknown-linux-gnu.tar.gz --repo Divhanthelion/ghaudit
 ```
 
 ghaudit needs `git` on your `PATH` for remote scans. Dependency scanning also needs
@@ -91,13 +102,15 @@ ghaudit scan .                                   # a local directory
 ghaudit scan rust-lang/regex                     # a GitHub repository (shallow clone)
 ghaudit scan https://github.com/owner/repo/tree/main/src
 ghaudit org my-company --max-repos 50            # every repo in an org (needs a token)
-ghaudit user octocat
+ghaudit user octocat                             # your own login: private repos too
 ghaudit search 'topic:cli language:go stars:>500' --max-repos 20
-ghaudit rules                                    # list the code rules
+ghaudit scan . --history                         # also search every commit for credentials
+ghaudit rules                                    # list every rule
 ```
 
-Set `GITHUB_TOKEN` (or pass `--token`) for private repositories, org/user/search scans
-and higher API rate limits.
+Set `GITHUB_TOKEN` (or pass `--token`) for private repositories, org/user/search scans,
+the settings audit and higher API rate limits. `ghaudit user` with your own login lists
+your private repositories as well as public ones.
 
 Common options:
 
@@ -105,7 +118,9 @@ Common options:
 |---|---|
 | `-f text\|json\|sarif` | Report format (default `text`) |
 | `-o FILE` | Write the report to a file (checked before the scan starts) |
-| `--no-sast`, `--no-secrets`, `--no-sca`, `--no-workflows` | Turn analyzers off |
+| `--no-sast`, `--no-secrets`, `--no-sca`, `--no-workflows`, `--no-agents`, `--no-settings` | Turn analyzers off |
+| `--history` | Also search git history for credentials removed from the files (clones full history) |
+| `--baseline report.json` | Report only findings that are not in an earlier `-f json` report |
 | `--languages rust,python` | Limit code analysis to these languages |
 | `--exclude 'docs/**'` | Skip paths (gitignore syntax; repeatable; also applied to osv-scanner) |
 | `--min-severity medium` | Leave lower-severity findings out of the report |
@@ -143,7 +158,7 @@ steps:
   - name: Install ghaudit (verifying its build provenance) and osv-scanner
     env:
       GH_TOKEN: ${{ github.token }}
-      VERSION: v0.2.1
+      VERSION: v0.3.0
     run: |
       archive="ghaudit-$VERSION-x86_64-unknown-linux-gnu.tar.gz"
       gh release download "$VERSION" -R Divhanthelion/ghaudit -p "$archive"
@@ -163,7 +178,23 @@ reporting them.
 
 The SARIF output has stable fingerprints, so alerts are tracked across runs instead of
 reopening. It also carries `security-severity` scores, so GitHub labels alerts
-critical/high/medium/low.
+critical/high/medium/low. Settings findings have no file; they link to the settings page
+that fixes them.
+
+### Only new findings: baselines
+
+To adopt ghaudit on an existing codebase without fixing everything first, record what
+is there today and gate on what is new:
+
+```bash
+ghaudit scan . -f json -o ghaudit-baseline.json --fail-on never
+ghaudit scan . --baseline ghaudit-baseline.json       # reports and fails only on new findings
+```
+
+Findings are matched by fingerprint, which ignores line numbers, so moving code does not
+make old findings new. The report counts the findings the baseline hid. In multi-repo
+scans the repository is part of the match. `baseline = "..."` in `[report]` sets it in
+the config file.
 
 ## Scanning repositories you don't control
 
@@ -177,7 +208,9 @@ fool scanners:
   scans, files git tracks are scanned when they match an ignore pattern.
 - **The clone runs nothing it controls**: no hooks, submodules, symlinks or Git LFS
   downloads (whose server the repository's `.lfsconfig` chooses). Your token is only
-  sent over HTTPS, to the GitHub host.
+  sent over HTTPS, to the GitHub host. The history search turns off external diff
+  drivers, textconv filters and signature checks, so a repository's `.git/config` or
+  `.gitattributes` cannot make it run a command either.
 - **Costs are bounded.** Each file gets a 5-second budget for code analysis, and each
   repository gets `github.repo_timeout_secs` (default 30 minutes). Workflow YAML that
   expands beyond 100,000 nodes is refused and reported. One rule reports at most 25
@@ -276,6 +309,29 @@ there. Generic matches are skipped in tests, examples, docs and translation cata
 Secret values never appear in a report: not in messages, not in the context lines of
 other findings, and not in a form a fingerprint could be checked against.
 
+#### In git history
+
+A credential deleted in a later commit is still leaked: anyone who can clone the
+repository can recover it. `--history` (or `history = true`) searches every commit on
+every branch and reports each credential that is gone from the current files once, at
+the newest commit that added it:
+
+```text
+CRITICAL secret     GitHub token in git history  [secret/github-token]
+           src/settings.py:6:10 in commit 10bdc4b11c77
+           > 6 | TOKEN = "ghp_********"
+           GitHub token found: ghp_******** Added in commit 10bdc4b11c77 (2020-09-14) and gone
+           from the current files, but anyone who can clone the repository can recover it from
+           history.
+```
+
+Repositories are then cloned with full history instead of depth 1. The search streams
+`git log -p` (a 10,000-commit history with 80 MB of diffs takes about 6 seconds) and
+stops after 10 minutes or 1 GiB of diffs, saying so in the report. `--exclude` patterns apply to historical paths
+too. Credentials still in the current files are reported by the normal scan, not twice.
+The fix is always to revoke the credential: rewriting history does not reach clones
+that already exist.
+
 ### GitHub Actions workflows
 
 Files in `.github/workflows/` and composite actions (`action.yml` anywhere) are checked
@@ -306,6 +362,47 @@ exact line of the expression.
 
 These are deliberately a high-confidence subset. For deeper workflow analysis, use
 [zizmor](https://github.com/zizmorcore/zizmor) as well.
+
+### Repository and organization settings
+
+With a token, ghaudit reads each repository's settings from the GitHub API (read-only:
+it never changes anything). Every check ends as **pass**, **fail** or **not
+assessable**. A check the token cannot see is reported as not assessable, never as a
+pass. Failures are findings that link to the settings page that fixes them; the JSON
+report's `settings` section lists every check.
+
+| Area | Checks |
+|---|---|
+| Default branch | No protection (rulesets or classic branch protection), direct pushes, no required review, force pushes, deletion, admins exempt |
+| Security features | Secret scanning, push protection, Dependabot alerts and security updates, private vulnerability reporting |
+| Actions | `GITHUB_TOKEN` writable by default, workflows can approve pull requests, SHA pinning not required, any action allowed, weak approval for fork pull requests, fork pull requests get secrets or a write token, self-hosted runners on a public repository |
+| Access | Deploy keys with write access or unused for a year, outside collaborators with admin, deployment environments without protection rules |
+| Webhooks | TLS verification off, plain HTTP, no secret |
+| Organization (`ghaudit org`) | 2FA not required, members without 2FA or with SMS 2FA, members get write or admin on every repository, and the Actions and webhook checks at organization level |
+
+`ghaudit rules` lists all 38 with their severities. GitHub shows most of these settings
+only to repository admins (and organization owners), so scan with an admin's token to
+assess them all. Local directories are audited when their `origin` remote is on the
+configured GitHub host.
+
+### AI agent and editor configuration
+
+Config files committed to a repository configure the tools of everyone who opens it:
+an agent may start an MCP server, run a hook or skip its confirmation prompts. ghaudit
+reads `.mcp.json`, `.vscode/mcp.json`, `.cursor/mcp.json` and other `mcp.json` files,
+`claude_desktop_config.json`, `mcp_config.json`, `.claude/settings.json` (and
+`settings.local.json`), `.vscode/settings.json`, `.vscode/tasks.json`,
+`.gemini/settings.json`, `.zed/settings.json` and `.codex/config.toml`.
+
+| Rule | Severity | What |
+|---|---|---|
+| `agent/dangerous-command` | high | A hook, credential helper, task or MCP server command that downloads or decodes code and runs it (`curl ... \| sh`, `iex`, `base64 -d \| sh`, reverse shells) |
+| `agent/auto-approve` | high / medium / low | Tool calls run without asking: VS Code `chat.tools.autoApprove` (CVE-2025-53773), Codex `approval_policy = "never"` or `danger-full-access`, Claude Code `Bash` allowed outright or `enableAllProjectMcpServers`, MCP servers marked `trust: true`, Gemini `autoAccept` |
+| `agent/command-on-open` | medium / low | VS Code tasks with `runOn: folderOpen`; Claude Code hooks, `apiKeyHelper` and other command settings |
+| `agent/mcp-unpinned-package` | medium | MCP server started with `npx`, `uvx`, `pipx run`, `pnpm dlx`, `bunx` or `docker run` without a pinned version, so each start can fetch different code |
+| `agent/mcp-insecure-transport` | medium | Remote MCP server reached over plain `http://` |
+
+Comments in these JSON files (JSONC) are understood.
 
 ### Hidden Unicode
 
@@ -366,12 +463,15 @@ medium: treat them as leads, not verdicts. Detected credentials are replaced wit
   assigned in the same function). They flag *a SQL string built from variables*, not
   *user input that reaches SQL*. That is why the rule set is small and aims at a low
   false-positive rate.
-- Secret detection looks at the current files only, not git history. Run
-  [gitleaks](https://github.com/gitleaks/gitleaks) or
-  [trufflehog](https://github.com/trufflesecurity/trufflehog) over history when it matters.
-- Repositories are cloned at depth 1 from their default branch.
+- Secrets are matched by format, not verified against the provider: a match may be
+  revoked already. Git history is searched only with `--history`, and only the branches
+  a clone fetches (not pull request refs or other forks).
+- Without `--history`, repositories are cloned at depth 1 from their default branch.
 - Workflow checks read workflow files only; they don't inspect what a referenced action
-  does internally, or repository settings such as branch protection.
+  does internally.
+- The settings audit needs a token, and admin access for most checks. Organization
+  rulesets that target a repository are counted as protection; their bypass lists are
+  not analyzed.
 
 ## Documentation
 

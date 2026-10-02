@@ -5,12 +5,14 @@
 //! 2. in parallel: per-file analysis on a rayon pool (each file is read once and fed
 //!    to the secret detector, the code rules, the hidden-Unicode check and the
 //!    workflow audit) and osv-scanner as a subprocess;
-//! 3. optionally, LLM review of source files;
+//! 3. optionally, a search of git history for removed credentials (alongside step 2),
+//!    and LLM review of source files;
 //! 4. per file: findings in tests and docs are downgraded, secret values are masked
 //!    everywhere (snippets, messages, fingerprints), inline suppressions are applied
 //!    (trusted trees only), and repeats of one rule in one file are capped.
 //!
-//! Remote targets are shallow-cloned into a temporary directory first; org/user/search
+//! Remote targets are shallow-cloned (full history with `--history`) into a temporary
+//! directory first; org/user/search
 //! targets list repositories through the GitHub API and scan several at a time.
 //! A cloned repository is untrusted by default: its ignore files, suppression
 //! comments and osv-scanner configuration are not honored (see
@@ -20,28 +22,38 @@ use crate::analyzer::ai::AiAnalyzer;
 use crate::analyzer::sast::{FILE_BUDGET, SastEngine};
 use crate::analyzer::sca::OsvScanner;
 use crate::analyzer::secrets::{self, Masker, SecretDetector};
-use crate::analyzer::{unicode, workflows};
+use crate::analyzer::settings::{self, Audit};
+use crate::analyzer::{agents, history, unicode, workflows};
 use crate::config::Config;
-use crate::discovery::{self, DiscoveryOptions, FileText, SourceFile};
+use crate::discovery::{self, DiscoveryOptions, FileText, PathFilter, SourceFile};
 use crate::error::{Error, Result};
 use crate::git;
 use crate::github::{GitHub, RepoInfo};
 use crate::model::{
     AnalyzerState, AnalyzerStatus, Category, Finding, LineIndex, Omitted, RepositorySummary,
-    ScanReport, Severity, SkippedFile,
+    ScanReport, SettingsCheck, Severity, SkippedFile,
 };
 use crate::report::terminal_safe;
-use crate::target::Target;
+use crate::target::{self, Target};
 use futures::StreamExt;
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
-pub const ANALYZERS: [&str; 5] = ["sast", "secrets", "sca", "workflows", "ai"];
+pub const ANALYZERS: [&str; 8] = [
+    "sast",
+    "secrets",
+    "history",
+    "sca",
+    "workflows",
+    "agents",
+    "settings",
+    "ai",
+];
 
 /// Findings of one rule kept per file; the rest are counted in the report's `omitted`.
 pub const MAX_PER_RULE_AND_FILE: usize = 25;
@@ -51,6 +63,8 @@ struct LocalEngines {
     sast: Option<SastEngine>,
     secrets: Option<SecretDetector>,
     workflows: bool,
+    agents: bool,
+    history: bool,
 }
 
 pub struct Scanner {
@@ -76,6 +90,22 @@ struct DirScan {
     suppressed: usize,
     skipped: Vec<SkippedFile>,
     omitted: Vec<Omitted>,
+    settings: Vec<SettingsCheck>,
+}
+
+impl DirScan {
+    /// Add a settings audit's outcome.
+    fn add_settings(&mut self, status: AnalyzerStatus, audit: Audit) {
+        self.analyzers.push(status);
+        self.analyzers.sort_by_key(|a| {
+            ANALYZERS
+                .iter()
+                .position(|n| *n == a.analyzer)
+                .unwrap_or(usize::MAX)
+        });
+        self.findings.extend(audit.findings);
+        self.settings.extend(audit.checks);
+    }
 }
 
 /// Sets the flag when dropped: a scan future that is dropped (Ctrl-C, timeout) tells
@@ -117,6 +147,8 @@ impl Scanner {
                 sast,
                 secrets,
                 workflows: a.workflows,
+                agents: a.agents,
+                history: a.history,
             }),
             sca,
             ai,
@@ -144,12 +176,21 @@ impl Scanner {
             Target::Local(path) => {
                 report.commit = git::head_commit(path).await;
                 let trusted = self.config.analysis.trust_repo.resolve(true);
-                let dir = self.scan_dir(path, trusted).await?;
+                let repo = self.github_repo_of(path).await;
+                let (dir, (status, audit)) = tokio::join!(
+                    self.scan_dir(path, trusted),
+                    self.audit_settings(
+                        repo.as_deref(),
+                        "this directory has no origin remote on the configured GitHub host"
+                    )
+                );
+                let mut dir = dir?;
+                dir.add_settings(status, audit);
                 apply(&mut report, dir);
             }
             Target::Repo { owner, name } => {
                 let url = self.github.clone_url(owner, name);
-                let (commit, dir) = self.scan_remote(&url).await?;
+                let (commit, dir) = self.scan_remote(&url, &format!("{owner}/{name}")).await?;
                 report.commit = commit;
                 apply(&mut report, dir);
             }
@@ -158,7 +199,28 @@ impl Scanner {
                     .github
                     .org_repos(org, self.config.github.max_repos)
                     .await?;
-                self.scan_many(&mut report, repos).await;
+                let ((), org_audit) =
+                    tokio::join!(self.scan_many(&mut report, repos), self.audit_org(org));
+                match org_audit {
+                    Ok(Some(audit)) => {
+                        report.findings.extend(audit.findings);
+                        report.settings.extend(audit.checks);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!("organization settings: {}", terminal_safe(&e.to_string()));
+                        if let Some(status) = report
+                            .analyzers
+                            .iter_mut()
+                            .find(|a| a.analyzer == "settings")
+                        {
+                            *status = AnalyzerStatus::failed(
+                                "settings",
+                                format!("organization {org}: {e}"),
+                            );
+                        }
+                    }
+                }
             }
             Target::User(user) => {
                 let repos = self
@@ -208,7 +270,7 @@ impl Scanner {
             futures::stream::iter(selected.into_iter().enumerate())
                 .map(|(i, repo)| async move {
                     let started = Instant::now();
-                    let result = self.scan_remote(&repo.clone_url).await;
+                    let result = self.scan_remote(&repo.clone_url, &repo.full_name).await;
                     if self.progress {
                         let n = done.fetch_add(1, Ordering::Relaxed) + 1;
                         let outcome = match &result {
@@ -261,6 +323,7 @@ impl Scanner {
                     report.findings.extend(dir.findings);
                     report.skipped.extend(dir.skipped);
                     report.omitted.extend(dir.omitted);
+                    report.settings.extend(dir.settings);
                 }
                 Err(e) => {
                     warn!(
@@ -294,14 +357,27 @@ impl Scanner {
         }
     }
 
-    /// Clone and scan one repository, within `github.repo_timeout_secs`.
-    async fn scan_remote(&self, clone_url: &str) -> RemoteScan {
+    /// Clone, scan and audit the settings of one repository (`full_name` is
+    /// `owner/name`), within `github.repo_timeout_secs`.
+    async fn scan_remote(&self, clone_url: &str, full_name: &str) -> RemoteScan {
         let limit = Duration::from_secs(self.config.github.repo_timeout_secs);
         let trusted = self.config.analysis.trust_repo.resolve(false);
         let work = async {
-            let checkout = git::clone(clone_url, self.config.github.token.as_deref()).await?;
-            let dir = self.scan_dir(&checkout.path, trusted).await?;
-            Ok((checkout.commit.clone(), dir))
+            let scan = async {
+                let checkout = git::clone(
+                    clone_url,
+                    self.config.github.token.as_deref(),
+                    self.config.analysis.history,
+                )
+                .await?;
+                let dir = self.scan_dir(&checkout.path, trusted).await?;
+                Ok::<_, Error>((checkout.commit.clone(), dir))
+            };
+            let (scan, (status, audit)) =
+                tokio::join!(scan, self.audit_settings(Some(full_name), ""));
+            let (commit, mut dir) = scan?;
+            dir.add_settings(status, audit);
+            Ok((commit, dir))
         };
         tokio::time::timeout(limit, work).await.unwrap_or_else(|_| {
             Err(Error::Timeout(format!(
@@ -316,11 +392,60 @@ impl Scanner {
         match analyzer {
             "sast" => a.sast,
             "secrets" => a.secrets,
+            "history" => a.history,
             "sca" => a.sca,
             "workflows" => a.workflows,
+            "agents" => a.agents,
+            "settings" => a.settings,
             "ai" => a.ai,
             _ => false,
         }
+    }
+
+    /// `owner/name` of the GitHub repository a local directory was cloned from.
+    async fn github_repo_of(&self, path: &Path) -> Option<String> {
+        let url = git::origin_url(path).await?;
+        let host = crate::github::web_host(&self.config.github.api_url);
+        match target::parse_scan_target(&url, &host) {
+            Ok(Target::Repo { owner, name }) => Some(format!("{owner}/{name}")),
+            _ => None,
+        }
+    }
+
+    /// Audit one repository's settings. `missing` explains a `None` repository.
+    async fn audit_settings(&self, repo: Option<&str>, missing: &str) -> (AnalyzerStatus, Audit) {
+        let skipped = |why: &str| (AnalyzerStatus::skipped("settings", why), Audit::default());
+        if !self.config.analysis.settings {
+            return skipped("disabled");
+        }
+        let Some((owner, name)) = repo.and_then(|r| r.split_once('/')) else {
+            return skipped(missing);
+        };
+        if !self.github.has_token() {
+            return skipped("needs a GitHub token (set GITHUB_TOKEN); admin access shows the most");
+        }
+        match settings::audit_repo(&self.github, owner, name).await {
+            Ok(audit) => (settings_status(&audit), audit),
+            Err(e) => {
+                warn!(
+                    "settings of {owner}/{name}: {}",
+                    terminal_safe(&e.to_string())
+                );
+                (
+                    AnalyzerStatus::failed("settings", e.to_string()),
+                    Audit::default(),
+                )
+            }
+        }
+    }
+
+    /// Audit an organization's own settings; `None` when settings are off or there is
+    /// no token.
+    async fn audit_org(&self, org: &str) -> Result<Option<Audit>> {
+        if !(self.config.analysis.settings && self.github.has_token()) {
+            return Ok(None);
+        }
+        settings::audit_org(&self.github, org).await.map(Some)
     }
 
     /// Scan one directory with every enabled analyzer. `trusted` decides whether the
@@ -353,7 +478,33 @@ impl Scanner {
                 None => None,
             }
         };
-        let (local, sca) = tokio::join!(local, sca);
+        let history = {
+            let engines = Arc::clone(&self.local);
+            let cancel = Arc::clone(&cancel);
+            let root = root.to_path_buf();
+            let exclude = self.config.analysis.exclude.clone();
+            async move {
+                if !engines.history {
+                    return None;
+                }
+                let task = tokio::task::spawn_blocking(move || {
+                    let detector = engines
+                        .secrets
+                        .as_ref()
+                        .ok_or("needs the secrets analyzer")?;
+                    let filter = PathFilter::new(&root, &exclude).map_err(|e| e.to_string())?;
+                    history::scan_history(
+                        &root,
+                        detector,
+                        &filter,
+                        history::Limits::default(),
+                        &cancel,
+                    )
+                });
+                Some(task.await.unwrap_or_else(|e| Err(format!("crashed: {e}"))))
+            }
+        };
+        let (local, sca, history) = tokio::join!(local, sca, history);
         let local = local.map_err(|e| Error::Config(format!("analysis crashed: {e}")))?;
 
         let mut dir = DirScan {
@@ -380,6 +531,18 @@ impl Scanner {
             .push(status("sast", self.local.sast.is_some()));
         dir.analyzers
             .push(status("secrets", self.local.secrets.is_some()));
+        dir.analyzers.push(match history {
+            None => AnalyzerStatus::skipped("history", "disabled (enable with --history)"),
+            Some(Ok(mut outcome)) => {
+                outcome.drop_current(&local.secret_values);
+                dir.findings.append(&mut outcome.findings);
+                AnalyzerStatus::completed("history").with_detail(Some(outcome.summary()))
+            }
+            Some(Err(e)) => {
+                warn!("git history search failed: {}", terminal_safe(&e));
+                AnalyzerStatus::failed("history", e)
+            }
+        });
 
         dir.analyzers.push(match sca {
             None => AnalyzerStatus::skipped("sca", "disabled"),
@@ -398,6 +561,7 @@ impl Scanner {
 
         dir.analyzers
             .push(status("workflows", self.local.workflows));
+        dir.analyzers.push(status("agents", self.local.agents));
         let ai = match &self.ai {
             None => AnalyzerStatus::skipped("ai", "disabled (enable with --ai)"),
             Some(ai) => self.run_ai(ai, &files, trusted, &mut dir).await,
@@ -464,6 +628,11 @@ impl Scanner {
     }
 }
 
+/// Completed; the per-check outcomes are in the report's `settings` section.
+fn settings_status(_audit: &Audit) -> AnalyzerStatus {
+    AnalyzerStatus::completed("settings")
+}
+
 fn status(name: &str, enabled: bool) -> AnalyzerStatus {
     if enabled {
         AnalyzerStatus::completed(name)
@@ -481,6 +650,7 @@ fn apply(report: &mut ScanReport, dir: DirScan) {
     report.findings = dir.findings;
     report.skipped = dir.skipped;
     report.omitted = dir.omitted;
+    report.settings = dir.settings;
 }
 
 /// Roll per-repository statuses up into one status per analyzer.
@@ -497,13 +667,20 @@ fn summarize_analyzer(name: &str, repos: &[RepositorySummary], enabled: bool) ->
         })
         .count();
     if failed > 0 {
-        AnalyzerStatus::failed(
+        return AnalyzerStatus::failed(
             name,
             format!("failed in {failed} of {} repositories", repos.len()),
-        )
-    } else {
-        AnalyzerStatus::completed(name)
+        );
     }
+    // Skipped everywhere (e.g. settings without a token): say so, with the reason.
+    let statuses: Vec<&AnalyzerStatus> = repos
+        .iter()
+        .filter_map(|r| r.analyzers.iter().find(|a| a.analyzer == name))
+        .collect();
+    if !statuses.is_empty() && statuses.iter().all(|a| a.state == AnalyzerState::Skipped) {
+        return AnalyzerStatus::skipped(name, statuses[0].detail.clone().unwrap_or_default());
+    }
+    AnalyzerStatus::completed(name)
 }
 
 #[derive(Default)]
@@ -514,11 +691,14 @@ struct LocalResults {
     suppressed: usize,
     skipped: Vec<SkippedFile>,
     omitted: Vec<Omitted>,
+    /// Credentials found in the current files, so history does not report them again.
+    secret_values: HashSet<String>,
 }
 
 #[derive(Default)]
 struct FileResult {
     findings: Vec<Finding>,
+    secret_values: Vec<String>,
     lines: usize,
     suppressed: usize,
     omitted: Vec<Omitted>,
@@ -558,6 +738,7 @@ fn analyze_files(
         out.findings.extend(r.findings);
         out.omitted.extend(r.omitted);
         out.skipped.extend(r.skipped);
+        out.secret_values.extend(r.secret_values);
     }
     out
 }
@@ -572,9 +753,10 @@ fn analyze_file(
     let wants_sast = matches!((&engines.sast, file.language), (Some(e), Some(l)) if e.handles(l));
     let wants_secrets = engines.secrets.is_some() && SecretDetector::should_scan(path);
     let wants_workflow = engines.workflows && workflows::applies_to(path);
+    let wants_agents = engines.agents && agents::applies_to(path);
     // Hidden-Unicode checks ride along with code analysis.
     let wants_unicode = engines.sast.is_some() && unicode::applies_to(path, file.language);
-    if !(wants_sast || wants_secrets || wants_workflow || wants_unicode) {
+    if !(wants_sast || wants_secrets || wants_workflow || wants_agents || wants_unicode) {
         return None;
     }
     let Some(text) = discovery::read_file(&file.abs_path) else {
@@ -595,6 +777,7 @@ fn analyze_file(
                 result.findings = found;
                 result.suppressed = outcome.suppressed;
                 result.omitted = outcome.omitted;
+                result.secret_values = scan.values;
             }
             return Some(result);
         }
@@ -635,10 +818,14 @@ fn analyze_file(
     if wants_workflow {
         found.extend(workflows::analyze(path, &content));
     }
+    if wants_agents {
+        found.extend(agents::analyze(path, &content));
+    }
     let outcome = finish(&mut found, path, &index, &values, trusted);
     result.findings = found;
     result.suppressed = outcome.suppressed;
     result.omitted = outcome.omitted;
+    result.secret_values = values;
     Some(result)
 }
 

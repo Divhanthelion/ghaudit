@@ -61,6 +61,14 @@ pub struct AnalysisConfig {
     pub sca: bool,
     /// GitHub Actions workflow checks.
     pub workflows: bool,
+    /// Committed AI-agent and editor configuration (MCP servers, auto-approval, ...).
+    pub agents: bool,
+    /// Repository and organization security settings, read from the GitHub API.
+    /// Needs a token; most checks need admin access to be assessable.
+    pub settings: bool,
+    /// Also search every commit for credentials that were removed from the current
+    /// files. Repositories are then cloned with full history.
+    pub history: bool,
     pub ai: bool,
     /// Languages the SAST engine analyzes. Secrets are searched in every text file.
     pub languages: Vec<String>,
@@ -102,6 +110,9 @@ impl Default for AnalysisConfig {
             secrets: true,
             sca: true,
             workflows: true,
+            agents: true,
+            settings: true,
+            history: false,
             ai: false,
             languages: SUPPORTED_LANGUAGES.iter().map(|s| s.to_string()).collect(),
             exclude: Vec::new(),
@@ -161,6 +172,9 @@ pub struct ReportConfig {
     pub min_severity: Severity,
     /// Exit with status 1 when any reported finding is at or above this severity.
     pub fail_on: FailOn,
+    /// A previous JSON report: findings already in it are left out of this one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<std::path::PathBuf>,
 }
 
 impl Default for ReportConfig {
@@ -168,6 +182,7 @@ impl Default for ReportConfig {
         Self {
             min_severity: Severity::Low,
             fail_on: FailOn(Some(Severity::High)),
+            baseline: None,
         }
     }
 }
@@ -221,6 +236,11 @@ impl Config {
                     SUPPORTED_LANGUAGES.join(", ")
                 )));
             }
+        }
+        if self.analysis.history && !self.analysis.secrets {
+            return Err(Error::Config(
+                "history searches for credentials: it needs the secrets analyzer".into(),
+            ));
         }
         if self.analysis.max_file_size == 0 {
             return Err(Error::Config("max_file_size must be greater than 0".into()));
