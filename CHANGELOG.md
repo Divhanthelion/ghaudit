@@ -1,5 +1,41 @@
 # Changelog
 
+## Unreleased
+
+Fixes from auditing a 93-repository account (Free plan, many private and archived
+repositories) with 0.3.0.
+
+### Fixed
+
+- **Settings audit**:
+  - Branch protection on a private repository whose plan does not offer it (GitHub
+    answers "Upgrade to GitHub Pro") was a high failure telling you to add a ruleset.
+    It is now a medium failure that names the plan. Branch rules that cannot be read
+    for any other reason make the branch checks not assessable instead of failing them,
+    since unreadable rulesets may still protect the branch.
+  - Secret scanning on a repository where it is not available (a user-owned private
+    repository) said the token "needs admin access" even when it had it. The detail now
+    says the feature is unavailable there.
+  - Archived repositories no longer get Dependabot checks (Dependabot does not scan
+    them, and their settings are read-only), and no longer report private vulnerability
+    reporting as not assessable because GitHub refuses it for them (422).
+- **Dependencies**: RustSec informational advisories are labeled as `unmaintained` or
+  `unsound` in the title and message (and in the new `dependency.informational` JSON
+  field) instead of "is affected by". Unrated unmaintained advisories are low instead
+  of unknown, which counted as medium; unsound advisories keep their rating.
+- **Secrets**: values inside Rust unit tests (`#[cfg(test)]` modules, `#[test]`
+  functions, `#![cfg(test)]` files) are treated like values in test files: generic
+  matches are skipped and provider tokens are capped at medium. `env:NAME` values are
+  recognized as environment references.
+- **`js/html-injection`**: markup read from an ALL_CAPS constant (`ICONS[name]`,
+  `PATHS.home`) is no longer reported.
+
+### New
+
+- **`agent/auto-approve`** also reports, at low severity, Claude Code allow rules that
+  install or run any package (`Bash(npm install:*)`, `Bash(npx:*)`, `Bash(pip install *)`,
+  ...): install scripts run without asking.
+
 ## 0.3.0
 
 Three new analyzers and two new modes, aimed at auditing the repositories you own.
