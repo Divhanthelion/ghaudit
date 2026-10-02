@@ -333,14 +333,23 @@ Every check ends as pass, fail or not assessable, and the rules for that are str
   assessable.
 - 403s (missing token scopes or fine-grained permissions) are not assessable, with
   GitHub's message as the detail.
-- `security_and_analysis` absent from the repository object means the token cannot see
-  it: not assessable.
+- `security_and_analysis` absent from the repository object is not assessable. For a
+  non-admin token that means it cannot see it; for an admin it means GitHub does not
+  offer secret scanning there (a user-owned private repository without GitHub Secret
+  Protection), and the detail says so, since no extra permission would help.
+- 403 "Upgrade to GitHub Pro" is not a permission problem: the feature does not exist
+  on the plan. For branch protection that is still a failure (the branch *is*
+  unprotected), weighted medium and with a fix that names the plan.
 
 Branch protection is judged from `GET /repos/{o}/{r}/rules/branches/{branch}`, which
-includes organization rulesets, and classic protection. Probes for one repository run
-concurrently (`tokio::join!`). A failure becomes a finding with category `settings`, a
-synthetic location (the settings page path), and `help_url`, the page that fixes it.
-Archived repositories skip the branch and Actions checks.
+includes organization rulesets, and classic protection. When the rules cannot be read
+for any other reason and classic protection is off, the branch checks are not
+assessable rather than failed, since unreadable rulesets may still protect it. Probes
+for one repository run concurrently (`tokio::join!`). A failure becomes a finding with
+category `settings`, a synthetic location (the settings page path), and `help_url`, the
+page that fixes it. Archived repositories skip the branch, Actions, Dependabot and
+private vulnerability reporting checks: their settings are read-only, Dependabot does
+not scan them, and GitHub refuses vulnerability reporting for them.
 
 #### Dependencies (`analyzer/sca.rs`)
 
@@ -358,6 +367,13 @@ group:
   computes. If that is empty, it falls back to the GHSA rating in `database_specific`,
   and failing that it is `unknown`. Unknown is treated as medium for thresholds, so it
   is never filtered out as noise.
+- **Informational RustSec advisories** carry `informational` in each affected entry's
+  `database_specific`, and the finding's `dependency.informational` repeats it. They are
+  labeled in the title and message instead of "is affected by". An unrated
+  `unmaintained` advisory is `low`: it reports no flaw, cargo-audit only warns about it,
+  and GitHub's advisory database does not republish it. `unsound` advisories keep their
+  rating, or stay `unknown`: they are memory-safety bugs, and where GitHub reviewers
+  rate them the ratings run from low to high.
 - **Fixed versions** are the `fixed` events of the advisory's ranges that are newer than
   the installed version.
 - **Location** is the lockfile path relative to the scan root, plus a best-effort line

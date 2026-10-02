@@ -49,6 +49,19 @@ pub static RULES: &[AgentRule] = &[
     },
 ];
 
+/// Claude Code allow rules that install or run any package (`Bash(npm install:*)`,
+/// `Bash(npx:*)`): the package chosen at run time gets to execute code.
+static ANY_PACKAGE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"^Bash\(\s*(",
+        r"(npm|pnpm|bun)\s+(install|i|add)|yarn(\s+add)?|pip3?\s+install|uv\s+(add|pip\s+install)",
+        r"|cargo\s+install|gem\s+install|go\s+(install|run)|pipx\s+(install|run)",
+        r"|npx|pnpx|bunx|uvx",
+        r")\s*(:\*|\*)\s*\)$",
+    ))
+    .unwrap()
+});
+
 /// Commands that fetch code and execute it, decode and execute it, or open a shell
 /// to the network.
 static DANGEROUS: LazyLock<Regex> = LazyLock::new(|| {
@@ -352,13 +365,27 @@ impl Audit<'_> {
                 "Remove it, or list the expected servers in `enabledMcpjsonServers`.",
             );
         }
-        let broad_bash = doc
+        let allow: Vec<&str> = doc
             .pointer("/permissions/allow")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
             .filter_map(Value::as_str)
-            .find(|r| matches!(r.trim(), "Bash" | "Bash(*)" | "Bash(:*)"));
+            .map(str::trim)
+            .collect();
+        let broad_bash = allow
+            .iter()
+            .find(|r| matches!(**r, "Bash" | "Bash(*)" | "Bash(:*)"));
+        if let Some(rule) = allow.iter().find(|r| ANY_PACKAGE.is_match(r)) {
+            self.push(
+                "agent/auto-approve",
+                Severity::Low,
+                "Agent tool calls approved without asking",
+                format!("`permissions.allow` contains `{rule}`: Claude Code installs or runs any package without asking, and a package's install scripts run with the contributor's privileges, so a prompt injection can still become code execution."),
+                &format!("\"{rule}\""),
+                "Allow the exact command (`Bash(npm ci)`) instead of any arguments, and approve new packages by hand.",
+            );
+        }
         if let Some(rule) = broad_bash {
             self.push(
                 "agent/auto-approve",
@@ -761,10 +788,28 @@ mod tests {
         assert!(
             found(
                 ".claude/settings.json",
-                r#"{"permissions": {"allow": ["Bash(npm test:*)"]}, "model": "x"}"#
+                r#"{"permissions": {"allow": ["Bash(npm test:*)", "Bash(npm ci)", "Bash(npx prettier --check .)", "Bash(cargo test:*)"]}, "model": "x"}"#
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn allow_rules_that_install_any_package() {
+        for rule in [
+            "Bash(npm install:*)",
+            "Bash(npx:*)",
+            "Bash(pip install *)",
+            "Bash(cargo install:*)",
+            "Bash(uv pip install:*)",
+        ] {
+            let cfg = format!(r#"{{"permissions": {{"allow": ["{rule}"]}}}}"#);
+            assert_eq!(
+                found(".claude/settings.local.json", &cfg),
+                vec![("agent/auto-approve".into(), Severity::Low, 1)],
+                "{rule}"
+            );
+        }
     }
 
     #[test]

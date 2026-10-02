@@ -305,6 +305,7 @@ values, hashes and hex addresses.
 Lockfiles and minified files are skipped. Provider tokens are reported even in tests and
 docs, because a live token in a fixture is still leaked, but at medium severity at most
 there. Generic matches are skipped in tests, examples, docs and translation catalogs.
+Rust unit tests count as tests: code under `#[cfg(test)]` and `#[test]` functions.
 
 Secret values never appear in a report: not in messages, not in the context lines of
 other findings, and not in a form a fingerprint could be checked against.
@@ -397,7 +398,7 @@ reads `.mcp.json`, `.vscode/mcp.json`, `.cursor/mcp.json` and other `mcp.json` f
 | Rule | Severity | What |
 |---|---|---|
 | `agent/dangerous-command` | high | A hook, credential helper, task or MCP server command that downloads or decodes code and runs it (`curl ... \| sh`, `iex`, `base64 -d \| sh`, reverse shells) |
-| `agent/auto-approve` | high / medium / low | Tool calls run without asking: VS Code `chat.tools.autoApprove` (CVE-2025-53773), Codex `approval_policy = "never"` or `danger-full-access`, Claude Code `Bash` allowed outright or `enableAllProjectMcpServers`, MCP servers marked `trust: true`, Gemini `autoAccept` |
+| `agent/auto-approve` | high / medium / low | Tool calls run without asking: VS Code `chat.tools.autoApprove` (CVE-2025-53773), Codex `approval_policy = "never"` or `danger-full-access`, Claude Code `Bash` allowed outright, any package install allowed (`Bash(npm install:*)`, `Bash(npx:*)`) or `enableAllProjectMcpServers`, MCP servers marked `trust: true`, Gemini `autoAccept` |
 | `agent/command-on-open` | medium / low | VS Code tasks with `runOn: folderOpen`; Claude Code hooks, `apiKeyHelper` and other command settings |
 | `agent/mcp-unpinned-package` | medium | MCP server started with `npx`, `uvx`, `pipx run`, `pnpm dlx`, `bunx` or `docker run` without a pinned version, so each start can fetch different code |
 | `agent/mcp-insecure-transport` | medium | Remote MCP server reached over plain `http://` |
@@ -426,6 +427,10 @@ composer.lock, pom.xml, gradle lockfiles and more, at any depth.
 
 Each advisory becomes one finding. It carries the CVSS-based severity, the advisory ID
 and its aliases (CVE, GHSA, ...), the lockfile line, and the lowest version that fixes it.
+
+RustSec also publishes informational advisories, which are labeled as such:
+`unmaintained` crates (no known flaw, but no fixes coming; low unless rated) and
+`unsound` ones (safe code can cause undefined behavior; their own rating, or unknown).
 
 Known-malicious packages (OpenSSF `MAL-` reports) are always critical, because
 installing one may already have compromised the machine.

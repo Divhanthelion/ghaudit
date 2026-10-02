@@ -401,6 +401,10 @@ pub struct DependencyInfo {
     /// Highest CVSS base score across the advisory's ratings, if any.
     pub cvss_score: Option<f64>,
     pub url: String,
+    /// RustSec's kind of informational advisory (`unmaintained`, `unsound`, `notice`):
+    /// a warning about the package rather than a vulnerability report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub informational: Option<String>,
 }
 
 /// One reported issue.

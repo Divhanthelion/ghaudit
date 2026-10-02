@@ -291,6 +291,7 @@ mod tests {
             fixed_versions: vec!["0.6.10".into()],
             cvss_score: Some(9.8),
             url: "https://osv.dev/vulnerability/GHSA-xxxx".into(),
+            informational: None,
         });
         r.findings.push(dep);
         r.finalize(Severity::Low);

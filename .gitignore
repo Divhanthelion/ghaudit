@@ -15,3 +15,6 @@
 Thumbs.db
 .idea/
 .vscode/
+
+# Audit sweeps (secrets are masked, but these list where they are)
+/scans/

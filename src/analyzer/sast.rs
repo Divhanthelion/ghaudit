@@ -320,6 +320,60 @@ fn compile(rule: &'static Rule, lang: Language) -> Result<CompiledRule, String> 
     })
 }
 
+/// Byte ranges of Rust test code: items marked `#[cfg(test)]` and test functions
+/// (`#[test]`, `#[tokio::test]`, ...), each from its attribute to the end of the item.
+pub fn rust_test_ranges(source: &str) -> Vec<std::ops::Range<usize>> {
+    if !source.contains("test") {
+        return Vec::new();
+    }
+    let Some(tree) = parse(Language::Rust, source, &|| false) else {
+        return Vec::new();
+    };
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    // `#![cfg(test)]` at the top makes the whole file test code.
+    if root.named_children(&mut cursor).any(|n| {
+        n.kind() == "inner_attribute_item"
+            && is_test_attribute(&source[n.byte_range()].replacen("#!", "#", 1))
+    }) {
+        return std::iter::once(0..source.len()).collect();
+    }
+    let mut ranges = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let mut cursor = node.walk();
+        let children: Vec<tree_sitter::Node> = node.named_children(&mut cursor).collect();
+        for (i, child) in children.iter().enumerate() {
+            if child.kind() == "attribute_item" && is_test_attribute(&source[child.byte_range()]) {
+                // Attributes and comments sit before the item they apply to.
+                if let Some(item) = children[i + 1..].iter().find(|n| {
+                    !matches!(
+                        n.kind(),
+                        "attribute_item" | "line_comment" | "block_comment"
+                    )
+                }) {
+                    ranges.push(child.start_byte()..item.end_byte());
+                }
+            } else if child.named_child_count() > 0 {
+                stack.push(*child);
+            }
+        }
+    }
+    ranges
+}
+
+fn is_test_attribute(text: &str) -> bool {
+    let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    let Some(inner) = compact.strip_prefix("#[").and_then(|s| s.strip_suffix(']')) else {
+        return false;
+    };
+    if let Some(cfg) = inner.strip_prefix("cfg(") {
+        return cfg == "test)" || cfg.starts_with("all(test,");
+    }
+    let path = inner.split('(').next().unwrap_or(inner);
+    path == "test" || path.ends_with("::test")
+}
+
 fn parse(
     language: Language,
     source: &str,
@@ -364,6 +418,42 @@ mod tests {
     fn engine() -> SastEngine {
         let langs: Vec<String> = SUPPORTED_LANGUAGES.iter().map(|s| s.to_string()).collect();
         SastEngine::new(&langs).expect("all rules compile")
+    }
+
+    #[test]
+    fn test_attributes() {
+        for yes in [
+            "#[test]",
+            "#[cfg(test)]",
+            "#[ cfg( all(test, unix) ) ]",
+            "#[tokio::test(flavor = \"multi_thread\")]",
+        ] {
+            assert!(is_test_attribute(yes), "{yes}");
+        }
+        for no in [
+            "#[cfg(any(test, feature = \"x\"))]",
+            "#[derive(Debug)]",
+            "#[attest]",
+        ] {
+            assert!(!is_test_attribute(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn rust_test_ranges_cover_test_items_only() {
+        let src = "fn a() {}\n#[cfg(test)]\n// note\nmod tests {\n    fn b() {}\n}\nfn c() {}\n";
+        let ranges = rust_test_ranges(src);
+        assert_eq!(ranges.len(), 1);
+        let covered = &src[ranges[0].clone()];
+        assert!(covered.starts_with("#[cfg(test)]") && covered.ends_with('}'));
+        assert!(!covered.contains("fn a") && !covered.contains("fn c"));
+        let whole = "#![cfg(test)]\nfn a() {}\n";
+        assert!(
+            rust_test_ranges(whole)
+                .iter()
+                .eq(std::iter::once(&(0..whole.len())))
+        );
+        assert!(rust_test_ranges("fn main() {}").is_empty());
     }
 
     fn example_targets(rule: &Rule) -> Vec<(Language, &'static str)> {

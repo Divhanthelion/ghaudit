@@ -162,13 +162,26 @@ pub static RULES: &[Rule] = &[
         query: r#"
 (assignment_expression
   left: (member_expression property: (property_identifier) @p)
-  right: [(identifier) (member_expression) (call_expression) (subscript_expression) (binary_expression) (template_string (template_substitution))]
+  right: [(call_expression) (binary_expression) (template_string (template_substitution))]
   (#match? @p "^(innerHTML|outerHTML)$")) @finding
 
 (augmented_assignment_expression
   left: (member_expression property: (property_identifier) @p)
-  right: [(identifier) (member_expression) (call_expression) (subscript_expression) (binary_expression) (template_string (template_substitution))]
+  right: [(call_expression) (binary_expression) (template_string (template_substitution))]
   (#match? @p "^(innerHTML|outerHTML)$")) @finding
+
+; Values read from an ALL_CAPS constant (`ICONS[name]`, `PATHS.home`) are static markup.
+(assignment_expression
+  left: (member_expression property: (property_identifier) @p)
+  right: [(identifier) @src (member_expression object: (_) @src) (subscript_expression object: (_) @src)]
+  (#match? @p "^(innerHTML|outerHTML)$")
+  (#not-match? @src "^[A-Z][A-Z0-9_]*$")) @finding
+
+(augmented_assignment_expression
+  left: (member_expression property: (property_identifier) @p)
+  right: [(identifier) @src (member_expression object: (_) @src) (subscript_expression object: (_) @src)]
+  (#match? @p "^(innerHTML|outerHTML)$")
+  (#not-match? @src "^[A-Z][A-Z0-9_]*$")) @finding
 
 (call_expression
   function: (member_expression
@@ -204,6 +217,8 @@ pub static RULES: &[Rule] = &[
             "el.innerHTML = comment.body;",
             "el.innerHTML = `<b>${name}</b>`;",
             "list.innerHTML += item;",
+            "el.innerHTML = rows[i];",
+            "el.innerHTML = this.state.html;",
             "el.insertAdjacentHTML('beforeend', html);",
             "document.write('<p>' + msg + '</p>');",
             "$('#out').html(data.message);",
@@ -216,6 +231,9 @@ pub static RULES: &[Rule] = &[
             "$('#list').append(node);",
             "el.innerHTML = '';",
             "el.innerHTML = `<br>`;",
+            "svg.innerHTML = PATHS[name];",
+            "span.innerHTML = ICONS.clock;",
+            "el.innerHTML = EMPTY_STATE;",
             "el.textContent = comment.body;",
             "document.write('<p>static</p>');",
         ],
