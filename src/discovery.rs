@@ -320,7 +320,9 @@ fn decode(bytes: Vec<u8>) -> FileText {
     let pairs = head.len() / 2;
     if pairs >= 2 {
         let zeros_at = |parity: usize| {
-            head.chunks_exact(2)
+            head.as_chunks::<2>()
+                .0
+                .iter()
                 .filter(|pair| pair[parity] == 0)
                 .count()
         };
@@ -338,8 +340,10 @@ fn decode(bytes: Vec<u8>) -> FileText {
 
 fn utf16(bytes: &[u8], unit: fn([u8; 2]) -> u16) -> String {
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|pair| unit([pair[0], pair[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&pair| unit(pair))
         .collect();
     String::from_utf16_lossy(&units)
 }
