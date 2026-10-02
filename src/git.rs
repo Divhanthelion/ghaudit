@@ -27,7 +27,12 @@ pub struct Checkout {
 ///
 /// The token, when given, is passed to git through `GIT_CONFIG_*` environment
 /// variables as an HTTP header scoped to the clone URL's host. It never appears in
-/// the command line (visible to other local users via `ps`) or in `.git/config`.
+/// the command line (visible to other local users via `ps`) or in `.git/config`,
+/// and it is only sent over http(s).
+///
+/// The repository is untrusted, so the clone runs nothing it controls: no hooks or
+/// submodules (a plain clone fetches neither), no symlinks, no `ext::` transport, and
+/// no Git LFS downloads (the repository's `.lfsconfig` could point them anywhere).
 pub async fn clone(url: &str, token: Option<&str>) -> Result<Checkout> {
     let dir = tempfile::Builder::new().prefix("ghaudit-").tempdir()?;
     let path = dir.path().join("repo");
@@ -35,9 +40,19 @@ pub async fn clone(url: &str, token: Option<&str>) -> Result<Checkout> {
     let mut cmd = git_command();
     cmd.args([
         // Check symlinks out as plain files so nothing in the checkout can point
-        // outside it. Hooks and submodules are never fetched by a plain clone.
+        // outside it.
         "-c",
         "core.symlinks=false",
+        "-c",
+        "protocol.ext.allow=never",
+        // Disable the LFS filter even when the user has run `git lfs install`:
+        // pointer files are checked out as they are.
+        "-c",
+        "filter.lfs.smudge=",
+        "-c",
+        "filter.lfs.process=",
+        "-c",
+        "filter.lfs.required=false",
         "clone",
         "--quiet",
         "--depth",
@@ -47,11 +62,12 @@ pub async fn clone(url: &str, token: Option<&str>) -> Result<Checkout> {
         "--",
         url,
     ])
-    .arg(&path);
+    .arg(&path)
+    .env("GIT_LFS_SKIP_SMUDGE", "1");
 
-    if let Some(token) = token.filter(|t| !t.is_empty()) {
-        let host = url_origin(url)
-            .ok_or_else(|| Error::Git(format!("cannot determine host of clone URL {url}")))?;
+    if let Some(token) = token.filter(|t| !t.is_empty())
+        && let Some(host) = url_origin(url)
+    {
         let basic =
             base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
         // Append to any GIT_CONFIG_* entries already set in the environment.
@@ -76,10 +92,9 @@ pub async fn clone(url: &str, token: Option<&str>) -> Result<Checkout> {
         .map_err(|_| Error::Git(format!("clone of {url} timed out")))?
         .map_err(spawn_error)?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(Error::Git(format!(
             "clone of {url} failed: {}",
-            stderr.trim()
+            summarize_stderr(&String::from_utf8_lossy(&output.stderr))
         )));
     }
 
@@ -109,7 +124,10 @@ pub async fn head_commit(path: &Path) -> Option<String> {
 
 fn git_command() -> Command {
     let mut cmd = Command::new("git");
-    cmd.env("GIT_TERMINAL_PROMPT", "0") // fail instead of prompting for credentials
+    // `core.fsmonitor` names a command git may run; a scanned tree's .git/config must
+    // not be able to set one.
+    cmd.args(["-c", "core.fsmonitor=false"])
+        .env("GIT_TERMINAL_PROMPT", "0") // fail instead of prompting for credentials
         .stdin(Stdio::null())
         .kill_on_drop(true);
     cmd
@@ -123,9 +141,33 @@ fn spawn_error(e: std::io::Error) -> Error {
     }
 }
 
-/// `https://host[:port]` part of a URL.
+/// The line of git's error output that says what went wrong (`fatal: ...`), shortened.
+fn summarize_stderr(stderr: &str) -> String {
+    let lines: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let line = lines
+        .iter()
+        .rev()
+        .find(|l| l.starts_with("fatal:") || l.starts_with("error:"))
+        .or(lines.last())
+        .copied()
+        .unwrap_or("no error output");
+    let mut short: String = line.chars().take(300).collect();
+    if line.chars().count() > 300 {
+        short.push('…');
+    }
+    short
+}
+
+/// `https://host[:port]` part of an http(s) URL. Other schemes never get the token.
 fn url_origin(url: &str) -> Option<String> {
     let (scheme, rest) = url.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("https") && !scheme.eq_ignore_ascii_case("http") {
+        return None;
+    }
     let host = rest.split('/').next()?;
     let host = host.rsplit('@').next()?; // drop any userinfo
     (!host.is_empty()).then(|| format!("{scheme}://{host}"))
@@ -146,6 +188,19 @@ mod tests {
             "https://ghe.corp:8443"
         );
         assert!(url_origin("not a url").is_none());
+        assert!(url_origin("file:///tmp/repo").is_none());
+        assert!(url_origin("ssh://git@github.com/a/b").is_none());
+    }
+
+    #[test]
+    fn errors_are_one_line() {
+        let stderr = "Cloning into 'repo'...\nremote: Repository not found.\nfatal: repository 'https://github.com/a/b/' not found\n";
+        assert_eq!(
+            summarize_stderr(stderr),
+            "fatal: repository 'https://github.com/a/b/' not found"
+        );
+        assert_eq!(summarize_stderr(""), "no error output");
+        assert!(summarize_stderr(&"x".repeat(1000)).chars().count() <= 301);
     }
 
     #[tokio::test]
@@ -180,7 +235,8 @@ mod tests {
         // file:///tmp/x on Unix, file:///C:/x on Windows.
         let path = src.path().to_string_lossy().replace('\\', "/");
         let url = format!("file:///{}", path.trim_start_matches('/'));
-        let checkout = clone(&url, None).await.unwrap();
+        // A token is never attached to a file:// URL (and must not make it fail).
+        let checkout = clone(&url, Some("ghp_unused")).await.unwrap();
         assert!(checkout.path.join("a.txt").exists());
         assert_eq!(checkout.commit.as_deref().map(str::len), Some(40));
         let dir = checkout.path.clone();
@@ -201,5 +257,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("failed"), "{err}");
+        assert!(!err.to_string().contains('\n'), "{err}");
     }
 }

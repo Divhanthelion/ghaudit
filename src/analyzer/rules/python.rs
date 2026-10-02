@@ -18,6 +18,7 @@ pub static RULES: &[Rule] = &[
   (#match? @f "^(eval|exec)$")) @finding
 "#,
         requires: None,
+        bindings: None,
         jsx: false,
         examples: &[
             "result = eval(user_input)",
@@ -51,8 +52,32 @@ pub static RULES: &[Rule] = &[
   arguments: (argument_list . [(binary_operator) (string (interpolation))] @q)
   (#eq? @t "text")
   (#match? @q "(?i)\\b(select|insert|update|delete|drop|create|alter)\\b")) @finding
+
+(call
+  function: (attribute object: (attribute attribute: (identifier) @o) attribute: (identifier) @m)
+  arguments: (argument_list . [(binary_operator) (string (interpolation)) (call function: (attribute attribute: (identifier) @f2))])
+  (#eq? @o "objects")
+  (#eq? @m "raw")) @finding
+
+(call
+  function: [(attribute attribute: (identifier) @m) (identifier) @m]
+  arguments: (argument_list . (identifier) @arg)
+  (#match? @m "^(execute|executemany|executescript|raw|mogrify|text)$")
+  (#bound? @arg)) @finding
 "#,
         requires: None,
+        bindings: Some(
+            r#"
+(assignment
+  left: (identifier) @var
+  right: [
+    (binary_operator)
+    (string (interpolation))
+    (call function: (attribute object: (string) attribute: (identifier) @fmt) (#eq? @fmt "format"))
+  ] @q
+  (#match? @q "(?i)\\b(select|insert|update|delete|drop|create|alter|replace)\\b"))
+"#,
+        ),
         jsx: false,
         examples: &[
             "cur.execute(\"SELECT * FROM users WHERE id = %s\" % user_id)",
@@ -60,12 +85,19 @@ pub static RULES: &[Rule] = &[
             "cur.execute(\"DELETE FROM t WHERE id=\" + str(i))",
             "cur.execute(\"SELECT {} FROM t\".format(col))",
             "db.session.execute(text(f\"SELECT * FROM x WHERE y = {y}\"))",
+            "def f(cur, name):\n    q = f\"SELECT * FROM users WHERE name = '{name}'\"\n    log(q)\n    cur.execute(q)",
+            "def f(cur, t):\n    sql = \"DROP TABLE \" + t\n    rows = cur.execute(sql).fetchall()",
+            "User.objects.raw(f\"SELECT * FROM auth_user WHERE id = {uid}\")",
         ],
         counter_examples: &[
             "cur.execute(\"SELECT * FROM users WHERE id = %s\", (user_id,))",
             "cur.execute(query, params)",
             "log.info(\"select %s\" % x)",
             "pool.execute(task_a + task_b)",
+            "def f(cur, x):\n    q = \"SELECT * FROM t WHERE id = %s\"\n    cur.execute(q, (x,))",
+            "def a(n):\n    q = f\"SELECT {n}\"\n\ndef b(cur, q):\n    cur.execute(q)",
+            "def f(cur, n):\n    cur.execute(q)\n    q = f\"SELECT {n}\"",
+            "User.objects.raw(\"SELECT * FROM auth_user WHERE id = %s\", [uid])",
         ],
     },
     Rule {
@@ -79,25 +111,36 @@ pub static RULES: &[Rule] = &[
         remediation: "Pass a list of arguments with shell=False (the default): subprocess.run([\"ls\", path]).",
         query: r#"
 (call
-  function: (attribute object: (identifier) @mod attribute: (identifier) @fn)
+  function: [(identifier) @fn (attribute attribute: (identifier) @fn)]
   arguments: (argument_list
     . [(identifier) (attribute) (call) (subscript) (binary_operator) (string (interpolation))]
     (keyword_argument name: (identifier) @k value: (true)))
-  (#eq? @mod "subprocess")
   (#match? @fn "^(run|call|check_call|check_output|Popen)$")
   (#eq? @k "shell")) @finding
+
+(call
+  function: [(identifier) @fn (attribute attribute: (identifier) @fn)]
+  arguments: (argument_list . [(identifier) (attribute) (call) (subscript) (binary_operator) (string (interpolation))])
+  (#match? @fn "^(getoutput|getstatusoutput|create_subprocess_shell)$")) @finding
 "#,
-        requires: None,
+        // Any import of subprocess or asyncio, so `from subprocess import run` counts.
+        requires: Some(r"\b(subprocess|asyncio)\b"),
+        bindings: None,
         jsx: false,
         examples: &[
             "subprocess.run(cmd, shell=True)",
             "subprocess.Popen(\"tar xf \" + name, shell=True, stdout=PIPE)",
             "subprocess.check_output(f\"ping {host}\", shell=True)",
+            "from subprocess import run\nrun(cmd, shell=True)",
+            "import subprocess\nout = subprocess.getoutput(\"du -sh \" + path)",
+            "import asyncio\nawait asyncio.create_subprocess_shell(cmd)",
         ],
         counter_examples: &[
             "subprocess.run([\"ls\", path])",
             "subprocess.run(cmd, shell=False)",
             "subprocess.run(\"make clean\", shell=True)",
+            "import asyncio\nawait asyncio.create_subprocess_exec(\"ls\", path)",
+            "runner.run(task, shell=True)",
         ],
     },
     Rule {
@@ -115,15 +158,27 @@ pub static RULES: &[Rule] = &[
   arguments: (argument_list . [(identifier) (attribute) (call) (subscript) (binary_operator) (string (interpolation))])
   (#eq? @mod "os")
   (#match? @fn "^(system|popen)$")) @finding
+
+(call
+  function: (identifier) @fn
+  arguments: (argument_list . [(identifier) (attribute) (call) (subscript) (binary_operator) (string (interpolation))])
+  (#match? @fn "^(system|popen)$")) @finding
 "#,
-        requires: None,
+        // `os.system(...)`, or `system(...)` after `from os import system`.
+        requires: Some(r"\bos\.(system|popen)\b|from\s+os\s+import\b[^\n]*\b(system|popen)\b"),
+        bindings: None,
         jsx: false,
         examples: &[
             "os.system(cmd)",
             "os.popen(\"cat \" + path)",
             "os.system(f\"rm {f}\")",
+            "from os import system\nsystem(\"rm -rf \" + d)",
         ],
-        counter_examples: &["os.system(\"clear\")", "os.path.join(a, b)"],
+        counter_examples: &[
+            "os.system(\"clear\")",
+            "os.path.join(a, b)",
+            "def system(x): pass\nsystem(x)",
+        ],
     },
     Rule {
         id: "python/unsafe-deserialization",
@@ -144,16 +199,29 @@ pub static RULES: &[Rule] = &[
   function: (attribute object: (identifier) @mod attribute: (identifier) @fn)
   (#match? @mod "^(pd|pandas)$")
   (#eq? @fn "read_pickle")) @finding
+
+(call
+  function: (identifier) @fn
+  (#match? @fn "^(loads|load|Unpickler)$")) @finding
 "#,
-        requires: None,
+        // A bare `loads(...)` counts only after `from pickle import loads` (or dill, marshal).
+        requires: Some(
+            r"\b(pickle|cPickle|_pickle|dill|marshal|shelve)\.|\b(pd|pandas)\.read_pickle\b|from\s+(pickle|cPickle|_pickle|dill|marshal)\s+import\b[^\n]*\b(loads?|Unpickler)\b",
+        ),
+        bindings: None,
         jsx: false,
         examples: &[
             "data = pickle.loads(blob)",
             "obj = pickle.load(open(p, 'rb'))",
             "df = pd.read_pickle(path)",
             "db = shelve.open(name)",
+            "from pickle import loads\nobj = loads(request.data)",
         ],
-        counter_examples: &["data = json.loads(blob)", "pickle.dumps(obj)"],
+        counter_examples: &[
+            "data = json.loads(blob)",
+            "pickle.dumps(obj)",
+            "from json import loads\nobj = loads(body)",
+        ],
     },
     Rule {
         id: "python/yaml-load",
@@ -178,6 +246,7 @@ pub static RULES: &[Rule] = &[
   (#match? @fn "^(unsafe_load|unsafe_load_all)$")) @finding
 "#,
         requires: None,
+        bindings: None,
         jsx: false,
         examples: &[
             "cfg = yaml.load(f)",
@@ -215,6 +284,7 @@ pub static RULES: &[Rule] = &[
   (#not-match? @args "usedforsecurity\\s*=\\s*False")) @finding
 "#,
         requires: None,
+        bindings: None,
         jsx: false,
         examples: &[
             "h = hashlib.md5(data).hexdigest()",
@@ -246,6 +316,7 @@ pub static RULES: &[Rule] = &[
 (attribute attribute: (identifier) @a (#eq? @a "MODE_ECB")) @finding
 "#,
         requires: None,
+        bindings: None,
         jsx: false,
         examples: &[
             "from Crypto.Cipher import DES",
@@ -275,6 +346,7 @@ pub static RULES: &[Rule] = &[
   (#match? @a "^(_create_unverified_context|CERT_NONE)$")) @finding
 "#,
         requires: None,
+        bindings: None,
         jsx: false,
         examples: &[
             "requests.get(url, verify=False)",
@@ -306,6 +378,7 @@ pub static RULES: &[Rule] = &[
   (#not-match? @args "timeout\\s*=")) @finding
 "#,
         requires: None,
+        bindings: None,
         jsx: false,
         examples: &["r = requests.get(url)", "requests.post(url, json=body)"],
         counter_examples: &["requests.get(url, timeout=10)", "session.get(url)"],
@@ -327,6 +400,7 @@ pub static RULES: &[Rule] = &[
   (#eq? @k "debug")) @finding
 "#,
         requires: None,
+        bindings: None,
         jsx: false,
         examples: &["app.run(host=\"0.0.0.0\", debug=True)"],
         counter_examples: &["app.run(debug=False)", "app.run()"],
@@ -347,6 +421,7 @@ pub static RULES: &[Rule] = &[
   (#eq? @fn "mktemp")) @finding
 "#,
         requires: None,
+        bindings: None,
         jsx: false,
         examples: &["path = tempfile.mktemp()"],
         counter_examples: &["fd, path = tempfile.mkstemp()"],

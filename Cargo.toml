@@ -1,6 +1,6 @@
 [package]
 name = "ghaudit"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.88"
 description = "Security scanner for GitHub repositories: code patterns, leaked secrets, and vulnerable dependencies"
@@ -55,6 +55,7 @@ futures = "0.3"
 # GitHub Actions workflow parsing (maintained fork of serde_yaml)
 serde_yaml_ng = "0.10"
 anstream = "1.0"
+saphyr-parser = "0.1"
 
 [dev-dependencies]
 assert_cmd = "2"

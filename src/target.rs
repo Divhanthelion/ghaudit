@@ -54,7 +54,11 @@ fn valid_repo(s: &str) -> bool {
 /// - a GitHub URL, including deep links such as `https://github.com/o/r/tree/main/src`
 ///   and SSH remotes (`git@github.com:o/r.git`)
 /// - `owner/repo`
-pub fn parse_scan_target(input: &str) -> Result<Target> {
+///
+/// `host` is the configured GitHub host (`github.com`, or a GitHub Enterprise Server
+/// host). A URL on any other host is an error rather than being quietly scanned as a
+/// same-named repository on `host`.
+pub fn parse_scan_target(input: &str, host: &str) -> Result<Target> {
     let input = input.trim();
     let path = PathBuf::from(input);
     if path.is_dir() {
@@ -66,26 +70,37 @@ pub fn parse_scan_target(input: &str) -> Result<Target> {
         )));
     }
 
+    let wrong_host = |found: &str| {
+        Error::InvalidTarget(format!(
+            "{input}: {found} is not {host}; ghaudit scans GitHub repositories (set github.api_url for GitHub Enterprise Server)"
+        ))
+    };
+    let same_host = |h: &str| {
+        let h = h.to_ascii_lowercase();
+        h == host || (host == "github.com" && h == "www.github.com")
+    };
     let rest = if let Some(r) = input.strip_prefix("git@") {
         // git@host:owner/repo.git
-        r.split_once(':').map(|(_, path)| path)
+        match r.split_once(':') {
+            Some((h, _)) if !same_host(h) => return Err(wrong_host(h)),
+            other => other.map(|(_, path)| path),
+        }
     } else {
         let no_scheme = input
             .strip_prefix("https://")
             .or_else(|| input.strip_prefix("http://"))
             .or_else(|| input.strip_prefix("ssh://git@"))
             .unwrap_or(input);
-        if no_scheme
-            .split('/')
-            .next()
-            .is_some_and(|h| HOST.is_match(h))
-        {
+        match no_scheme.split('/').next() {
             // host/owner/repo/...
-            no_scheme.split_once('/').map(|(_, path)| path)
-        } else if no_scheme != input {
-            None
-        } else {
-            Some(no_scheme)
+            Some(h) if HOST.is_match(h) => {
+                if !same_host(h) {
+                    return Err(wrong_host(h));
+                }
+                no_scheme.split_once('/').map(|(_, path)| path)
+            }
+            _ if no_scheme != input => None,
+            _ => Some(no_scheme),
         }
     };
 
@@ -115,6 +130,10 @@ pub fn parse_scan_target(input: &str) -> Result<Target> {
 mod tests {
     use super::*;
 
+    fn parse(input: &str) -> Result<Target> {
+        parse_scan_target(input, "github.com")
+    }
+
     fn repo(o: &str, n: &str) -> Target {
         Target::Repo {
             owner: o.into(),
@@ -125,33 +144,30 @@ mod tests {
     #[test]
     fn parses_repo_forms() {
         assert_eq!(
-            parse_scan_target("rust-lang/regex").unwrap(),
+            parse("rust-lang/regex").unwrap(),
             repo("rust-lang", "regex")
         );
         assert_eq!(
-            parse_scan_target("https://github.com/rust-lang/regex").unwrap(),
+            parse("https://github.com/rust-lang/regex").unwrap(),
             repo("rust-lang", "regex")
         );
         assert_eq!(
-            parse_scan_target("https://github.com/rust-lang/regex.git").unwrap(),
+            parse("https://github.com/rust-lang/regex.git").unwrap(),
             repo("rust-lang", "regex")
         );
         assert_eq!(
-            parse_scan_target("github.com/rust-lang/regex/").unwrap(),
+            parse("github.com/rust-lang/regex/").unwrap(),
             repo("rust-lang", "regex")
         );
         assert_eq!(
-            parse_scan_target("git@github.com:rust-lang/regex.git").unwrap(),
+            parse("git@github.com:rust-lang/regex.git").unwrap(),
             repo("rust-lang", "regex")
         );
         assert_eq!(
-            parse_scan_target("https://github.com/owner/repo/tree/main/src").unwrap(),
+            parse("https://github.com/owner/repo/tree/main/src").unwrap(),
             repo("owner", "repo")
         );
-        assert_eq!(
-            parse_scan_target("a/repo.js").unwrap(),
-            repo("a", "repo.js")
-        );
+        assert_eq!(parse("a/repo.js").unwrap(), repo("a", "repo.js"));
     }
 
     #[test]
@@ -166,8 +182,27 @@ mod tests {
             "https://github.com",
             "./does/not/exist/anywhere",
         ] {
-            assert!(parse_scan_target(bad).is_err(), "{bad} should be rejected");
+            assert!(parse(bad).is_err(), "{bad} should be rejected");
         }
+    }
+
+    #[test]
+    fn other_hosts_are_not_mistaken_for_github() {
+        for url in [
+            "https://gitlab.com/owner/repo",
+            "gitlab.com/owner/repo",
+            "git@gitlab.com:owner/repo.git",
+            "https://github.com.evil.example/owner/repo",
+        ] {
+            let err = parse(url).unwrap_err().to_string();
+            assert!(err.contains("is not github.com"), "{url}: {err}");
+        }
+        assert_eq!(parse("https://www.github.com/o/r").unwrap(), repo("o", "r"));
+        assert_eq!(
+            parse_scan_target("https://ghe.corp/o/r", "ghe.corp").unwrap(),
+            repo("o", "r")
+        );
+        assert!(parse_scan_target("https://github.com/o/r", "ghe.corp").is_err());
     }
 
     #[test]
@@ -182,7 +217,7 @@ mod tests {
     #[test]
     fn existing_directory_wins() {
         let dir = tempfile::tempdir().unwrap();
-        let t = parse_scan_target(dir.path().to_str().unwrap()).unwrap();
+        let t = parse(dir.path().to_str().unwrap()).unwrap();
         assert_eq!(t, Target::Local(dir.path().to_path_buf()));
     }
 
@@ -191,9 +226,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("Cargo.lock");
         std::fs::write(&f, "").unwrap();
-        let err = parse_scan_target(f.to_str().unwrap())
-            .unwrap_err()
-            .to_string();
+        let err = parse(f.to_str().unwrap()).unwrap_err().to_string();
         assert!(err.contains("directory"), "{err}");
     }
 }

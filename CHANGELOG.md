@@ -1,5 +1,131 @@
 # Changelog
 
+## 0.2.1
+
+Hardening for scanning repositories you don't control, plus accuracy work across every
+analyzer. Each fix below has a regression test.
+
+### Security
+
+- **Cloned repositories can no longer hide findings.** By default their `.gitignore` and
+  `.ignore` files, `ghaudit:ignore` comments and `osv-scanner.toml` files are not
+  honored; osv-scanner runs with `--config <empty> --no-ignore`. Local directories are
+  still trusted. New `trust_repo` setting and `--trust-repo`/`--no-trust-repo` flags.
+  Files git tracks are scanned even when an ignore rule matches them.
+- **No file is skipped silently.** Files over `max_file_size`, minified files and files
+  that hit the analysis time limit are listed in a new `skipped` report section. UTF-16
+  files are decoded, and files with NUL bytes are still searched for credentials.
+- **Bounded cost on hostile input.**
+  - Workflow YAML that expands past 100,000 nodes (alias bombs) is refused and reported
+    as `gha/unanalyzable-workflow`. It used to need over 5 GB of memory; deeply nested
+    flow YAML used to hang.
+  - Code analysis has a 5-second budget per file.
+  - Per-finding work is now linear: a 32,000-line file that took 20 seconds takes
+    under 2, and a 1 MiB line no longer produces a 200 MB report.
+  - Each rule keeps at most 25 findings per file. The rest are counted in a new
+    `omitted` section, so thousands of decoys cannot push real findings out of SARIF's
+    5,000-result limit.
+  - `github.repo_timeout_secs` (default 1800) bounds each repository, and SIGTERM now
+    cleans up like Ctrl-C.
+- **Clones run nothing the repository controls.** Git LFS is disabled, so a
+  `.lfsconfig` can no longer make git-lfs contact a server of its choosing.
+  `protocol.ext.allow=never` is set. The token is only sent over http(s).
+- **Secret leaks closed.**
+  - Credentials are masked before files are sent to the optional LLM, and in its replies.
+  - Fingerprints of every finding on a line holding a secret now use a fully masked
+    line. In 0.2.0, code findings on such a line hashed the raw line, which allowed
+    offline guessing of weak passwords.
+  - Secrets are masked in finding messages too.
+- Every git command ghaudit runs disables `core.fsmonitor`, so the `.git/config` of a
+  downloaded project scanned as a local directory cannot run a command.
+- **Terminal escapes neutralized.** File names, code and error output can no longer
+  inject escape sequences into the text report or logs.
+- **Target confusion fixed.** `gitlab.com/a/b` (or any non-GitHub URL) is now an error
+  instead of a scan of `github.com/a/b`.
+- On Linux and macOS, backslashes in file names are no longer rewritten to `/`, so
+  `src\app.py` cannot pose as `src/app.py`.
+
+### Workflows
+
+- Rebuilt on a position-preserving YAML parser: findings point at the exact line.
+- `${{ }}` expressions are parsed:
+  - any spelling of a field is recognized (`GitHub.Event['issue'].title`), as are
+    `toJSON(github.event...)`, `format()`, `join()` and values passed through `env:`;
+  - boolean-only expressions (`github.event.issue.title == 'x'`) are no longer flagged;
+  - a `}}` inside a quoted string no longer ends the expression.
+- New checks and coverage:
+  - composite actions (`action.yml`);
+  - `inputs.*` in reusable workflows (low severity);
+  - pwn requests via `gh pr checkout`, `git fetch ... pull/`, `issue_comment` and
+    `env:` indirection;
+  - `docker://` images without a digest;
+  - workflow-wide write permissions on privileged triggers;
+  - every `toJSON(secrets)` occurrence.
+- Fewer false positives:
+  - the actor check must be in an `if:` condition;
+  - using `secrets.GITHUB_TOKEN` alone does not count as reading secrets;
+  - block-scalar `uses:` values and non-`owner/repo` references are handled;
+  - GitHub's own `actions/*` are `info` when unpinned.
+- `uses:` matching is case-insensitive (`TJ-Actions/Changed-Files@v45`).
+
+### Code rules
+
+- SQL rules follow one step of data flow: a SQL string built in a variable and executed
+  later in the same function is flagged (Python, JavaScript, Go, Rust). The engine
+  supports this through a `#bound?` predicate.
+- New rules: `js/sanitizer-bypass` (Angular), `js/nosql-injection` (MongoDB `$where`),
+  `go/template-escape-bypass` (`template.HTML`).
+- New sinks:
+  - JavaScript: `vm.runIn*Context` and jQuery `.html()`;
+  - Python: Django `objects.raw()`, `subprocess.getoutput`,
+    `asyncio.create_subprocess_shell`, imported `system()`/`loads()`, and `shell=True`
+    on imported `run`.
+- False positives fixed:
+  - `exec.Command("git", "sh")`, and shell commands that are constant strings;
+  - `new Function` with only literal arguments;
+  - `innerHTML += 'literal'`;
+  - delimiter-separated regexes such as `([^,]+,)*`.
+- Columns count characters, not bytes; SARIF declares `columnKind: unicodeCodePoints`
+  and percent-encodes URIs.
+- Findings in tests, examples and docs are reported as `info` instead of failing builds.
+
+### Secrets
+
+- New formats:
+  - GitLab runner registration tokens;
+  - Slack workflow webhooks;
+  - Hugging Face org tokens;
+  - Claude OAuth tokens;
+  - TestPyPI tokens;
+  - `.npmrc` auth tokens.
+- Tokens ending in `-` or `_` (Google, SendGrid) are no longer missed.
+- Generic assignments now also cover `cfg["password"] = ...`, type-annotated
+  assignments, template literals, shell `export`, Dockerfile `ENV`/`ARG`, indented PEM
+  keys and `redis://:password@host`.
+- Fewer false positives: hex values, checksum/digest names, translation catalogs, and
+  repetitive fakes behind a real prefix.
+- Provider tokens in tests and docs are capped at medium severity (private keys: low).
+- Recall on the gitleaks test corpus: 71.5% → 74.9% of true-positive files, with no
+  new false positives.
+
+### Hidden Unicode
+
+- Also checks configuration files and many more languages (Java, C#, Ruby, shell, ...).
+- Detects Hangul fillers, variation-selector payloads (GlassWorm), blank-looking
+  characters, and direction marks next to code.
+- Flags only valid subdivision-flag sequences as legitimate, not any line containing 🏴.
+- Covers more agent files: `SKILL.md`, `.github/instructions/`, `.github/prompts/`,
+  `.windsurf/`, `.claude/`, `.kiro/` and others.
+- Agent files are never downgraded as documentation.
+- Typography in translation catalogs (ZWNJ in Persian, ZWSP in Thai) is no longer
+  flagged.
+
+### Other
+
+- Org/user/search scans print one progress line per repository to stderr.
+  `buffer_unordered` means one slow repository no longer stalls the rest.
+- Clone errors are one line.
+
 ## 0.2.0
 
 A rebuild of the scanner with a focus on correct, trustworthy results.

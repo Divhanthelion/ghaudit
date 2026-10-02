@@ -35,6 +35,8 @@ pub struct GitHubConfig {
     pub include_archived: bool,
     /// Repositories cloned and scanned at the same time in multi-repo scans.
     pub concurrency: usize,
+    /// Give up on one repository (clone and analysis) after this many seconds.
+    pub repo_timeout_secs: u64,
 }
 
 impl Default for GitHubConfig {
@@ -46,6 +48,7 @@ impl Default for GitHubConfig {
             include_forks: false,
             include_archived: false,
             concurrency: 4,
+            repo_timeout_secs: 1800,
         }
     }
 }
@@ -63,8 +66,33 @@ pub struct AnalysisConfig {
     pub languages: Vec<String>,
     /// Extra gitignore-style patterns to skip, relative to the scan root.
     pub exclude: Vec<String>,
-    /// Files larger than this many bytes are skipped.
+    /// Files larger than this many bytes are skipped (and listed in the report).
     pub max_file_size: u64,
+    /// Whether the scanned repository's own controls are honored: its `.gitignore` and
+    /// `.ignore` files, `ghaudit:ignore` comments and `osv-scanner.toml` files.
+    /// `auto` honors them for local directories and not for cloned repositories, whose
+    /// author could use them to hide findings.
+    pub trust_repo: TrustRepo,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TrustRepo {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+impl TrustRepo {
+    /// Resolve `auto` for a local directory (`true`) or a cloned repository (`false`).
+    pub fn resolve(self, local: bool) -> bool {
+        match self {
+            TrustRepo::Auto => local,
+            TrustRepo::Always => true,
+            TrustRepo::Never => false,
+        }
+    }
 }
 
 impl Default for AnalysisConfig {
@@ -78,6 +106,7 @@ impl Default for AnalysisConfig {
             languages: SUPPORTED_LANGUAGES.iter().map(|s| s.to_string()).collect(),
             exclude: Vec::new(),
             max_file_size: 1024 * 1024,
+            trust_repo: TrustRepo::Auto,
         }
     }
 }
@@ -202,6 +231,11 @@ impl Config {
         if self.github.concurrency == 0 {
             return Err(Error::Config("concurrency must be greater than 0".into()));
         }
+        if self.github.repo_timeout_secs == 0 {
+            return Err(Error::Config(
+                "repo_timeout_secs must be greater than 0".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -262,6 +296,16 @@ mod tests {
             serde_json::to_value(Config::default()).unwrap(),
             "ghaudit.example.toml must show the real defaults"
         );
+    }
+
+    #[test]
+    fn trust_resolution() {
+        let c: Config = toml::from_str("[analysis]\ntrust_repo = \"never\"\n").unwrap();
+        assert!(!c.analysis.trust_repo.resolve(true));
+        assert!(TrustRepo::Auto.resolve(true));
+        assert!(!TrustRepo::Auto.resolve(false));
+        assert!(TrustRepo::Always.resolve(false));
+        assert!(toml::from_str::<Config>("[analysis]\ntrust_repo = \"yes\"\n").is_err());
     }
 
     #[test]

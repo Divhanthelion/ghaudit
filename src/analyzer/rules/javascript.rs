@@ -20,16 +20,40 @@ pub static RULES: &[Rule] = &[
   arguments: (arguments . [(identifier) (member_expression) (call_expression) (subscript_expression) (binary_expression) (template_string (template_substitution))])
   (#eq? @f "eval")) @finding
 
-(new_expression constructor: (identifier) @c (#eq? @c "Function")) @finding
+(new_expression
+  constructor: (identifier) @c
+  arguments: (arguments [(identifier) (member_expression) (call_expression) (subscript_expression) (binary_expression) (template_string (template_substitution))])
+  (#eq? @c "Function")) @finding
+
+(call_expression
+  function: (member_expression object: (identifier) @o property: (property_identifier) @m)
+  arguments: (arguments . [(identifier) (member_expression) (call_expression) (subscript_expression) (binary_expression) (template_string (template_substitution))])
+  (#eq? @o "vm")
+  (#match? @m "^(runInContext|runInNewContext|runInThisContext|compileFunction)$")) @finding
+
+(new_expression
+  constructor: (member_expression object: (identifier) @o property: (property_identifier) @c)
+  arguments: (arguments . [(identifier) (member_expression) (call_expression) (subscript_expression) (binary_expression) (template_string (template_substitution))])
+  (#eq? @o "vm")
+  (#eq? @c "Script")) @finding
 "#,
         requires: None,
+        bindings: None,
         jsx: false,
         examples: &[
             "const r = eval(input);",
             "eval(`${a} + ${b}`);",
             "const fn = new Function('a', body);",
+            "vm.runInNewContext(req.body.expr, sandbox);",
+            "const s = new vm.Script(code);",
         ],
-        counter_examples: &["eval('1 + 1');", "model.eval(x);", "const f = new Map();"],
+        counter_examples: &[
+            "eval('1 + 1');",
+            "model.eval(x);",
+            "const f = new Map();",
+            "const add = new Function('a', 'b', 'return a + b');",
+            "vm.runInNewContext('1 + 1', sandbox);",
+        ],
     },
     Rule {
         id: "js/command-injection",
@@ -59,6 +83,7 @@ pub static RULES: &[Rule] = &[
   (#eq? @k "shell")) @finding
 "#,
         requires: Some(r"child_process"),
+        bindings: None,
         jsx: false,
         examples: &[
             "const { exec } = require('child_process');\nexec(`git clone ${url}`);",
@@ -87,16 +112,39 @@ pub static RULES: &[Rule] = &[
   arguments: (arguments . [(binary_expression) (template_string (template_substitution))] @q)
   (#match? @m "^(query|execute|exec|raw|prepare|unsafe|\\$queryRawUnsafe|\\$executeRawUnsafe)$")
   (#match? @q "(?is)\\b(select\\s.+\\sfrom|insert\\s+into|update\\s.+\\sset|delete\\s+from|drop\\s+table)\\b")) @finding
+
+(call_expression
+  function: (member_expression property: (property_identifier) @m)
+  arguments: (arguments . (identifier) @arg)
+  (#match? @m "^(query|execute|exec|raw|prepare|unsafe|\\$queryRawUnsafe|\\$executeRawUnsafe)$")
+  (#bound? @arg)) @finding
 "#,
         requires: None,
+        bindings: Some(
+            r#"
+(variable_declarator
+  name: (identifier) @var
+  value: [(binary_expression) (template_string (template_substitution))] @q
+  (#match? @q "(?is)\\b(select\\s.+\\sfrom|insert\\s+into|update\\s.+\\sset|delete\\s+from|drop\\s+table)\\b"))
+
+(assignment_expression
+  left: (identifier) @var
+  right: [(binary_expression) (template_string (template_substitution))] @q
+  (#match? @q "(?is)\\b(select\\s.+\\sfrom|insert\\s+into|update\\s.+\\sset|delete\\s+from|drop\\s+table)\\b"))
+"#,
+        ),
         jsx: false,
         examples: &[
             "db.query(`SELECT * FROM users WHERE id = ${req.params.id}`);",
             "conn.execute(\"DELETE FROM orders WHERE id = \" + id);",
             "await prisma.$queryRawUnsafe(`SELECT * FROM t WHERE name = '${name}'`);",
+            "async function f(db, id) {\n  const sql = `SELECT * FROM users WHERE id = ${id}`;\n  const rows = await db.query(sql);\n}",
+            "let q;\nq = \"DELETE FROM t WHERE id = \" + id;\nconn.execute(q).then(done);",
         ],
         counter_examples: &[
             "db.query('SELECT * FROM users WHERE id = $1', [id]);",
+            "async function f(db, id) {\n  const sql = 'SELECT * FROM users WHERE id = $1';\n  await db.query(sql, [id]);\n}",
+            "function a(id) { const sql = `SELECT * FROM t WHERE id = ${id}`; }\nfunction b(db, sql) { db.query(sql); }",
             "await prisma.$queryRaw`SELECT * FROM t WHERE name = ${name}`;",
             "cache.query(`select-${key}`);",
             "re.exec(`${a}${b}`);",
@@ -119,7 +167,24 @@ pub static RULES: &[Rule] = &[
 
 (augmented_assignment_expression
   left: (member_expression property: (property_identifier) @p)
+  right: [(identifier) (member_expression) (call_expression) (subscript_expression) (binary_expression) (template_string (template_substitution))]
   (#match? @p "^(innerHTML|outerHTML)$")) @finding
+
+(call_expression
+  function: (member_expression
+    object: (call_expression function: (identifier) @j)
+    property: (property_identifier) @m)
+  arguments: (arguments . [(identifier) (member_expression) (call_expression) (subscript_expression) (binary_expression) (template_string (template_substitution))])
+  (#match? @j "^(\\$|jQuery)$")
+  (#eq? @m "html")) @finding
+
+(call_expression
+  function: (member_expression
+    object: (call_expression function: (identifier) @j)
+    property: (property_identifier) @m)
+  arguments: (arguments . [(binary_expression) (template_string (template_substitution))])
+  (#match? @j "^(\\$|jQuery)$")
+  (#match? @m "^(append|prepend|after|before|replaceWith)$")) @finding
 
 (call_expression
   function: (member_expression property: (property_identifier) @m)
@@ -133,6 +198,7 @@ pub static RULES: &[Rule] = &[
   (#match? @m "^(write|writeln)$")) @finding
 "#,
         requires: None,
+        bindings: None,
         jsx: false,
         examples: &[
             "el.innerHTML = comment.body;",
@@ -140,8 +206,14 @@ pub static RULES: &[Rule] = &[
             "list.innerHTML += item;",
             "el.insertAdjacentHTML('beforeend', html);",
             "document.write('<p>' + msg + '</p>');",
+            "$('#out').html(data.message);",
+            "jQuery(el).append(`<li>${item.name}</li>`);",
         ],
         counter_examples: &[
+            "list.innerHTML += '<li>static</li>';",
+            "$('#out').html('<b>static</b>');",
+            "$('#out').text(data.message);",
+            "$('#list').append(node);",
             "el.innerHTML = '';",
             "el.innerHTML = `<br>`;",
             "el.textContent = comment.body;",
@@ -159,6 +231,7 @@ pub static RULES: &[Rule] = &[
         remediation: "Render text through JSX, or sanitize the HTML (e.g. DOMPurify.sanitize) right where it is passed.",
         query: r#"(jsx_attribute (property_identifier) @a (#eq? @a "dangerouslySetInnerHTML")) @finding"#,
         requires: None,
+        bindings: None,
         jsx: true,
         examples: &["const C = ({ html }) => <div dangerouslySetInnerHTML={{ __html: html }} />;"],
         counter_examples: &["const C = ({ text }) => <div>{text}</div>;"],
@@ -183,6 +256,7 @@ pub static RULES: &[Rule] = &[
   (#match? @v "^[\"']?0[\"']?$")) @finding
 "#,
         requires: None,
+        bindings: None,
         jsx: false,
         examples: &[
             "const agent = new https.Agent({ rejectUnauthorized: false });",
@@ -216,6 +290,7 @@ pub static RULES: &[Rule] = &[
   (#match? @alg "^[\"'](?i:des|des-|rc4|rc2|bf|blowfish|aes-\\d+-ecb)")) @finding
 "#,
         requires: None,
+        bindings: None,
         jsx: false,
         examples: &[
             "const h = crypto.createHash('md5').update(pw).digest('hex');",
@@ -238,18 +313,70 @@ pub static RULES: &[Rule] = &[
         remediation: "Rewrite the pattern so repetitions cannot overlap (e.g. (a+)+ becomes a+), or bound the input length.",
         query: r#"
 (regex pattern: (regex_pattern) @p
-  (#match? @p "\\([^()]*[+*][^()]*\\)[+*{]")) @finding
+  (#match? @p "\\([^()]*[+*][^()]*\\)[+*{]")
+  (#not-match? @p "\\(\\[\\^(,|;|:|\\\\/|/|\\\\.|\\|| |\\\\s)\\][+*](,|;|:|\\\\/|/|\\\\.|\\|| |\\\\s)\\??\\)[+*]|\\((,|;|:|\\\\/|/|\\\\.|\\|| |\\\\s)\\[\\^(,|;|:|\\\\/|/|\\\\.|\\|| |\\\\s)\\][+*]\\)[+*]")) @finding
 "#,
         requires: None,
+        bindings: None,
         jsx: false,
         examples: &[
             "const re = /^(a+)+$/;",
             "const email = /^([a-zA-Z0-9]+\\s?)*$/;",
         ],
         counter_examples: &[
+            "const csv = /^([^,]+,)*[^,]+$/;",
+            "const path = /^(\\/[^\\/]+)+$/;",
             "const re = /^(\\d+)\\.(\\d+)$/;",
             "const re = /(a|b)+/;",
             "const re = /^a+$/;",
+        ],
+    },
+    Rule {
+        id: "js/sanitizer-bypass",
+        language: RuleLanguage::JavaScript,
+        name: "Angular sanitizer bypassed for dynamic content",
+        message: "bypassSecurityTrust* tells Angular to render the value without sanitizing it. If the value contains user input, this is cross-site scripting.",
+        severity: Severity::Medium,
+        confidence: Confidence::Medium,
+        cwe: &["CWE-79"],
+        remediation: "Let Angular sanitize the value (bind it normally), or sanitize it yourself (e.g. DOMPurify) right before trusting it.",
+        query: r#"
+(call_expression
+  function: (member_expression property: (property_identifier) @m)
+  arguments: (arguments . [(identifier) (member_expression) (call_expression) (subscript_expression) (binary_expression) (template_string (template_substitution))])
+  (#match? @m "^bypassSecurityTrust(Html|Script|Style|Url|ResourceUrl)$")) @finding
+"#,
+        requires: None,
+        bindings: None,
+        jsx: false,
+        examples: &["this.html = this.sanitizer.bypassSecurityTrustHtml(comment.body);"],
+        counter_examples: &["this.icon = this.sanitizer.bypassSecurityTrustHtml('<svg></svg>');"],
+    },
+    Rule {
+        id: "js/nosql-injection",
+        language: RuleLanguage::JavaScript,
+        name: "MongoDB $where with dynamic code",
+        message: "$where runs JavaScript on the database server. Building it from a variable or string lets user input become server-side code.",
+        severity: Severity::High,
+        confidence: Confidence::Medium,
+        cwe: &["CWE-943"],
+        remediation: "Express the condition with query operators ($eq, $gt, $regex, ...) instead of $where.",
+        query: r#"
+(pair
+  key: [(property_identifier) (string)] @k
+  value: [(identifier) (member_expression) (call_expression) (subscript_expression) (binary_expression) (template_string (template_substitution))]
+  (#match? @k "^[\"']?\\$where[\"']?$")) @finding
+"#,
+        requires: None,
+        bindings: None,
+        jsx: false,
+        examples: &[
+            "db.users.find({ $where: `this.name == '${req.query.name}'` });",
+            "User.find({ '$where': 'this.age > ' + age });",
+        ],
+        counter_examples: &[
+            "db.users.find({ $where: function () { return this.a > 1; } });",
+            "db.users.find({ name: req.query.name });",
         ],
     },
 ];

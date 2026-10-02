@@ -19,6 +19,9 @@ pub enum Error {
     #[error("configuration: {0}")]
     Config(String),
 
+    #[error("{0}")]
+    Timeout(String),
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 

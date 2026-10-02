@@ -2,7 +2,10 @@
 //!
 //! Notes on the choices here:
 //! - `startLine` is always >= 1 (GitHub rejects 0).
-//! - URIs are relative with `/` separators, so reports from Windows and Linux match.
+//! - URIs are relative with `/` separators, so reports from Windows and Linux match;
+//!   other characters that are not valid in a URI are percent-encoded.
+//! - Columns count Unicode code points (`columnKind: unicodeCodePoints`), as ghaudit's
+//!   locations do; the SARIF default would be UTF-16 code units.
 //! - Fingerprints are content-based and stable across runs, so alerts are tracked
 //!   instead of being closed and re-opened on every upload.
 //! - `security-severity` is what GitHub uses to label alerts critical/high/medium/low.
@@ -51,10 +54,27 @@ fn security_severity(f: &Finding) -> String {
 }
 
 fn uri(f: &Finding) -> String {
-    match &f.repository {
+    let path = match &f.repository {
         Some(repo) => format!("{repo}/{}", f.location.path),
         None => f.location.path.clone(),
+    };
+    encode_uri_path(&path)
+}
+
+/// Percent-encode everything but unreserved characters, `/` and sub-delimiters.
+fn encode_uri_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        if c.is_ascii_alphanumeric() || "-._~/!$&'()*+,;=:@".contains(c) {
+            out.push(c);
+        } else {
+            let mut buf = [0u8; 4];
+            for b in c.encode_utf8(&mut buf).bytes() {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        }
     }
+    out
 }
 
 fn rule(f: &Finding) -> Value {
@@ -176,6 +196,15 @@ pub fn to_sarif(report: &ScanReport) -> Value {
         .chain((dropped > 0).then(|| json!({ "level": "warning", "message": { "text": format!(
             "{dropped} lower-severity findings omitted: SARIF consumers such as GitHub show at most {MAX_RESULTS} results per run. Use JSON output for the full list."
         ) } })))
+        .chain((!report.skipped.is_empty()).then(|| json!({ "level": "warning", "message": { "text": format!(
+            "{} files were not fully analyzed (too large, minified, unreadable or over the time limit). Use JSON output for the list.",
+            report.skipped.len()
+        ) } })))
+        .chain((report.stats.findings_omitted > 0).then(|| json!({ "level": "note", "message": { "text": format!(
+            "{} repeated findings omitted (over {} of one rule in one file). Use JSON output for the counts.",
+            report.stats.findings_omitted,
+            crate::scanner::MAX_PER_RULE_AND_FILE
+        ) } })))
         .collect();
 
     let run = json!({
@@ -188,6 +217,7 @@ pub fn to_sarif(report: &ScanReport) -> Value {
                 "rules": rules,
             }
         },
+        "columnKind": "unicodeCodePoints",
         "invocations": [{
             "executionSuccessful": report.is_complete(),
             "startTimeUtc": report.started_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -253,6 +283,7 @@ mod tests {
     #[test]
     fn locations_are_valid_for_github() {
         let sarif = to_sarif(&sample());
+        assert_eq!(sarif["runs"][0]["columnKind"], "unicodeCodePoints");
         for res in sarif["runs"][0]["results"].as_array().unwrap() {
             let loc = &res["locations"][0]["physicalLocation"];
             assert!(loc["region"]["startLine"].as_u64().unwrap() >= 1);
@@ -263,6 +294,13 @@ mod tests {
                     .contains('\\')
             );
         }
+    }
+
+    #[test]
+    fn uris_are_percent_encoded() {
+        assert_eq!(encode_uri_path("src/my file.py"), "src/my%20file.py");
+        assert_eq!(encode_uri_path("a\\b/é.rs"), "a%5Cb/%C3%A9.rs");
+        assert_eq!(encode_uri_path("o/r/src/a-b_c.~x"), "o/r/src/a-b_c.~x");
     }
 
     #[test]

@@ -517,3 +517,236 @@ fn github_actions_workflows_are_audited() {
     ]);
     assert!(rule_ids(&report).is_empty());
 }
+
+fn has_git() -> bool {
+    std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// Commit every file under `dir` (including ignored ones) to a new repository.
+fn commit_all(dir: &Path) {
+    let run = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    };
+    run(&["init", "-q"]);
+    run(&["add", "-f", "-A"]);
+    run(&["commit", "-q", "-m", "init", "--no-gpg-sign"]);
+}
+
+/// `file:///tmp/x` on Unix, `file:///C:/x` on Windows.
+fn file_url(path: &Path) -> String {
+    let p = path.to_string_lossy().replace('\\', "/");
+    format!("file:///{}", p.trim_start_matches('/'))
+}
+
+/// A repository whose author tries to hide a credential and a finding from scanners.
+fn hiding_repo(root: &Path) {
+    write(root, ".gitignore", "deploy.env\n");
+    write(
+        root,
+        "deploy.env",
+        &format!("STRIPE_KEY={}\n", stripe_key()),
+    );
+    write(
+        root,
+        "app.py",
+        "import os\nos.system(cmd)  # ghaudit:ignore\n",
+    );
+    commit_all(root);
+}
+
+#[test]
+fn cloned_repositories_cannot_hide_findings_from_the_scan() {
+    if !has_git() {
+        return;
+    }
+    // api_url = file://<serve> makes `owner/repo` clone from <serve>/owner/repo.git.
+    let serve = tempfile::tempdir().unwrap();
+    hiding_repo(&serve.path().join("acme/hidden.git"));
+    let config = serve.path().join("ghaudit.toml");
+    fs::write(
+        &config,
+        format!("[github]\napi_url = \"{}\"\n", file_url(serve.path())),
+    )
+    .unwrap();
+    let cfg = config.to_str().unwrap();
+
+    let (report, code) = json_report(&["scan", "acme/hidden", "-c", cfg, "--no-sca", "-f", "json"]);
+    assert_eq!(
+        rule_ids(&report),
+        vec!["python/os-command", "secret/stripe-key"],
+        "its .gitignore and ghaudit:ignore comment are not honored"
+    );
+    assert_eq!(report["stats"]["findings_suppressed"], 0);
+    assert_eq!(code, 1);
+    assert_eq!(report["commit"].as_str().map(str::len), Some(40));
+
+    // Trusting it honors the comment; a tracked file is scanned even though ignored.
+    let (report, _) = json_report(&[
+        "scan",
+        "acme/hidden",
+        "-c",
+        cfg,
+        "--no-sca",
+        "--trust-repo",
+        "-f",
+        "json",
+    ]);
+    assert_eq!(rule_ids(&report), vec!["secret/stripe-key"]);
+    assert_eq!(report["stats"]["findings_suppressed"], 1);
+}
+
+#[test]
+fn local_directories_are_trusted_unless_told_otherwise() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), ".gitignore", "local.env\n");
+    write(
+        dir.path(),
+        "local.env",
+        &format!("STRIPE_KEY={}\n", stripe_key()),
+    );
+    let path = dir.path().to_str().unwrap();
+    let (report, _) = json_report(&["scan", path, "--no-sca", "-f", "json"]);
+    assert!(
+        rule_ids(&report).is_empty(),
+        "untracked and ignored: skipped"
+    );
+    let (report, _) = json_report(&["scan", path, "--no-sca", "--no-trust-repo", "-f", "json"]);
+    assert_eq!(rule_ids(&report), vec!["secret/stripe-key"]);
+}
+
+/// Serve `body` as JSON for GET requests whose path contains `route`, 404 otherwise.
+fn mock_api(route: &'static str, body: String) -> String {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap_or(0);
+            // Skip the headers.
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 2 {
+                line.clear();
+            }
+            let (status, payload) = if request_line.contains(route) {
+                ("200 OK", body.clone())
+            } else {
+                ("404 Not Found", "{\"message\": \"Not Found\"}".to_string())
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
+                payload.len()
+            );
+        }
+    });
+    format!("http://{addr}")
+}
+
+#[test]
+fn org_scans_report_every_repository_with_progress() {
+    if !has_git() {
+        return;
+    }
+    let repos = tempfile::tempdir().unwrap();
+    let good = repos.path().join("good");
+    hiding_repo(&good);
+    let missing = repos.path().join("missing");
+    let body = serde_json::json!([
+        { "full_name": "acme/good", "clone_url": file_url(&good) },
+        { "full_name": "acme/missing", "clone_url": file_url(&missing) },
+        { "full_name": "acme/fork", "clone_url": file_url(&good), "fork": true },
+    ])
+    .to_string();
+    let api = mock_api("/orgs/acme/repos", body);
+    let config = repos.path().join("ghaudit.toml");
+    fs::write(&config, format!("[github]\napi_url = \"{api}\"\n")).unwrap();
+
+    let out = ghaudit()
+        .args([
+            "org",
+            "acme",
+            "-c",
+            config.to_str().unwrap(),
+            "--no-sca",
+            "--fail-on",
+            "never",
+            "-f",
+            "json",
+            // A token must not break clones of non-HTTPS URLs (it is just not sent).
+            "--token",
+            "unused-token",
+        ])
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "one repository failed: incomplete"
+    );
+    let repositories = report["repositories"].as_array().unwrap();
+    assert_eq!(repositories.len(), 2, "forks are skipped by default");
+    assert_eq!(repositories[0]["name"], "acme/good");
+    assert_eq!(repositories[0]["findings"], 2);
+    let error = repositories[1]["error"].as_str().unwrap();
+    assert!(error.contains("failed") && !error.contains('\n'), "{error}");
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|f| f["repository"] == "acme/good")
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("/2] acme/good: 2 findings"), "{stderr}");
+    assert!(stderr.contains("/2] acme/missing: failed"), "{stderr}");
+}
+
+#[test]
+fn oversized_files_are_listed_not_silently_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "small.py", "x = 1\n");
+    write(dir.path(), "big.env", &"A".repeat(5000));
+    let path = dir.path().to_str().unwrap();
+    let (report, _) = json_report(&[
+        "scan",
+        path,
+        "--no-sca",
+        "--max-file-size",
+        "1000",
+        "-f",
+        "json",
+    ]);
+    assert_eq!(report["stats"]["files_skipped"], 1);
+    assert_eq!(report["skipped"][0]["path"], "big.env");
+    ghaudit()
+        .args(["scan", path, "--no-sca", "--max-file-size", "1000"])
+        .assert()
+        .stdout(predicate::str::contains(
+            "1 files not fully analyzed (big.env)",
+        ));
+}
+
+#[test]
+fn urls_on_other_hosts_are_not_scanned_as_github_repositories() {
+    ghaudit()
+        .args(["scan", "https://gitlab.com/acme/app"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("gitlab.com is not github.com"));
+}

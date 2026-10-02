@@ -12,7 +12,7 @@ flowchart LR
     T -->|owner/repo| G["git.rs<br/>shallow clone to temp dir"]
     T -->|org / user / search| API["github.rs<br/>list repositories"] --> G
     G --> D["discovery.rs<br/>pick files"]
-    D --> L["per-file analysis (rayon)<br/>sast.rs, secrets.rs,<br/>workflows.rs, unicode.rs"]
+    D --> L["per-file analysis (rayon)<br/>sast.rs, secrets.rs,<br/>workflows/, unicode.rs"]
     D --> S["sca.rs<br/>osv-scanner subprocess"]
     L --> AI["ai.rs (optional)<br/>LLM review"]
     L --> R["model.rs<br/>ScanReport"]
@@ -33,8 +33,9 @@ Then:
 
 - If `-o` is given, the output path is checked *before* scanning: a temporary file is
   created next to it and renamed into place at the end.
-- The scan runs inside `tokio::select!` together with a Ctrl-C listener. Interrupting
-  drops the scan, which deletes temporary clones and kills child processes.
+- The scan runs inside `tokio::select!` together with a Ctrl-C and SIGTERM listener.
+  Interrupting drops the scan future, which deletes temporary clones, kills child
+  processes and tells analysis threads to stop.
 - The exit code is computed last from the findings and the analyzer statuses. The
   table is in the README.
 
@@ -47,7 +48,9 @@ Then:
 3. `owner/repo`.
 
 Owner and repository names are validated against GitHub's character rules before they
-are put into any URL. `org`, `user` and `search` build their targets directly.
+are put into any URL. A URL must be on the configured GitHub host (github.com, or the
+GitHub Enterprise host of `github.api_url`): `gitlab.com/a/b` is an error, not a scan of
+`github.com/a/b`. `org`, `user` and `search` build their targets directly.
 
 ### 3. Getting the code (`github.rs`, `git.rs`)
 
@@ -57,37 +60,66 @@ are put into any URL. `org`, `user` and `search` build their targets directly.
 - **Cloning.** `git.rs` runs the system `git`: `clone --depth 1 --single-branch
   --no-tags` into a `TempDir`, which is deleted when it goes out of scope. The token is
   passed as an HTTP header through `GIT_CONFIG_*` environment variables, so it never
-  appears in `ps` output or in `.git/config`. `core.symlinks=false` makes symlinks in a
-  hostile repository plain files.
+  appears in `ps` output or in `.git/config`, and only for http(s) URLs. The repository
+  is untrusted, so the clone runs nothing it controls: `core.symlinks=false` makes
+  symlinks plain files, `protocol.ext.allow=never` disables the `ext::` transport, and
+  the LFS filter is disabled (`filter.lfs.*`, `GIT_LFS_SKIP_SMUDGE`) so the repository's
+  `.lfsconfig` cannot send git-lfs to a server of its choosing. Clone errors are cut to
+  git's one `fatal:` line.
 - **Multi-repo scans.** These run `github.concurrency` repositories at a time
-  (`futures::buffered`). A repository that fails to clone is recorded in the report
-  with its error instead of aborting the run.
+  (`buffer_unordered`, so one slow repository does not stall the others; the original
+  order is restored afterwards). Each repository, clone included, has
+  `github.repo_timeout_secs`. A repository that fails or times out is recorded in the
+  report with its error instead of aborting the run, and a progress line per repository
+  goes to stderr.
 
 ### 4. Choosing files (`discovery.rs`)
 
 This step uses the `ignore` crate, the same walker as ripgrep:
 
-- `.gitignore` is honored even outside a git checkout.
+- `.gitignore`/`.ignore` files are honored only when the tree is trusted (by default, a
+  local directory; see `config::TrustRepo`). In a repository you are auditing they are
+  the author's way of hiding files.
+- Even then, files git tracks are added back when an ignore rule matches them
+  (`git ls-files --cached --ignored`), because they are in the repository all the same.
+  Every git command ghaudit runs passes `-c core.fsmonitor=false`, so a `.git/config`
+  copied in with a downloaded project cannot make it run a command.
 - Directories such as `node_modules`, `vendor`, `target`, `dist` and `.venv` are pruned
   by name at any depth.
 - Hidden files are included, so `.env` gets checked.
 - Symlinks are never followed.
-- Files over `max_file_size` are dropped.
+- Files over `max_file_size` are not read, and are listed in the report's `skipped`.
 
-`read_text` treats a file with NUL bytes near the start as binary (this also catches
-UTF-16) and replaces invalid UTF-8 rather than failing.
+`read_file` decodes UTF-16 (with a byte-order mark, or recognized by its zero bytes, as
+git's `working-tree-encoding` writes it) and replaces invalid UTF-8 rather than failing.
+Other files with NUL bytes are binary: they still go through the credential patterns,
+since a NUL byte in front of a secret does not make it harmless.
 
 ### 5. Analysis (`scanner.rs` and `analyzer/`)
 
 `Scanner::scan_dir` runs two things concurrently:
 
 - **Per-file analysis** on a rayon thread pool. Each file is read once and given to the
-  SAST engine (if its language has rules) and the secret detector (unless it is a
-  lockfile or minified). Suppression comments are applied here, and any secret found
-  in a file is masked in every snippet from that file.
+  secret detector (unless it is a lockfile or minified), the SAST engine (if its
+  language has rules and the file is not minified), the hidden-Unicode check and the
+  workflow audit. A shared cancellation flag stops the threads when the scan is dropped.
 - **osv-scanner** as a subprocess, which walks the same tree for lockfiles.
 
-The optional LLM review runs after that, one file at a time.
+The optional LLM review runs after that, one file at a time, on a copy of the file with
+detected credentials replaced by `********`.
+
+Every file's findings then go through `scanner::finish`:
+
+1. Findings in tests, examples and docs become `info` (secrets have their own policy).
+2. Every secret value found in the file is masked in all snippets and messages, with
+   one Aho-Corasick pass (`secrets::Masker`), and findings on a line holding a secret
+   get a fingerprint of the line with the value replaced by `********`.
+3. `ghaudit:ignore` comments are applied, in trusted trees only, and counted.
+4. One rule keeps at most 25 findings per file; the rest are counted in `omitted`.
+5. Snippet lines are cut to 200 characters around the finding.
+
+These steps are linear in the file's size: lines are looked up through a
+`model::LineIndex` built once per file, never by rescanning the text.
 
 Each analyzer reports an `AnalyzerStatus`: `completed`, `skipped` or `failed`. A
 failure is never turned into "no findings". The report, the text output and the SARIF
@@ -101,18 +133,36 @@ shell=True":
 
 ```scheme
 (call
-  function: (attribute object: (identifier) @mod attribute: (identifier) @fn)
+  function: [(identifier) @fn (attribute attribute: (identifier) @fn)]
   arguments: (argument_list
     . [(identifier) (attribute) (call) (subscript) (binary_operator) (string (interpolation))]
     (keyword_argument name: (identifier) @k value: (true)))
-  (#eq? @mod "subprocess")
   (#match? @fn "^(run|call|check_call|check_output|Popen)$")
   (#eq? @k "shell")) @finding
 ```
 
-The query matches syntax, not text. In plain terms it says: a call to
-`subprocess.run` (or `call`, `Popen`, ...) whose first argument is not a fixed string
-and which passes `shell=True`. Comments and strings can't match it.
+The query matches syntax, not text. In plain terms it says: a call to `run` (or
+`call`, `Popen`, ...), as `subprocess.run` or imported bare, whose first argument is not
+a fixed string and which passes `shell=True`. Comments and strings can't match it.
+
+A rule can follow one step of data flow. Its `bindings` query marks variables assigned
+a dangerous value (capture `@var`), and its main query can require `(#bound? @arg)`:
+
+```scheme
+; bindings: a variable assigned SQL built from strings
+(assignment left: (identifier) @var right: (string (interpolation)) @q
+  (#match? @q "(?i)\\b(select|insert|update|delete)\\b"))
+
+; main query: that variable passed to execute()
+(call function: (attribute attribute: (identifier) @m)
+      arguments: (argument_list . (identifier) @arg)
+  (#match? @m "^(execute|executemany)$")
+  (#bound? @arg)) @finding
+```
+
+tree-sitter hands `#bound?` back to the engine as a "general predicate". The engine
+evaluates it: the argument must name a variable bound earlier in the same function (the
+nearest enclosing function node, per grammar).
 
 The engine works like this:
 
@@ -121,17 +171,28 @@ The engine works like this:
 - JavaScript rules also run on the TypeScript and TSX grammars.
 - `requires` is an optional regex the whole file must match first. Go's math/rand rule
   uses it to check the import.
+- Parsing and querying share a 5-second budget per file, enforced through tree-sitter's
+  progress callbacks. A file that hits it is listed in `skipped`. Deeply nested input
+  can otherwise make tree-sitter very slow.
+- Columns are converted from tree-sitter's byte offsets to characters.
 - Every rule carries `examples` and `counter_examples`, and
   `every_rule_matches_its_examples_and_not_its_counter_examples` runs all of them. A
   rule that stops matching, or starts over-matching, fails the build.
 
-#### GitHub Actions workflows (`analyzer/workflows.rs`)
+#### GitHub Actions workflows (`analyzer/workflows/`)
 
-Each `.github/workflows/*.yml` file is parsed with `serde_yaml_ng`. The checks then run
-over the structure:
+Workflow files (`.github/workflows/*.yml`) and composite actions (`action.yml`) are
+parsed by `workflows/yaml.rs`, a small tree builder over saphyr-parser's event stream.
+It keeps the position of every node, so findings point at the exact line. It is also
+hardened for hostile input: anchored nodes are shared rather than copied when an alias
+refers to them, and a document whose logical size exceeds 100,000 nodes (an "alias
+bomb") is refused with a `gha/unanalyzable-workflow` finding. The parser itself rejects
+pathological nesting.
+
+The checks then run over the structure:
 
 1. `on:` is collected as a set of triggers. `on:` may be a string, a list or a map.
-2. Each job and its steps are walked in order.
+2. Each job and its steps are walked in order, carrying the `env:` variables in scope.
 3. The checks combine the trigger set with what a step does.
 
 Some examples of how the checks combine:
@@ -143,31 +204,50 @@ Some examples of how the checks combine:
   problem on `pull_request_target`/`workflow_run`. On `pull_request` it is the safe,
   normal pattern, so it is not flagged.
 
-The list of attacker-controlled contexts (`ATTACKER_CONTEXT`) follows GitHub's
+`${{ }}` expressions are parsed by `workflows/expr.rs` into a small syntax tree, then
+checked for taint:
+
+- Context access in any spelling (`GitHub.Event['issue'].title`) is normalized.
+- Comparisons and `!` yield booleans, and `contains()`/`startsWith()` too, so they are
+  never tainted. `a && b` can yield `b`, and `a || b` either side.
+- `toJSON(github.event.pull_request)` serializes an object that contains attacker
+  fields; `format()` and `join()` pass their arguments through.
+- `env.X` is tainted when `X` was defined from an attacker field in an enclosing
+  `env:`. `inputs.*` is tainted, at low severity, in reusable workflows and composite
+  actions.
+
+The list of attacker-controlled fields (`expr::ATTACKER_FIELDS`) follows GitHub's
 security-hardening guidance and zizmor's context analysis. Excluded are values an
 outsider cannot shape freely: numbers, SHAs, repository names.
 
-Line numbers are found by searching the source text forward from the previous match,
-so repeated text resolves to the occurrence being checked.
+An expression inside a `run:` block is located by searching the scalar's own source
+text, so repeated expressions resolve to their own lines.
 
 #### Hidden Unicode (`analyzer/unicode.rs`)
 
-This runs on source files and on AI-agent instruction files. It looks for:
+This runs on source and configuration files and on AI-agent instruction files. It looks
+for:
 
 - bidirectional controls (U+202A–202E, U+2066–2069);
 - Unicode tag characters (U+E0000–E007F);
-- zero-width characters, in agent files only.
+- zero-width characters, invisible operators, Hangul fillers and blank-looking
+  characters;
+- direction marks (LRM, RLM, ALM) next to ASCII code;
+- variation selectors that select nothing, which can encode a hidden payload.
 
-Flag emoji (which legitimately use tag characters), a leading byte-order mark, and
-zero-width joiners in emoji are allowed. The snippet shows each hidden character as
-`<U+XXXX>`.
+Legitimate uses are allowed: subdivision flags (which use tag characters), a leading
+byte-order mark, emoji sequences, joiners and marks after letters of scripts that need
+them, and typography in translation catalogs. The snippet shows each hidden character
+as `<U+XXXX>`.
 
 #### Secrets (`analyzer/secrets.rs`)
 
 There are two passes:
 
 1. **Provider patterns.** Regexes for token formats with a recognizable shape
-   (`ghp_` + 36 characters, `AKIA` + 16, PEM key blocks with key material, ...).
+   (`ghp_` + 36 characters, `AKIA` + 16, PEM key blocks with key material, ...). A
+   match must not continue into a longer token. They run on binary files too, and in
+   tests and docs they are capped at medium severity.
 2. **Generic assignments.** A value assigned to a secret-like name. This pass is
    filtered against:
    - placeholders (`changeme`, `<...>`, `xxxx`);
@@ -177,8 +257,9 @@ There are two passes:
    - test, example and doc paths.
 
 Values are masked as the first four characters plus `********`; the mask doesn't reveal
-the length. Fingerprints are computed from the masked line, never from the secret, so
-a published fingerprint can't be used to brute-force a weak password.
+the length. Fingerprints of every finding on a line holding a secret, whatever its
+rule, are computed from the line with each secret value replaced by `********`. So a
+published fingerprint can't be used to brute-force a weak password.
 
 #### Dependencies (`analyzer/sca.rs`)
 
@@ -201,6 +282,10 @@ group:
 - **Location** is the lockfile path relative to the scan root, plus a best-effort line
   number for the package.
 
+When the tree is untrusted, ghaudit adds `--config <empty file> --no-ignore`: a
+`--config` file replaces every per-directory `osv-scanner.toml` (which can ignore
+packages and advisories), and `--no-ignore` stops `.gitignore` from hiding lockfiles.
+
 Exit codes 0 and 1 from osv-scanner both mean success. Anything else, a missing binary,
 a timeout or unparsable output is a failed analyzer. Error lines on stderr (for example
 a manifest it could not resolve) are kept as warnings on the analyzer status.
@@ -212,7 +297,9 @@ a manifest it could not resolve) are kept as warnings on the analyzer status.
 - the findings;
 - per-analyzer statuses;
 - per-repository summaries (for multi-repo scans);
-- stats.
+- `skipped`: files that were not fully analyzed, and why;
+- `omitted`: counts of findings beyond the per-rule, per-file limit;
+- stats, including suppressed, skipped and omitted counts.
 
 `finalize()` drops findings below `min_severity`, makes fingerprints unique, sorts the
 findings (by severity, then repository, path and line) and recomputes the counts in
@@ -225,14 +312,19 @@ SARIF consumers need to track alerts across runs.
 The three formats:
 
 - **text**: grouped and colored. Colors are stripped automatically when stdout is not a
-  terminal, via `anstream`.
+  terminal, via `anstream`. Every string that comes from the scanned code (paths,
+  snippets, messages, error output) passes through `report::terminal_safe`, which shows
+  control and invisible characters as `<U+XXXX>`.
 - **json**: the `ScanReport` serialized as is. Field names are stable.
 - **sarif**: SARIF 2.1.0 with:
   - one rule per rule ID (one per advisory for dependencies);
   - `security-severity` scores;
   - CWE tags;
   - `partialFingerprints`;
-  - tool execution notifications for failed analyzers.
+  - `columnKind: unicodeCodePoints`, matching ghaudit's character columns;
+  - percent-encoded artifact URIs;
+  - tool execution notifications for failed analyzers, skipped files and omitted
+    findings.
 
   CI validates it against the official schema.
 
@@ -246,6 +338,8 @@ The three formats:
 | Small, precise rule set | A scanner that flags every `unwrap()` or file read gets ignored. Every rule must ship with examples and near-misses. |
 | System `git` and pure-Rust TLS (rustls + ring) | No C libraries to build, so `cargo install` works on Windows, macOS and Linux. Proxies and credentials behave like the user's own git. |
 | Failures are loud | A security tool that turns "couldn't check" into "nothing found" is worse than no tool. |
+| Cloned repositories are untrusted | Their ignore files, suppression comments and osv-scanner config are written by the party being audited. |
+| Every per-file step is linear and budgeted | One crafted file must not stall an org-wide scan or exhaust memory. |
 | Logs on stderr, reports on stdout | Reports can be piped and redirected safely. |
 | Strict config | Unknown keys are errors, so a misspelled setting can't silently do nothing. |
 
@@ -257,5 +351,5 @@ The three formats:
 | Rules | `analyzer/sast.rs` | every rule's examples and counter-examples, on every grammar it targets |
 | osv-scanner | `analyzer/sca.rs` | conversion of recorded real osv-scanner output (`tests/fixtures/osv-scanner/`), plus fake binaries for the error paths |
 | GitHub API | `github.rs` | pagination and errors against an in-process mock HTTP server |
-| End to end | `tests/cli.rs` | the real binary: exit codes, formats, exclusions, redaction, SARIF stability |
+| End to end | `tests/cli.rs` | the real binary: exit codes, formats, exclusions, redaction, SARIF stability, untrusted clones, org scans against a mock API |
 | Live | `tests/cli.rs` (ignored by default) | the real osv-scanner; run in CI with `--include-ignored` |

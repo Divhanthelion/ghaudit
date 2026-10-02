@@ -28,16 +28,49 @@ pub static RULES: &[Rule] = &[
   (#eq? @pkg "fmt")
   (#eq? @fn "Sprintf")
   (#match? @q "(?is)\\b(select\\s.+\\sfrom|insert\\s+into|update\\s.+\\sset|delete\\s+from|drop\\s+table)\\b")) @finding
+
+(call_expression
+  function: (selector_expression field: (field_identifier) @m)
+  arguments: (argument_list (identifier) @arg)
+  (#match? @m "^(Query|QueryContext|QueryRow|QueryRowContext|Exec|ExecContext|Prepare|PrepareContext|Raw)$")
+  (#bound? @arg)) @finding
 "#,
         requires: None,
+        bindings: Some(
+            r#"
+(short_var_declaration
+  left: (expression_list . (identifier) @var)
+  right: (expression_list . (binary_expression) @q)
+  (#match? @q "(?is)\\b(select\\s.+\\sfrom|insert\\s+into|update\\s.+\\sset|delete\\s+from|drop\\s+table)\\b"))
+
+(short_var_declaration
+  left: (expression_list . (identifier) @var)
+  right: (expression_list .
+    (call_expression
+      function: (selector_expression operand: (identifier) @pkg field: (field_identifier) @fn)
+      arguments: (argument_list . (interpreted_string_literal) @q)))
+  (#eq? @pkg "fmt")
+  (#eq? @fn "Sprintf")
+  (#match? @q "(?is)\\b(select\\s.+\\sfrom|insert\\s+into|update\\s.+\\sset|delete\\s+from|drop\\s+table)\\b"))
+
+(assignment_statement
+  left: (expression_list . (identifier) @var)
+  right: (expression_list . (binary_expression) @q)
+  (#match? @q "(?is)\\b(select\\s.+\\sfrom|insert\\s+into|update\\s.+\\sset|delete\\s+from|drop\\s+table)\\b"))
+"#,
+        ),
         jsx: false,
         examples: &[
             "package m\nfunc f() { db.Query(\"SELECT * FROM users WHERE id = \" + id) }",
             "package m\nfunc f() { db.QueryContext(ctx, fmt.Sprintf(\"SELECT * FROM t WHERE name = '%s'\", n)) }",
+            "package m\nfunc f(db *sql.DB, n string) {\n\tq := fmt.Sprintf(\"SELECT * FROM t WHERE name = '%s'\", n)\n\trows, err := db.QueryContext(ctx, q)\n\t_ = rows\n\t_ = err\n}",
+            "package m\nfunc f(db *sql.DB, id string) {\n\tq := \"DELETE FROM t WHERE id = \" + id\n\tif _, err := db.Exec(q); err != nil {\n\t\tpanic(err)\n\t}\n}",
         ],
         counter_examples: &[
             "package m\nfunc f() { db.Query(\"SELECT * FROM users WHERE id = $1\", id) }",
             "package m\nfunc f() { log.Exec(prefix + suffix) }",
+            "package m\nfunc f(db *sql.DB, id string) {\n\tq := \"SELECT * FROM t WHERE id = $1\"\n\tdb.Query(q, id)\n}",
+            "package m\nfunc a(n string) { q := \"SELECT * FROM t WHERE n = \" + n; _ = q }\nfunc b(db *sql.DB, q string) { db.Query(q) }",
         ],
     },
     Rule {
@@ -49,21 +82,46 @@ pub static RULES: &[Rule] = &[
         confidence: Confidence::Medium,
         cwe: &["CWE-78"],
         remediation: "Call the program directly: exec.Command(\"git\", \"clone\", url).",
+        // The program is a shell, its flag runs a command string, and that string is
+        // not a constant.
         query: r#"
 (call_expression
   function: (selector_expression operand: (identifier) @pkg field: (field_identifier) @fn)
-  arguments: (argument_list (interpreted_string_literal) @prog)
+  arguments: (argument_list
+    . (interpreted_string_literal) @prog
+    . (interpreted_string_literal) @flag
+    . [(identifier) (binary_expression) (call_expression) (selector_expression) (index_expression)])
   (#eq? @pkg "exec")
-  (#match? @fn "^Command(Context)?$")
-  (#match? @prog "^\"(sh|bash|zsh|dash|cmd|cmd\\.exe|powershell|powershell\\.exe|pwsh|/bin/sh|/bin/bash)\"$")) @finding
+  (#eq? @fn "Command")
+  (#match? @prog "^\"(sh|bash|zsh|dash|cmd|cmd\\.exe|powershell|powershell\\.exe|pwsh|/bin/sh|/bin/bash)\"$")
+  (#match? @flag "^\"(-[a-z]*c|/[cC]|-[Cc]ommand)\"$")) @finding
+
+(call_expression
+  function: (selector_expression operand: (identifier) @pkg field: (field_identifier) @fn)
+  arguments: (argument_list
+    . (_)
+    . (interpreted_string_literal) @prog
+    . (interpreted_string_literal) @flag
+    . [(identifier) (binary_expression) (call_expression) (selector_expression) (index_expression)])
+  (#eq? @pkg "exec")
+  (#eq? @fn "CommandContext")
+  (#match? @prog "^\"(sh|bash|zsh|dash|cmd|cmd\\.exe|powershell|powershell\\.exe|pwsh|/bin/sh|/bin/bash)\"$")
+  (#match? @flag "^\"(-[a-z]*c|/[cC]|-[Cc]ommand)\"$")) @finding
 "#,
         requires: None,
+        bindings: None,
         jsx: false,
         examples: &[
             "package m\nfunc f() { exec.Command(\"sh\", \"-c\", cmd).Run() }",
-            "package m\nfunc f() { exec.CommandContext(ctx, \"bash\", \"-c\", c) }",
+            "package m\nfunc f() { exec.CommandContext(ctx, \"bash\", \"-lc\", c) }",
+            "package m\nfunc f() { exec.Command(\"cmd\", \"/C\", \"dir \" + p) }",
         ],
-        counter_examples: &["package m\nfunc f() { exec.Command(\"git\", \"status\").Run() }"],
+        counter_examples: &[
+            "package m\nfunc f() { exec.Command(\"git\", \"status\").Run() }",
+            "package m\nfunc f() { exec.Command(\"git\", \"sh\").Run() }",
+            "package m\nfunc f() { exec.Command(\"bash\", \"deploy.sh\").Run() }",
+            "package m\nfunc f() { exec.Command(\"sh\", \"-c\", \"make clean\").Run() }",
+        ],
     },
     Rule {
         id: "go/tls-verification-disabled",
@@ -81,6 +139,7 @@ pub static RULES: &[Rule] = &[
   (#eq? @k "InsecureSkipVerify")) @finding
 "#,
         requires: None,
+        bindings: None,
         jsx: false,
         examples: &["package m\nvar c = &tls.Config{InsecureSkipVerify: true}"],
         counter_examples: &[
@@ -106,6 +165,7 @@ pub static RULES: &[Rule] = &[
         // Only when math/rand is imported under its own name; a file using crypto/rand
         // as `rand` must alias math/rand, so `rand.X` would not refer to it.
         requires: Some(r#"(?m)^\s*(import\s+)?"math/rand(/v2)?""#),
+        bindings: None,
         jsx: false,
         examples: &[
             "package m\nimport \"math/rand\"\nfunc token() int { return rand.Intn(1000000) }",
@@ -136,6 +196,7 @@ pub static RULES: &[Rule] = &[
   (#match? @fn "^(NewCipher|NewTripleDESCipher)$")) @finding
 "#,
         requires: Some(r#""crypto/(md5|sha1|des|rc4)""#),
+        bindings: None,
         jsx: false,
         examples: &[
             "package m\nimport \"crypto/md5\"\nfunc f(b []byte) { md5.Sum(b) }",
@@ -165,10 +226,39 @@ pub static RULES: &[Rule] = &[
   (#eq? @f "Pointer")) @finding
 "#,
         requires: Some(r#""unsafe""#),
+        bindings: None,
         jsx: false,
         examples: &[
             "package m\nimport \"unsafe\"\nfunc f(p *int) uintptr { return uintptr(unsafe.Pointer(p)) }",
         ],
         counter_examples: &["package m\nfunc f(p *int) *int { return p }"],
+    },
+    Rule {
+        id: "go/template-escape-bypass",
+        language: RuleLanguage::Go,
+        name: "html/template escaping bypassed",
+        message: "Converting a value to template.HTML (or JS, URL, CSS, ...) tells html/template it is already safe, so it is inserted without escaping. If it contains user input, this is cross-site scripting.",
+        severity: Severity::Medium,
+        confidence: Confidence::Medium,
+        cwe: &["CWE-79"],
+        remediation: "Pass plain strings to the template and let it escape them; convert only constants or sanitized HTML.",
+        query: r#"
+(call_expression
+  function: (selector_expression operand: (identifier) @pkg field: (field_identifier) @t)
+  arguments: (argument_list . [(identifier) (binary_expression) (call_expression) (selector_expression) (index_expression)])
+  (#eq? @pkg "template")
+  (#match? @t "^(HTML|HTMLAttr|JS|JSStr|URL|CSS|Srcset)$")) @finding
+"#,
+        requires: Some(r#""html/template""#),
+        bindings: None,
+        jsx: false,
+        examples: &[
+            "package m\nimport \"html/template\"\nfunc f(c string) template.HTML { return template.HTML(c) }",
+            "package m\nimport \"html/template\"\nfunc f(r *Req) any { return template.HTML(\"<b>\" + r.Name + \"</b>\") }",
+        ],
+        counter_examples: &[
+            "package m\nimport \"html/template\"\nconst logo = template.HTML(\"<svg></svg>\")",
+            "package m\nimport \"text/template\"\nfunc f(c string) any { return template.HTML(c) }",
+        ],
     },
 ];

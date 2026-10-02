@@ -56,9 +56,20 @@ impl OsvScanner {
         }
     }
 
-    /// Scan every lockfile/manifest under `root`.
-    pub async fn scan(&self, root: &Path) -> Result<ScaOutcome, String> {
+    /// Scan every lockfile/manifest under `root`. Unless `trusted`, the tree's own
+    /// `osv-scanner.toml` files (which can ignore packages and advisories) and
+    /// `.gitignore` files (which can hide lockfiles) are not honored.
+    pub async fn scan(&self, root: &Path, trusted: bool) -> Result<ScaOutcome, String> {
         let root = std::path::absolute(root).map_err(|e| e.to_string())?;
+        // `--config` replaces every per-directory osv-scanner.toml; an empty one ignores nothing.
+        let empty_config = if trusted {
+            None
+        } else {
+            let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+            let path = dir.path().join("osv-scanner.toml");
+            std::fs::write(&path, "").map_err(|e| e.to_string())?;
+            Some((dir, path))
+        };
         let mut cmd = Command::new(&self.program);
         cmd.args([
             "scan",
@@ -72,10 +83,11 @@ impl OsvScanner {
             "--format",
             "json",
         ])
-        .args(&self.extra_args)
-        .arg(&root)
-        .stdin(Stdio::null())
-        .kill_on_drop(true);
+        .args(&self.extra_args);
+        if let Some((_, config)) = &empty_config {
+            cmd.arg("--config").arg(config).arg("--no-ignore");
+        }
+        cmd.arg(&root).stdin(Stdio::null()).kill_on_drop(true);
 
         debug!("running {} on {}", self.program, root.display());
         let output = match tokio::time::timeout(self.timeout, cmd.output()).await {
@@ -813,7 +825,7 @@ mod tests {
                 ),
             );
             let outcome = OsvScanner::new(program, vec![], &[], Duration::from_secs(30))
-                .scan(&fixture_dir())
+                .scan(&fixture_dir(), true)
                 .await
                 .unwrap();
             assert_eq!(outcome.findings.len(), 15);
@@ -831,7 +843,7 @@ mod tests {
                 "echo 'could not reach api.osv.dev' >&2\nexit 127",
             );
             let err = OsvScanner::new(program, vec![], &[], Duration::from_secs(30))
-                .scan(tmp.path())
+                .scan(tmp.path(), true)
                 .await
                 .unwrap_err();
             assert!(
@@ -841,14 +853,14 @@ mod tests {
 
             let program = fake_scanner(tmp.path(), "echo 'not json'\nexit 0");
             let err = OsvScanner::new(program, vec![], &[], Duration::from_secs(30))
-                .scan(tmp.path())
+                .scan(tmp.path(), true)
                 .await
                 .unwrap_err();
             assert!(err.contains("parse"), "{err}");
 
             let program = fake_scanner(tmp.path(), "sleep 5");
             let err = OsvScanner::new(program, vec![], &[], Duration::from_millis(200))
-                .scan(tmp.path())
+                .scan(tmp.path(), true)
                 .await
                 .unwrap_err();
             assert!(err.contains("timed out"), "{err}");
@@ -862,7 +874,7 @@ mod tests {
                 "echo '{\"results\": []}'\necho 'failed resolution for requirements.txt' >&2\nexit 127",
             );
             let outcome = OsvScanner::new(program, vec![], &[], Duration::from_secs(30))
-                .scan(tmp.path())
+                .scan(tmp.path(), true)
                 .await
                 .unwrap();
             assert_eq!(
@@ -872,10 +884,41 @@ mod tests {
 
             let program = fake_scanner(tmp.path(), "echo 'API down' >&2\nexit 129");
             let err = OsvScanner::new(program, vec![], &[], Duration::from_secs(30))
-                .scan(tmp.path())
+                .scan(tmp.path(), true)
                 .await
                 .unwrap_err();
             assert!(err.contains("status 129"), "{err}");
+        }
+
+        #[tokio::test]
+        async fn untrusted_trees_cannot_configure_osv_scanner() {
+            let tmp = tempfile::tempdir().unwrap();
+            let args = tmp.path().join("args");
+            // Record the arguments, and the size of the --config file while it exists.
+            let program = fake_scanner(
+                tmp.path(),
+                &format!(
+                    "echo \"$@\" > '{0}'\nfor a; do [ -f \"$a\" ] && wc -c < \"$a\" >> '{0}'; done\necho '{{\"results\": []}}'",
+                    args.display()
+                ),
+            );
+            let scanner = OsvScanner::new(program, vec![], &[], Duration::from_secs(30));
+            scanner.scan(tmp.path(), false).await.unwrap();
+            let recorded = std::fs::read_to_string(&args).unwrap();
+            assert!(
+                recorded.contains("--config ") && recorded.contains("--no-ignore"),
+                "{recorded}"
+            );
+            assert!(
+                recorded.lines().nth(1).is_some_and(|l| l.trim() == "0"),
+                "empty config: {recorded}"
+            );
+            scanner.scan(tmp.path(), true).await.unwrap();
+            let recorded = std::fs::read_to_string(&args).unwrap();
+            assert!(
+                !recorded.contains("--config") && !recorded.contains("--no-ignore"),
+                "{recorded}"
+            );
         }
 
         #[tokio::test]
@@ -886,7 +929,7 @@ mod tests {
                 &[],
                 Duration::from_secs(5),
             )
-            .scan(Path::new("."))
+            .scan(Path::new("."), true)
             .await
             .unwrap_err();
             assert!(

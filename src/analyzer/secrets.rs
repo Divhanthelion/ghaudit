@@ -3,17 +3,18 @@
 //! Two kinds of detection:
 //! 1. **Provider patterns**: token formats with a recognizable prefix or shape
 //!    (`ghp_...`, `AKIA...`, PEM private key blocks). High confidence; they run
-//!    on every text file, tests included, because a live token in a test fixture is
-//!    still a leaked token.
+//!    on every file, binary files and tests included, because a live token in a test
+//!    fixture is still a leaked token. In tests, docs and examples they are reported
+//!    at reduced severity, since most are fakes.
 //! 2. **Generic assignments**: a value assigned to a secret-like name
 //!    (`password = "..."`, `API_KEY: ...`). Filtered hard against placeholders,
 //!    references (`${VAR}`, `process.env.X`) and identifier-like values; skipped
-//!    in test and example paths.
+//!    in test, example, docs and translation paths.
 //!
 //! Matched values never leave this module unredacted: messages and snippets show only
 //! a short prefix.
 
-use crate::model::{Category, Confidence, Finding, Location, Severity, Snippet};
+use crate::model::{Category, Confidence, Finding, LineIndex, Location, Severity, Snippet};
 use regex::{Captures, Regex};
 use std::sync::LazyLock;
 
@@ -59,21 +60,21 @@ static PROVIDERS: LazyLock<Vec<Provider>> = LazyLock::new(|| {
         provider(
             "secret/aws-secret-access-key",
             "AWS secret access key",
-            r#"(?i)aws[_\-.]?(?:secret|private)[_\-.]?(?:access[_\-.]?)?key["']?\s*(?:=|:|:=|=>)\s*["']?([A-Za-z0-9/+]{40})\b"#,
+            r#"(?i)aws[_\-.]?(?:secret|private)[_\-.]?(?:access[_\-.]?)?key["']?\s*(?:=|:|:=|=>)\s*["']?([A-Za-z0-9/+]{40})"#,
             S::Critical,
             C::High,
         ),
         provider(
             "secret/github-token",
             "GitHub token",
-            r"\b(gh[pousr]_[A-Za-z0-9]{36,251})\b",
+            r"\b(gh[pousr]_[A-Za-z0-9]{36,251})",
             S::Critical,
             C::High,
         ),
         provider(
             "secret/github-fine-grained-token",
             "GitHub fine-grained token",
-            r"\b(github_pat_[A-Za-z0-9_]{82})\b",
+            r"\b(github_pat_[A-Za-z0-9_]{82})",
             S::Critical,
             C::High,
         ),
@@ -84,6 +85,13 @@ static PROVIDERS: LazyLock<Vec<Provider>> = LazyLock::new(|| {
             // the routable format (`glpat-<payload>.<2><7>`) introduced in GitLab 17.
             r"\b((?:glpat|gldt|glrt|glcbt|glptt|glft|glffct|glimt|glagent|gloas|glsoat)-[0-9A-Za-z_\-]{20,300}(?:\.[0-9a-z]{9})?)",
             S::Critical,
+            C::High,
+        ),
+        provider(
+            "secret/gitlab-token",
+            "GitLab runner registration token",
+            r"\b(GR1348941[0-9A-Za-z_\-]{20})",
+            S::High,
             C::High,
         ),
         provider(
@@ -98,21 +106,22 @@ static PROVIDERS: LazyLock<Vec<Provider>> = LazyLock::new(|| {
         provider(
             "secret/slack-webhook",
             "Slack webhook URL",
-            r"(https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]{20,})",
+            // Incoming webhooks, and Workflow Builder webhooks and triggers.
+            r"(https://hooks\.slack\.com/(?:services/T[A-Z0-9]+/B[A-Z0-9]+|(?:workflows|triggers)/T[A-Z0-9]+/A[A-Z0-9]+/\d+)/[A-Za-z0-9]{20,})",
             S::Medium,
             C::High,
         ),
         provider(
             "secret/stripe-key",
             "Stripe live secret key",
-            r"\b((?:sk|rk)_live_[A-Za-z0-9]{24,})\b",
+            r"\b((?:sk|rk)_live_[A-Za-z0-9]{24,})",
             S::Critical,
             C::High,
         ),
         provider(
             "secret/google-api-key",
             "Google API key",
-            r"\b(AIza[0-9A-Za-z_\-]{35})\b",
+            r"\b(AIza[0-9A-Za-z_\-]{35})",
             S::High,
             C::High,
         ),
@@ -126,42 +135,53 @@ static PROVIDERS: LazyLock<Vec<Provider>> = LazyLock::new(|| {
         provider(
             "secret/anthropic-key",
             "Anthropic API key",
-            r"\b(sk-ant-(?:api|admin)\d{2}-[A-Za-z0-9_\-]{80,})",
+            // API and admin keys, and Claude OAuth access/refresh tokens.
+            r"\b(sk-ant-(?:api|admin|oat|ort)\d{2}-[A-Za-z0-9_\-]{80,})",
             S::Critical,
             C::High,
         ),
         provider(
             "secret/huggingface-token",
             "Hugging Face token",
-            r"\b(hf_[A-Za-z]{34})\b",
+            // User tokens and (legacy) organization API tokens.
+            r"\b((?:hf|api_org)_[A-Za-z]{34})",
             S::High,
             C::High,
         ),
         provider(
             "secret/npm-token",
             "npm access token",
-            r"\b(npm_[A-Za-z0-9]{36})\b",
+            r"\b(npm_[A-Za-z0-9]{36})",
+            S::Critical,
+            C::High,
+        ),
+        provider(
+            "secret/npm-token",
+            "npm registry token in .npmrc",
+            // `//registry.npmjs.org/:_authToken=...`; `${NPM_TOKEN}` references don't match.
+            r"//[^\s:]+/:_auth(?:Token)?\s*=\s*([A-Za-z0-9_\-.+/=]{20,})",
             S::Critical,
             C::High,
         ),
         provider(
             "secret/pypi-token",
             "PyPI upload token",
-            r"\b(pypi-AgEIcHlwaS5vcmc[A-Za-z0-9_\-]{50,})",
+            // pypi.org and test.pypi.org macaroons.
+            r"\b(pypi-(?:AgEIcHlwaS5vcmc|AgENdGVzdC5weXBpLm9yZw)[A-Za-z0-9_\-]{50,})",
             S::Critical,
             C::High,
         ),
         provider(
             "secret/sendgrid-key",
             "SendGrid API key",
-            r"\b(SG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43})\b",
+            r"\b(SG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43})",
             S::High,
             C::High,
         ),
         provider(
             "secret/twilio-key",
             "Twilio API key",
-            r"\b(SK[0-9a-f]{32})\b",
+            r"\b(SK[0-9a-f]{32})",
             S::High,
             C::Medium,
         ),
@@ -177,7 +197,8 @@ static PROVIDERS: LazyLock<Vec<Provider>> = LazyLock::new(|| {
             "Private key",
             // The header must be followed by key material (raw newlines or `\\n` escapes in a
             // string literal), so documentation that merely names the header is not flagged.
-            r"(-----BEGIN (?:RSA |DSA |EC |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY(?: BLOCK)?-----)(?:\r?\n|(?:\\r)?\\n)(?:[A-Za-z-]+: [^\r\n\\]*(?:\r?\n|(?:\\r)?\\n))*(?:\r?\n|(?:\\r)?\\n)?([A-Za-z0-9+/=]{40,})",
+            // Lines may be indented (YAML block scalars, heredocs).
+            r"(-----BEGIN (?:RSA |DSA |EC |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY(?: BLOCK)?-----)(?:\r?\n|(?:\\r)?\\n)(?:[ \t]*[A-Za-z-]+: [^\r\n\\]*(?:\r?\n|(?:\\r)?\\n))*(?:[ \t]*(?:\r?\n|(?:\\r)?\\n))?[ \t]*([A-Za-z0-9+/=]{40,})",
             S::Critical,
             C::High,
         ),
@@ -191,33 +212,47 @@ static PROVIDERS: LazyLock<Vec<Provider>> = LazyLock::new(|| {
         provider(
             "secret/connection-string-password",
             "Password in connection string",
-            r#"(?i)\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|rediss?|amqps?|mssql|sqlserver)://[^\s:/@'"]+:([^\s@'"/]+)@[^\s'"]+"#,
+            // The user may be empty: `redis://:password@host`.
+            r#"(?i)\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|rediss?|amqps?|mssql|sqlserver)://[^\s:/@'"]*:([^\s@'"/]+)@[^\s'"]+"#,
             S::High,
             C::High,
         ),
     ]
 });
 
-/// `name = "value"`, `"name": "value"`, `name: 'value'`, `name := "value"`, `name => 'value'`.
+/// Words that make a name secret-like.
+const SECRET_NAME: &str = r"[A-Za-z0-9_.\-]*(?:secret|passwd|password|passphrase|pwd|token|api[_\-.]?key|apikey|access[_\-.]?key|private[_\-.]?key|client[_\-.]?secret|auth[_\-.]?key|credentials?)[A-Za-z0-9_.\-]*";
+
+/// `name = "value"`, `"name": "value"`, `name: 'value'`, `name := "value"`, `name => 'value'`,
+/// `cfg["name"] = "value"`, `name: str = "value"` and `` name = `value` ``.
 static QUOTED_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?i)(?P<key>[A-Za-z0-9_.\-]*(?:secret|passwd|password|passphrase|pwd|token|api[_\-.]?key|apikey|access[_\-.]?key|private[_\-.]?key|client[_\-.]?secret|auth[_\-.]?key|credentials?)[A-Za-z0-9_.\-]*)["']?\s*(?:=|:|:=|=>)\s*(?:[rbuf]?["'])(?P<val>[^"'\s]{8,256})["']"#,
-    )
+    Regex::new(&format!(
+        r#"(?i)(?P<key>{SECRET_NAME})["'`]?\]?(?:\s*:\s*[A-Za-z_][A-Za-z0-9_.<>\[\]| ]{{0,40}}?)?\s*(?:=|:|:=|=>|\?\?=)\s*(?:[rbuf]?["'`])(?P<val>[^"'`\s]{{8,256}})["'`]"#
+    ))
     .unwrap()
 });
 
-/// Unquoted `NAME=value` / `name: value` lines, only in config-style files.
+/// Unquoted `NAME=value` / `name: value` lines (also `export`, Dockerfile `ENV`/`ARG`),
+/// only in config-style files.
 static BARE_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?im)^[ \t]*(?:export[ \t]+)?(?P<key>[A-Za-z0-9_.\-]*(?:secret|passwd|password|passphrase|pwd|token|api[_\-.]?key|apikey|access[_\-.]?key|private[_\-.]?key|client[_\-.]?secret|auth[_\-.]?key|credentials?)[A-Za-z0-9_.\-]*)[ \t]*[=:][ \t]*(?P<val>[^\s"'#;(){}\[\]<>$%,]{8,256})[ \t]*(?:#.*)?$"#,
-    )
+    Regex::new(&format!(
+        r#"(?im)^[ \t]*(?:(?:export|ENV|ARG)[ \t]+)?(?P<key>{SECRET_NAME})[ \t]*[=:][ \t]*(?P<val>[^\s"'#;(){{}}\[\]<>$%,]{{8,256}})[ \t]*(?:#.*)?$"#
+    ))
+    .unwrap()
+});
+
+/// Dockerfile `ENV NAME value` (space-separated form).
+static DOCKER_ENV: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        r#"(?im)^[ \t]*ENV[ \t]+(?P<key>{SECRET_NAME})[ \t]+(?P<val>[^\s"'#$=]{{8,256}})[ \t]*$"#
+    ))
     .unwrap()
 });
 
 /// Names that contain a secret word but describe something else (`token_url`, `max_tokens`).
 static NON_SECRET_KEY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)(tokens|tokenizer|tokenize|_?(url|uri|path|file|dir|name|names|type|header|endpoint|length|len|count|size|limit|field|param|prefix|format|mode|expiry|expires|expiration|ttl|timeout|policy|hint|label|placeholder|template|regex|pattern|id|ids|env|var|ref|arn|version|algorithm|alg|scheme|kind|style|hash|length|min|max|enabled|required|rotation|store|provider|manager|reset|confirmation|confirm)$)",
+        r"(?i)(tokens|tokenizer|tokenize|_?(url|uri|path|file|dir|name|names|type|header|endpoint|length|len|count|size|limit|field|param|prefix|format|mode|expiry|expires|expiration|ttl|timeout|policy|hint|label|placeholder|template|regex|pattern|id|ids|env|var|ref|arn|version|algorithm|alg|scheme|kind|style|hash|length|min|max|enabled|required|rotation|store|provider|manager|reset|confirmation|confirm|checksum|digest|fingerprint|sha|sha1|sha256|sha512|integrity)$)",
     )
     .unwrap()
 });
@@ -240,25 +275,77 @@ pub struct SecretScan {
     pub values: Vec<String>,
 }
 
-/// Mask every value in `values` in the snippets of `findings`.
-pub fn redact_snippets(findings: &mut [Finding], values: &[String]) {
-    if values.is_empty() {
-        return;
+/// Finds any of a file's secret values in a single pass, however many there are.
+pub struct Masker(Option<Regex>);
+
+impl Masker {
+    pub fn new(values: &[String]) -> Self {
+        let mut sorted: Vec<&str> = values
+            .iter()
+            .map(String::as_str)
+            .filter(|v| !v.is_empty())
+            .collect();
+        // Longest first, so a value that contains another is masked as a whole.
+        sorted.sort_by_key(|v| std::cmp::Reverse(v.len()));
+        sorted.dedup();
+        if sorted.is_empty() {
+            return Self(None);
+        }
+        let pattern = sorted
+            .iter()
+            .map(|v| regex::escape(v))
+            .collect::<Vec<_>>()
+            .join("|");
+        let re = regex::RegexBuilder::new(&pattern)
+            .size_limit(256 << 20)
+            .build()
+            .expect("escaped literals always compile");
+        Self(Some(re))
     }
-    // Longest first, so a value that contains another is masked as a whole.
-    let mut sorted: Vec<&String> = values.iter().collect();
-    sorted.sort_by_key(|v| std::cmp::Reverse(v.len()));
-    for f in findings {
-        if let Some(snippet) = &mut f.snippet {
-            for line in &mut snippet.lines {
-                for v in &sorted {
-                    if line.contains(v.as_str()) {
-                        *line = line.replace(v.as_str(), &redact(v));
+
+    pub fn is_match(&self, s: &str) -> bool {
+        self.0.as_ref().is_some_and(|re| re.is_match(s))
+    }
+
+    /// Each value replaced with its short redacted form (`ghp_********`).
+    pub fn redact<'a>(&self, s: &'a str) -> std::borrow::Cow<'a, str> {
+        match &self.0 {
+            Some(re) => re.replace_all(s, |c: &Captures| redact(&c[0])),
+            None => s.into(),
+        }
+    }
+
+    /// Each value replaced with `********`, revealing nothing about it.
+    pub fn mask<'a>(&self, s: &'a str) -> std::borrow::Cow<'a, str> {
+        match &self.0 {
+            Some(re) => re.replace_all(s, "********"),
+            None => s.into(),
+        }
+    }
+
+    /// Redact the values in the snippets and messages of `findings`.
+    pub fn redact_findings(&self, findings: &mut [Finding]) {
+        if self.0.is_none() {
+            return;
+        }
+        for f in findings {
+            if let Some(snippet) = &mut f.snippet {
+                for line in &mut snippet.lines {
+                    if let std::borrow::Cow::Owned(r) = self.redact(line) {
+                        *line = r;
                     }
                 }
             }
+            if let std::borrow::Cow::Owned(r) = self.redact(&f.message) {
+                f.message = r;
+            }
         }
     }
+}
+
+/// Mask every value in `values` in the snippets and messages of `findings`.
+pub fn redact_snippets(findings: &mut [Finding], values: &[String]) {
+    Masker::new(values).redact_findings(findings);
 }
 
 impl Default for SecretDetector {
@@ -298,17 +385,34 @@ impl SecretDetector {
         !SKIP_NAMES.contains(&name.as_str()) && !SKIP_SUFFIXES.iter().any(|s| name.ends_with(s))
     }
 
-    /// Find credentials in one file. `rel_path` uses `/` separators.
+    /// Find credentials in one text file. `rel_path` uses `/` separators.
     pub fn detect(&self, rel_path: &str, content: &str) -> SecretScan {
+        self.scan(rel_path, content, false)
+    }
+
+    /// Find provider credentials in a binary file's (lossily decoded) content.
+    pub fn detect_binary(&self, rel_path: &str, content: &str) -> SecretScan {
+        self.scan(rel_path, content, true)
+    }
+
+    fn scan(&self, rel_path: &str, content: &str, binary: bool) -> SecretScan {
+        let index = LineIndex::new(content);
+        let test = is_test_path(rel_path);
         let mut findings = Vec::new();
         let mut values: Vec<String> = Vec::new();
-        // Byte ranges already reported, so the generic pass does not re-report a provider token.
+        // Byte ranges already reported, so one value is reported once.
         let mut covered: Vec<(usize, usize)> = Vec::new();
+        let overlaps = |covered: &[(usize, usize)], m: &regex::Match| {
+            covered.iter().any(|&(s, e)| m.start() < e && s < m.end())
+        };
 
         for p in PROVIDERS.iter() {
             for caps in p.regex.captures_iter(content) {
                 let m = secret_group(&caps);
                 let value = m.as_str();
+                if continues_token(content, m.end()) || overlaps(&covered, &m) {
+                    continue;
+                }
                 if p.id != "secret/private-key" && is_placeholder(value) {
                     continue;
                 }
@@ -322,26 +426,43 @@ impl SecretDetector {
                     // Key material must not appear in any snippet.
                     values.push(body.as_str().to_string());
                 }
+                let mut severity = p.severity;
+                if test {
+                    // Most keys and tokens in tests and docs are fakes: report, quietly.
+                    severity = if is_key {
+                        Severity::Low
+                    } else {
+                        severity.min(Severity::Medium)
+                    };
+                }
                 let mut finding = build(
-                    content,
+                    &index,
                     rel_path,
                     m.start(),
                     value,
                     p.id,
                     p.name,
-                    p.severity,
+                    severity,
                     p.confidence,
                 );
-                if is_key {
-                    let (line, _) = position(content, m.start());
-                    finding.snippet = Snippet::around(content, line, 0)
+                if test {
+                    finding
+                        .message
+                        .push_str(" (in test, example or documentation files)");
+                }
+                if binary {
+                    finding.message.push_str(" (in a binary file)");
+                    finding.snippet = None;
+                } else if is_key {
+                    let (line, column) = index.position(m.start());
+                    finding.snippet = Snippet::from_index(&index, line, column, 0)
                         .map(|sn| sn.redact(value, &redact(value)));
                 }
                 findings.push(finding);
             }
         }
 
-        if is_test_path(rel_path) {
+        if test || binary || is_generic_exempt(rel_path) {
             redact_snippets(&mut findings, &values);
             return SecretScan { findings, values };
         }
@@ -350,22 +471,24 @@ impl SecretDetector {
                 let (Some(key), Some(val)) = (caps.name("key"), caps.name("val")) else {
                     continue;
                 };
-                if covered
-                    .iter()
-                    .any(|&(s, e)| val.start() < e && s < val.end())
+                if overlaps(&covered, &val) || NON_SECRET_KEY.is_match(key.as_str()) {
+                    continue;
+                }
+                let value = val.as_str();
+                // Hex constants and addresses, unless the name says it is a private key.
+                let hex = value.starts_with("0x") || value.starts_with("0X");
+                if (hex && !key.as_str().to_ascii_lowercase().contains("private"))
+                    || !looks_like_secret(value)
                 {
                     continue;
                 }
-                if NON_SECRET_KEY.is_match(key.as_str()) || !looks_like_secret(val.as_str()) {
-                    continue;
-                }
                 covered.push((val.start(), val.end()));
-                values.push(val.as_str().to_string());
+                values.push(value.to_string());
                 findings.push(build(
-                    content,
+                    &index,
                     rel_path,
                     val.start(),
-                    val.as_str(),
+                    value,
                     "secret/generic-assignment",
                     "Hardcoded secret",
                     Severity::Medium,
@@ -376,6 +499,7 @@ impl SecretDetector {
         generic(&QUOTED_ASSIGNMENT);
         if is_config_file(rel_path) {
             generic(&BARE_ASSIGNMENT);
+            generic(&DOCKER_ENV);
         }
         redact_snippets(&mut findings, &values);
         SecretScan { findings, values }
@@ -388,9 +512,19 @@ fn secret_group<'h>(caps: &Captures<'h>) -> regex::Match<'h> {
         .expect("group 0 always exists")
 }
 
+/// Whether the character after a match continues the token, i.e. the match is only
+/// part of a longer string. (A trailing `\b` would wrongly reject tokens that end in
+/// `-` or `_`, which Google and SendGrid keys can.)
+fn continues_token(content: &str, end: usize) -> bool {
+    content[end..]
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+' | '/'))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build(
-    content: &str,
+    index: &LineIndex,
     rel_path: &str,
     offset: usize,
     value: &str,
@@ -399,10 +533,11 @@ fn build(
     severity: Severity,
     confidence: Confidence,
 ) -> Finding {
-    let (line, column) = position(content, offset);
+    let (line, column) = index.position(offset);
     let masked = redact(value);
-    let line_text = content.lines().nth(line - 1).unwrap_or_default();
-    let snippet = Snippet::around(content, line, SNIPPET_CONTEXT).map(|s| s.redact(value, &masked));
+    let line_text = index.line(line).unwrap_or_default();
+    let snippet =
+        Snippet::from_index(index, line, column, SNIPPET_CONTEXT).map(|s| s.redact(value, &masked));
     Finding::new(
         rule_id,
         Category::Secret,
@@ -411,19 +546,13 @@ fn build(
         name,
         format!("{name} found: {masked}"),
         Location::new(rel_path, line, column).with_end(line, column + value.chars().count()),
-        &line_text.replace(value, &masked),
+        // Never derived from the value itself: a fingerprint of a short password
+        // could be brute-forced.
+        &line_text.replace(value, "********"),
     )
     .with_snippet(snippet)
     .with_cwe(["CWE-798"])
     .with_remediation(REMEDIATION)
-}
-
-/// 1-based (line, column) of a byte offset; the column counts characters, not bytes.
-fn position(content: &str, offset: usize) -> (usize, usize) {
-    let before = &content[..offset];
-    let line = before.matches('\n').count() + 1;
-    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
-    (line, before[line_start..].chars().count() + 1)
 }
 
 /// Keep a short prefix (useful to recognize the token type) and hide the rest,
@@ -438,7 +567,11 @@ pub fn redact(value: &str) -> String {
 }
 
 fn is_placeholder(value: &str) -> bool {
-    PLACEHOLDER.is_match(value) || distinct_chars(value) < 5
+    PLACEHOLDER.is_match(value) || distinct_chars(value) < 5 || {
+        // Judge a prefixed token (`GR1348941...`, `AKIA...`) by its random part.
+        let tail: Vec<char> = value.chars().rev().take(16).collect();
+        tail.len() == 16 && distinct_chars(&tail.iter().collect::<String>()) < 5
+    }
 }
 
 /// `${DB_PASSWORD}`, `$PASSWORD`, `%(pw)s`: the connection string reads it from elsewhere.
@@ -500,7 +633,9 @@ pub fn shannon_entropy(s: &str) -> f64 {
         .sum()
 }
 
-/// Tests, fixtures and examples: generic matches there are almost always fake.
+/// Tests, fixtures, examples and documentation: findings there are usually fakes or
+/// illustrations, so they are reported at reduced severity (or not at all, for
+/// generic secret matches).
 pub fn is_test_path(rel_path: &str) -> bool {
     let lower = rel_path.to_ascii_lowercase();
     let in_dir = lower.split('/').rev().skip(1).any(|seg| {
@@ -512,12 +647,19 @@ pub fn is_test_path(rel_path: &str) -> bool {
                 | "spec"
                 | "specs"
                 | "testdata"
+                | "test-data"
+                | "test_data"
                 | "fixtures"
                 | "fixture"
                 | "examples"
                 | "example"
+                | "samples"
+                | "sample"
                 | "mocks"
                 | "__mocks__"
+                | "docs"
+                | "doc"
+                | "docs_src"
         )
     });
     let name = lower.rsplit('/').next().unwrap_or(&lower);
@@ -530,7 +672,22 @@ pub fn is_test_path(rel_path: &str) -> bool {
         .any(|s| name.ends_with(s))
         || name.contains(".example") // .env.example, config.example.yml
         || name.contains(".sample")
-        || name.ends_with(".md")
+        || [".md", ".rst", ".adoc"].iter().any(|s| name.ends_with(s))
+}
+
+/// Translation catalogs: `"password": "Mot de passe"` is a label, not a password.
+fn is_generic_exempt(rel_path: &str) -> bool {
+    rel_path
+        .to_ascii_lowercase()
+        .split('/')
+        .rev()
+        .skip(1)
+        .any(|seg| {
+            matches!(
+                seg,
+                "locales" | "locale" | "i18n" | "l10n" | "translations" | "lang" | "langs"
+            )
+        })
 }
 
 fn is_config_file(rel_path: &str) -> bool {
@@ -552,10 +709,16 @@ fn is_config_file(rel_path: &str) -> bool {
             ".tfvars",
             ".npmrc",
             ".pypirc",
+            ".sh",
+            ".bash",
+            ".zsh",
+            ".envrc",
+            ".dockerfile",
         ]
         .iter()
         .any(|ext| name.ends_with(ext))
-        || name == "dockerfile"
+        || name.starts_with("dockerfile")
+        || name.starts_with("containerfile")
 }
 
 #[cfg(test)]
@@ -827,6 +990,204 @@ mod tests {
         assert!(!SecretDetector::should_scan("static/app.min.js"));
         assert!(SecretDetector::should_scan(".env"));
         assert!(SecretDetector::should_scan("config/prod.yaml"));
+    }
+
+    #[test]
+    fn tokens_ending_in_dash_or_underscore_are_found() {
+        let key = tok(&["AIza", "SyD3x9QmTz4LwR8vKp2Nc7Hj5Gf1Bd0Aex-"]);
+        assert_eq!(key.len(), 39);
+        assert_eq!(
+            ids(&detect("app.js", &format!("const k = \"{key}\";"))),
+            vec!["secret/google-api-key"]
+        );
+        // ...but not as a prefix of a longer string.
+        assert!(detect("app.js", &format!("const k = \"{key}xyz\";")).is_empty());
+    }
+
+    #[test]
+    fn newer_providers() {
+        let cases = [
+            (
+                tok(&["GR1348941", "zx9Qp2Lm7Kw4Rt8VbN3c"]),
+                "secret/gitlab-token",
+            ),
+            (
+                tok(&[
+                    "https://hooks.slack.com/workflows/",
+                    "T01ABCDEF/A02BCDEFG/123456789012345678/",
+                    "Zq8Xr3Lm7Kp2Wt9Vn4Bc6Hy1",
+                ]),
+                "secret/slack-webhook",
+            ),
+            (
+                tok(&["api_org_", "AbCdEfGhIjKlMnOpQrStUvWxYzAbCdEfGh"]),
+                "secret/huggingface-token",
+            ),
+            (
+                tok(&[
+                    "sk-ant-oat01-",
+                    &"Zq8Xr3Lm7Kp2Wt9Vn4Bc6Hy1Jd5Fs0Ga".repeat(3)[..90],
+                ]),
+                "secret/anthropic-key",
+            ),
+            (
+                tok(&["pypi-", "AgENdGVzdC5weXBpLm9yZw", &"Ab1Cd2Ef3Gh4".repeat(6)]),
+                "secret/pypi-token",
+            ),
+        ];
+        for (secret, rule) in cases {
+            assert_eq!(
+                ids(&detect("deploy.py", &format!("X = '{secret}'\n"))),
+                vec![rule],
+                "{rule}"
+            );
+        }
+        // A fixed prefix does not make a repetitive fake look random.
+        assert!(
+            detect(
+                "x.py",
+                &format!("X = '{}'", tok(&["GR1348941", "12312312312312312312"]))
+            )
+            .is_empty()
+        );
+        let npmrc = tok(&[
+            "//registry.npmjs.org/:_authToken=",
+            "a1b2c3d4-e5f6-4789-abcd-ef0123456789",
+        ]);
+        assert_eq!(ids(&detect(".npmrc", &npmrc)), vec!["secret/npm-token"]);
+        assert!(detect(".npmrc", "//registry.npmjs.org/:_authToken=${NPM_TOKEN}").is_empty());
+    }
+
+    #[test]
+    fn more_assignment_shapes() {
+        let pw = "Tr0ub4dor&3xq";
+        for (path, line) in [
+            ("app.py", format!("config[\"password\"] = \"{pw}\"")),
+            ("app.py", format!("password: str = \"{pw}\"")),
+            ("app.ts", format!("const password: string = \"{pw}\";")),
+            ("app.js", format!("const password = `{pw}`;")),
+            ("deploy.sh", format!("export DB_PASSWORD={pw}")),
+            ("Dockerfile", format!("ENV DB_PASSWORD={pw}")),
+            ("Dockerfile", format!("ENV DB_PASSWORD {pw}")),
+            ("build/Dockerfile.prod", format!("ARG API_TOKEN={pw}")),
+        ] {
+            assert_eq!(
+                ids(&detect(path, &line)),
+                vec!["secret/generic-assignment"],
+                "{path}: {line}"
+            );
+        }
+        let redis = tok(&[
+            "REDIS_URL = \"redis://:",
+            "Sup3rS3cretPw",
+            "@cache:6379/0\"",
+        ]);
+        assert_eq!(
+            ids(&detect("app.py", &redis)),
+            vec!["secret/connection-string-password"]
+        );
+    }
+
+    #[test]
+    fn indented_private_keys() {
+        let body = "MIIEowIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo4lgOEePzNm0tRgeLezV6ffAt0gun";
+        let yaml = tok(&[
+            "tls:\n  key: |\n    -----BEGIN ",
+            "RSA PRIVATE KEY-----\n    ",
+            body,
+            "\n    -----END RSA PRIVATE KEY-----\n",
+        ]);
+        let found = detect("deploy/values.yaml", &yaml);
+        assert_eq!(ids(&found), vec!["secret/private-key"]);
+        assert!(!serde_json::to_string(&found).unwrap().contains(body));
+    }
+
+    #[test]
+    fn tests_and_docs_are_reported_at_lower_severity() {
+        let gh = tok(&["ghp_", "R8d2kLq9ZxT4mWn7Bv1Cy6Pa3Hs5Je0Fu2Gk"]);
+        let f = detect(
+            "docs/api.md",
+            &format!("curl -H 'Authorization: token {gh}'"),
+        );
+        assert_eq!(
+            (f[0].rule_id.as_str(), f[0].severity),
+            ("secret/github-token", Severity::Medium)
+        );
+        assert!(f[0].message.contains("test, example or documentation"));
+        let key = tok(&[
+            "-----BEGIN ",
+            "PRIVATE KEY-----\n",
+            "MIIEowIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo4lgOEePzNm0tRgeLezV6ffAt0gun",
+            "\n",
+        ]);
+        assert_eq!(
+            detect("tests/data/key.pem", &key)[0].severity,
+            Severity::Low
+        );
+        assert_eq!(
+            detect("deploy/key.pem", &key)[0].severity,
+            Severity::Critical
+        );
+    }
+
+    #[test]
+    fn generic_false_positive_shapes() {
+        for (path, line) in [
+            ("app.py", "private_key_checksum = \"9f2c4e1b7a3d5f60\""),
+            (
+                "app.js",
+                "const tokenAddress = \"0x6B175474E89094C44Da98b954EedeAC495271d0F\";",
+            ),
+            (
+                "app.py",
+                "token_sha256 = \"3f9a1c5e7b2d4f6081a3c5e7b9d1f3a5\"",
+            ),
+            ("web/locales/fr.json", "\"password\": \"Mot-de-passe9\""),
+        ] {
+            assert!(detect(path, line).is_empty(), "{path}: {line}");
+        }
+        // A private key in hex is still a private key.
+        let eth = tok(&[
+            "private_key = \"0x",
+            "4c0883a69102937d6231471b5dbb6204fe512961708279f2e3e8a5d4b8e3e2ab\"",
+        ]);
+        assert_eq!(
+            ids(&detect("deploy.py", &eth)),
+            vec!["secret/generic-assignment"]
+        );
+    }
+
+    #[test]
+    fn binary_files_get_provider_patterns_only() {
+        let gh = tok(&["ghp_", "R8d2kLq9ZxT4mWn7Bv1Cy6Pa3Hs5Je0Fu2Gk"]);
+        let content = format!("\n\n\x01\x02 {gh} \npassword = \"Tr0ub4dor&3xq\"");
+        let f = SecretDetector::new()
+            .detect_binary("assets/app.bin", &content)
+            .findings;
+        assert_eq!(ids(&f), vec!["secret/github-token"]);
+        assert!(f[0].message.contains("binary"));
+        assert!(f[0].snippet.is_none());
+    }
+
+    #[test]
+    fn fingerprints_do_not_depend_on_the_secret() {
+        let a = detect("app.py", "password = \"Tr0ub4dor&3xq\"\n");
+        let b = detect("app.py", "password = \"Zx9Qp2Lm7Kw4!\"\n");
+        assert_eq!(a[0].fingerprint, b[0].fingerprint);
+    }
+
+    #[test]
+    fn masker_handles_overlaps_and_many_values() {
+        let m = Masker::new(&["abcdefghijklmnopq".into(), "abcdefgh".into()]);
+        assert_eq!(
+            m.mask("x abcdefghijklmnopq y abcdefgh"),
+            "x ******** y ********"
+        );
+        assert_eq!(m.redact("abcdefghijklmnopq"), "abcd********");
+        let many: Vec<String> = (0..20_000).map(|i| format!("tok{i:08}x")).collect();
+        let m = Masker::new(&many);
+        assert!(m.is_match("... tok00019999x ..."));
+        assert!(!Masker::new(&[]).is_match("anything"));
     }
 
     #[test]
