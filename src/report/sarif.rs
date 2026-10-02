@@ -10,7 +10,7 @@
 //!   instead of being closed and re-opened on every upload.
 //! - `security-severity` is what GitHub uses to label alerts critical/high/medium/low.
 
-use crate::model::{AnalyzerState, Finding, ScanReport, Severity};
+use crate::model::{AnalyzerState, Category, Finding, ScanReport, Severity};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
@@ -54,6 +54,11 @@ fn security_severity(f: &Finding) -> String {
 }
 
 fn uri(f: &Finding) -> String {
+    // A setting has no file. GitHub code scanning needs a location anyway; this is the
+    // placeholder OpenSSF Scorecard uses for the same situation.
+    if f.category == Category::Settings {
+        return "no file associated with this alert".to_string();
+    }
     let path = match &f.repository {
         Some(repo) => format!("{repo}/{}", f.location.path),
         None => f.location.path.clone(),
@@ -117,6 +122,8 @@ fn rule(f: &Finding) -> Value {
     }
     if let Some(dep) = &f.dependency {
         rule["helpUri"] = json!(dep.url);
+    } else if let Some(url) = &f.help_url {
+        rule["helpUri"] = json!(url);
     }
     rule
 }
@@ -137,8 +144,22 @@ fn result(f: &Finding, rule_index: usize) -> Value {
         region["snippet"] = json!({ "text": text });
     }
     let mut message = f.message.clone();
+    if let (Category::Settings, Some(repo)) = (f.category, &f.repository) {
+        message = format!("{repo}: {message}");
+    }
     if let Some(fix) = &f.remediation {
         message = format!("{message}\nFix: {fix}");
+    }
+    if let (Category::Settings, Some(url)) = (f.category, &f.help_url) {
+        message = format!("{message}\nSettings: {url}");
+    }
+    let mut properties = json!({
+        "category": f.category.label(),
+        "severity": f.severity.as_str(),
+        "confidence": f.confidence.to_string(),
+    });
+    if let Some(commit) = &f.commit {
+        properties["commit"] = json!(commit);
     }
     json!({
         "ruleId": f.rule_id,
@@ -155,11 +176,7 @@ fn result(f: &Finding, rule_index: usize) -> Value {
         // Our own key: GitHub's upload action computes primaryLocationLineHash itself and
         // warns when a supplied value differs from its own.
         "partialFingerprints": { "ghaudit/v1": f.fingerprint },
-        "properties": {
-            "category": f.category.label(),
-            "severity": f.severity.as_str(),
-            "confidence": f.confidence.to_string(),
-        }
+        "properties": properties,
     })
 }
 
@@ -294,6 +311,40 @@ mod tests {
                     .contains('\\')
             );
         }
+    }
+
+    #[test]
+    fn settings_results_have_a_placeholder_location_and_a_link() {
+        let mut r = ScanReport::new("o/r");
+        let mut f = Finding::new(
+            "settings/webhook-no-secret",
+            Category::Settings,
+            Severity::Medium,
+            Confidence::High,
+            "Webhook without a secret",
+            "m",
+            Location::new("settings/hooks", 1, 1),
+            "x",
+        );
+        f.help_url = Some("https://github.com/o/r/settings/hooks".into());
+        r.findings.push(f);
+        r.finalize(Severity::Low);
+        let sarif = to_sarif(&r);
+        let res = &sarif["runs"][0]["results"][0];
+        assert_eq!(
+            res["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
+            "no file associated with this alert"
+        );
+        assert!(
+            res["message"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("settings/hooks")
+        );
+        assert_eq!(
+            sarif["runs"][0]["tool"]["driver"]["rules"][0]["helpUri"],
+            "https://github.com/o/r/settings/hooks"
+        );
     }
 
     #[test]

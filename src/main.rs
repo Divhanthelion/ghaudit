@@ -2,7 +2,7 @@
 
 use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use ghaudit::analyzer::{rules, workflows};
+use ghaudit::analyzer::{agents, rules, settings, workflows};
 use ghaudit::config::{Config, FailOn, SUPPORTED_LANGUAGES, TrustRepo};
 use ghaudit::model::{ScanReport, Severity};
 use ghaudit::report::{self, Format};
@@ -134,6 +134,19 @@ struct ScanArgs {
     #[arg(long)]
     no_workflows: bool,
 
+    /// Skip checks of committed AI-agent and editor configuration
+    #[arg(long)]
+    no_agents: bool,
+
+    /// Skip the repository and organization settings audit (GitHub API)
+    #[arg(long)]
+    no_settings: bool,
+
+    /// Also search every commit for credentials removed from the current files
+    /// (repositories are cloned with full history)
+    #[arg(long)]
+    history: bool,
+
     /// Also ask a local LLM to review source files (OpenAI-compatible endpoint, e.g. LM Studio)
     #[arg(long)]
     ai: bool,
@@ -157,6 +170,10 @@ struct ScanArgs {
     /// Exit with status 1 if a finding is at or above this severity [default: high; or never]
     #[arg(long, value_name = "SEVERITY")]
     fail_on: Option<FailOn>,
+
+    /// Report only findings that are not in this earlier JSON report (`-f json -o FILE`)
+    #[arg(long, value_name = "FILE")]
+    baseline: Option<PathBuf>,
 
     /// Honor the scanned repository's own .gitignore, ghaudit:ignore comments and
     /// osv-scanner.toml, even for cloned repositories [default: only for local directories]
@@ -287,8 +304,19 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
     // Fail on an unwritable output path now, not after a long scan.
     let output = g.output.as_deref().map(prepare_output).transpose()?;
 
+    // Read the baseline now, so a bad path fails before a long scan.
+    let baseline = config
+        .report
+        .baseline
+        .as_deref()
+        .map(load_baseline)
+        .transpose()?;
+
     let scanner = Scanner::new(config)?.with_progress(!g.quiet);
-    let report = scanner.scan(&target).await?;
+    let mut report = scanner.scan(&target).await?;
+    if let Some(baseline) = &baseline {
+        report.apply_baseline(baseline);
+    }
 
     match output {
         Some((file, path)) => {
@@ -300,6 +328,18 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
     }
 
     Ok(exit_code(&report, fail_on))
+}
+
+fn load_baseline(path: &Path) -> anyhow::Result<ScanReport> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("cannot read baseline {}", path.display()))?;
+    serde_json::from_str(&text).with_context(|| {
+        format!(
+            "{} is not a ghaudit JSON report (create one with -f json -o {})",
+            path.display(),
+            path.display()
+        )
+    })
 }
 
 fn exit_code(report: &ScanReport, fail_on: FailOn) -> u8 {
@@ -328,6 +368,9 @@ fn apply_scan_args(config: &mut Config, scan: ScanArgs, multi: MultiArgs) -> any
     a.secrets &= !scan.no_secrets;
     a.sca &= !scan.no_sca;
     a.workflows &= !scan.no_workflows;
+    a.agents &= !scan.no_agents;
+    a.settings &= !scan.no_settings;
+    a.history |= scan.history;
     a.ai |= scan.ai;
     if let Some(langs) = scan.languages {
         a.languages = langs
@@ -345,6 +388,9 @@ fn apply_scan_args(config: &mut Config, scan: ScanArgs, multi: MultiArgs) -> any
     }
     if let Some(f) = scan.fail_on {
         config.report.fail_on = f;
+    }
+    if let Some(b) = scan.baseline {
+        config.report.baseline = Some(b);
     }
     if scan.trust_repo {
         config.analysis.trust_repo = TrustRepo::Always;
@@ -365,6 +411,8 @@ fn apply_scan_args(config: &mut Config, scan: ScanArgs, multi: MultiArgs) -> any
         || config.analysis.secrets
         || config.analysis.sca
         || config.analysis.workflows
+        || config.analysis.agents
+        || config.analysis.settings
         || config.analysis.ai)
     {
         bail!("every analyzer is disabled; nothing to do");
@@ -426,21 +474,46 @@ fn print_rules(format: Format) -> anyhow::Result<()> {
         json.extend(workflows::RULES.iter().map(|r| {
             serde_json::json!({ "id": r.id, "kind": "workflow", "name": r.name, "severity": r.severity })
         }));
+        json.extend(agents::RULES.iter().map(|r| {
+            serde_json::json!({ "id": r.id, "kind": "agent", "name": r.name, "severity": r.severity })
+        }));
+        json.extend(settings::RULES.iter().map(|r| {
+            serde_json::json!({ "id": r.id, "kind": "settings", "name": r.name, "severity": r.severity })
+        }));
         println!("{}", serde_json::to_string_pretty(&json)?);
         return Ok(());
     }
-    println!("{:<34} {:<9} NAME", "RULE", "SEVERITY");
-    for r in &code {
-        println!("{:<34} {:<9} {}", r.id, r.severity.as_str(), r.name);
-    }
-    for r in workflows::RULES {
-        println!("{:<34} {:<9} {}", r.id, r.severity.as_str(), r.name);
+    let rows: Vec<(&str, &str, &str)> = code
+        .iter()
+        .map(|r| (r.id, r.severity.as_str(), r.name))
+        .chain(
+            workflows::RULES
+                .iter()
+                .map(|r| (r.id, r.severity.as_str(), r.name)),
+        )
+        .chain(
+            agents::RULES
+                .iter()
+                .map(|r| (r.id, r.severity.as_str(), r.name)),
+        )
+        .chain(
+            settings::RULES
+                .iter()
+                .map(|r| (r.id, r.severity.as_str(), r.name)),
+        )
+        .collect();
+    let width = rows.iter().map(|(id, _, _)| id.len()).max().unwrap_or(4);
+    println!("{:<width$} {:<9} NAME", "RULE", "SEVERITY");
+    for (id, severity, name) in rows {
+        println!("{id:<width$} {severity:<9} {name}");
     }
     println!(
-        "\n{} code rules for {}, {} GitHub Actions workflow checks. Secret, dependency and hidden-Unicode checks are described in the README.",
+        "\n{} code rules for {}, {} GitHub Actions workflow checks, {} agent-config checks, {} settings checks. Secret, dependency and hidden-Unicode checks are described in the README.",
         code.len(),
         SUPPORTED_LANGUAGES.join(", "),
-        workflows::RULES.len()
+        workflows::RULES.len(),
+        agents::RULES.len(),
+        settings::RULES.len()
     );
     Ok(())
 }

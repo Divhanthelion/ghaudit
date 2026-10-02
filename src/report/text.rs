@@ -1,7 +1,7 @@
 //! Human-readable terminal report.
 
 use super::terminal_safe as safe;
-use crate::model::{AnalyzerState, Category, Finding, ScanReport, Severity};
+use crate::model::{AnalyzerState, Category, CheckStatus, Finding, ScanReport, Severity};
 use std::fmt::Write;
 
 pub struct TextOptions {
@@ -98,13 +98,25 @@ fn write_finding(out: &mut String, s: &Style, f: &Finding) {
         s.dim(&format!("[{}]", safe(&f.rule_id)))
     );
     let loc = &f.location;
-    let _ = writeln!(
-        out,
-        "{INDENT}  {}:{}:{}",
-        safe(&loc.path),
-        loc.start_line,
-        loc.start_column
-    );
+    match (&f.category, &f.help_url) {
+        (Category::Settings, Some(url)) => {
+            let _ = writeln!(out, "{INDENT}  {}", safe(url));
+        }
+        _ => {
+            let commit = f
+                .commit
+                .as_deref()
+                .map(|c| format!(" in commit {}", safe(&c[..c.len().min(12)])))
+                .unwrap_or_default();
+            let _ = writeln!(
+                out,
+                "{INDENT}  {}:{}:{}{commit}",
+                safe(&loc.path),
+                loc.start_line,
+                loc.start_column
+            );
+        }
+    }
 
     if let Some(snippet) = &f.snippet {
         let width = (snippet.first_line + snippet.lines.len()).to_string().len();
@@ -163,6 +175,8 @@ fn write_summary(out: &mut String, s: &Style, report: &ScanReport) {
         Category::Secret,
         Category::Dependency,
         Category::Workflow,
+        Category::Agent,
+        Category::Settings,
         Category::Ai,
     ]
     .iter()
@@ -203,8 +217,25 @@ fn write_summary(out: &mut String, s: &Style, report: &ScanReport) {
             );
         }
     }
+    if !report.settings.is_empty() {
+        let n = |st| report.settings.iter().filter(|c| c.status == st).count();
+        let unknown = n(CheckStatus::NotAssessable);
+        let mut line = format!(
+            "{} passed, {} failed, {unknown} not assessable",
+            n(CheckStatus::Pass),
+            n(CheckStatus::Fail)
+        );
+        if unknown > 0 {
+            line.push_str(" (the token cannot see them; details in -f json)");
+        }
+        let _ = writeln!(out, "{} {line}", s.bold("Settings:"));
+    }
     let stats = &report.stats;
-    if stats.files_skipped > 0 || stats.findings_omitted > 0 || stats.findings_suppressed > 0 {
+    if stats.files_skipped > 0
+        || stats.findings_omitted > 0
+        || stats.findings_suppressed > 0
+        || stats.findings_baselined > 0
+    {
         let mut notes = Vec::new();
         if stats.files_skipped > 0 {
             let shown: Vec<String> = report
@@ -229,6 +260,12 @@ fn write_summary(out: &mut String, s: &Style, report: &ScanReport) {
                 "{} repeated findings omitted (over {} per rule and file)",
                 stats.findings_omitted,
                 crate::scanner::MAX_PER_RULE_AND_FILE
+            ));
+        }
+        if stats.findings_baselined > 0 {
+            notes.push(format!(
+                "{} findings already in the baseline not shown",
+                stats.findings_baselined
             ));
         }
         if stats.findings_suppressed > 0 {
@@ -383,6 +420,37 @@ mod tests {
         let out = render(&r, &TextOptions { color: false });
         assert!(out.contains("1 files not fully analyzed (big.js)"), "{out}");
         assert!(out.contains("40 repeated findings omitted"), "{out}");
+    }
+
+    #[test]
+    fn settings_findings_link_to_the_settings_page() {
+        let mut r = ScanReport::new("o/r");
+        let mut f = Finding::new(
+            "settings/default-branch-unprotected",
+            Category::Settings,
+            Severity::High,
+            Confidence::High,
+            "Default branch has no protection",
+            "m",
+            Location::new("settings/rules", 1, 1),
+            "x",
+        );
+        f.help_url = Some("https://github.com/o/r/settings/rules".into());
+        r.findings.push(f);
+        r.settings.push(crate::model::SettingsCheck {
+            target: "o/r".into(),
+            check: "settings/webhook-no-secret".into(),
+            status: CheckStatus::NotAssessable,
+            detail: None,
+        });
+        r.finalize(Severity::Low);
+        let out = render(&r, &TextOptions { color: false });
+        assert!(
+            out.contains("https://github.com/o/r/settings/rules"),
+            "{out}"
+        );
+        assert!(!out.contains("settings/rules:1:1"));
+        assert!(out.contains("Settings: 0 passed, 0 failed, 1 not assessable"));
     }
 
     #[test]

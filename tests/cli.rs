@@ -114,8 +114,11 @@ fn json_report_finds_issues_and_skips_ignored_paths() {
         vec![
             ("sast", "completed"),
             ("secrets", "completed"),
+            ("history", "skipped"),
             ("sca", "skipped"),
             ("workflows", "completed"),
+            ("agents", "completed"),
+            ("settings", "skipped"),
             ("ai", "skipped")
         ]
     );
@@ -409,6 +412,8 @@ fn usage_errors_exit_2() {
             "--no-sca",
             "--no-secrets",
             "--no-workflows",
+            "--no-agents",
+            "--no-settings",
         ])
         .assert()
         .code(2);
@@ -454,11 +459,13 @@ fn real_osv_scanner_reports_known_vulnerabilities() {
         "-f",
         "json",
     ]);
-    assert_eq!(
-        report["analyzers"][2]["state"], "completed",
-        "{:#}",
-        report["analyzers"]
-    );
+    let sca = report["analyzers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["analyzer"] == "sca")
+        .unwrap();
+    assert_eq!(sca["state"], "completed", "{:#}", report["analyzers"]);
     assert_eq!(code, 1);
     let advisories: Vec<&str> = report["findings"]
         .as_array()
@@ -608,6 +615,89 @@ fn cloned_repositories_cannot_hide_findings_from_the_scan() {
 }
 
 #[test]
+fn history_finds_credentials_removed_from_the_files() {
+    if !has_git() {
+        return;
+    }
+    let serve = tempfile::tempdir().unwrap();
+    let repo = serve.path().join("acme/leaky.git");
+    write(&repo, "config.py", &format!("KEY = \"{}\"\n", stripe_key()));
+    commit_all(&repo);
+    write(&repo, "config.py", "import os\nKEY = os.environ[\"KEY\"]\n");
+    let out = std::process::Command::new("git")
+        .args(["commit", "-q", "-am", "remove key", "--no-gpg-sign"])
+        .current_dir(&repo)
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@example.com")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@example.com")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let config = serve.path().join("ghaudit.toml");
+    fs::write(
+        &config,
+        format!("[github]\napi_url = \"{}\"\n", file_url(serve.path())),
+    )
+    .unwrap();
+    let cfg = config.to_str().unwrap();
+    let history = |report: &Value| {
+        report["analyzers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["analyzer"] == "history")
+            .unwrap()
+            .clone()
+    };
+
+    let (report, code) = json_report(&["scan", "acme/leaky", "-c", cfg, "--no-sca", "-f", "json"]);
+    assert!(rule_ids(&report).is_empty());
+    assert_eq!(code, 0);
+    assert_eq!(history(&report)["state"], "skipped");
+
+    let out = ghaudit()
+        .args([
+            "scan",
+            "acme/leaky",
+            "-c",
+            cfg,
+            "--no-sca",
+            "--history",
+            "-f",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains(&stripe_key()));
+    let report: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(rule_ids(&report), vec!["secret/stripe-key"]);
+    let f = &report["findings"][0];
+    assert_eq!(f["location"]["path"], "config.py");
+    assert_eq!(f["location"]["start_line"], 1);
+    assert_eq!(f["commit"].as_str().map(str::len), Some(40));
+    assert_ne!(f["commit"], report["commit"], "added before HEAD");
+    assert_eq!(history(&report)["state"], "completed");
+    assert_eq!(history(&report)["detail"], "searched 2 commits");
+
+    ghaudit()
+        .args(["scan", "acme/leaky", "-c", cfg, "--no-sca", "--history"])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("in git history"))
+        .stdout(predicate::str::contains("config.py:1:8 in commit"))
+        .stdout(predicate::str::contains(stripe_key()).not());
+
+    ghaudit()
+        .args(["scan", "acme/leaky", "-c", cfg, "--history", "--no-secrets"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("needs the secrets analyzer"));
+}
+
+#[test]
 fn local_directories_are_trusted_unless_told_otherwise() {
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), ".gitignore", "local.env\n");
@@ -683,6 +773,7 @@ fn org_scans_report_every_repository_with_progress() {
             "-c",
             config.to_str().unwrap(),
             "--no-sca",
+            "--no-settings", // covered by org_scans_audit_settings_and_agent_configs
             "--fail-on",
             "never",
             "-f",
@@ -749,4 +840,217 @@ fn urls_on_other_hosts_are_not_scanned_as_github_repositories() {
         .assert()
         .code(2)
         .stderr(predicate::str::contains("gitlab.com is not github.com"));
+}
+
+#[test]
+fn baseline_reports_and_gates_only_new_findings() {
+    let dir = project();
+    let path = dir.path().to_str().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let baseline = out.path().join("baseline.json");
+    ghaudit()
+        .args([
+            "scan",
+            path,
+            "--no-sca",
+            "-f",
+            "json",
+            "-o",
+            baseline.to_str().unwrap(),
+        ])
+        .assert()
+        .code(1);
+    // Nothing new: clean exit even though old high/critical findings remain.
+    let (report, code) = json_report(&[
+        "scan",
+        path,
+        "--no-sca",
+        "-f",
+        "json",
+        "--baseline",
+        baseline.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0);
+    assert!(rule_ids(&report).is_empty());
+    assert_eq!(report["stats"]["findings_baselined"], 3);
+    // A new issue, plus an old one moved down a line, is reported alone.
+    write(
+        dir.path(),
+        "app/db.py",
+        "import os\n\ndef find(cur, name):\n    cur.execute(f\"SELECT * FROM users WHERE name = '{name}'\")\n\ndef run(c):\n    os.system(c)\n",
+    );
+    let (report, code) = json_report(&[
+        "scan",
+        path,
+        "--no-sca",
+        "-f",
+        "json",
+        "--baseline",
+        baseline.to_str().unwrap(),
+    ]);
+    assert_eq!(rule_ids(&report), vec!["python/os-command"]);
+    assert_eq!(code, 1);
+    // A bad baseline fails before scanning.
+    ghaudit()
+        .args(["scan", path, "--baseline", "/no/such/baseline.json"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("cannot read baseline"));
+}
+
+/// Serve fixed JSON responses: each route is (path, or path-and-query prefix when it
+/// contains `?`; status; body). Unknown paths get 404.
+fn mock_routes(routes: Vec<(&'static str, u16, String)>) -> String {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap_or(0);
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 2 {
+                line.clear();
+            }
+            let target = request_line.split(' ').nth(1).unwrap_or_default();
+            let path = target.split('?').next().unwrap_or_default();
+            let (status, body) = routes
+                .iter()
+                .find(|(r, _, _)| *r == path || (r.contains('?') && target.starts_with(r)))
+                .map(|(_, s, b)| (*s, b.clone()))
+                .unwrap_or((404, r#"{"message": "Not Found"}"#.to_string()));
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    format!("http://{addr}")
+}
+
+#[test]
+fn org_scans_audit_settings_and_agent_configs() {
+    if !has_git() {
+        return;
+    }
+    let repos = tempfile::tempdir().unwrap();
+    let app = repos.path().join("app");
+    write(&app, "README.md", "hello\n");
+    write(
+        &app,
+        ".vscode/settings.json",
+        "{\n  // team settings\n  \"chat.tools.autoApprove\": true,\n}\n",
+    );
+    commit_all(&app);
+    let list = serde_json::json!([{ "full_name": "acme/app", "clone_url": file_url(&app) }]);
+    let owner_only = r#"{"message": "Must be an organization owner"}"#.to_string();
+    let api = mock_routes(vec![
+        ("/orgs/acme/repos", 200, list.to_string()),
+        (
+            "/orgs/acme",
+            200,
+            r#"{"login": "acme", "two_factor_requirement_enabled": false, "default_repository_permission": "read"}"#.into(),
+        ),
+        ("/orgs/acme/members?filter=2fa_disabled", 200, "[]".into()),
+        ("/orgs/acme/members", 403, owner_only.clone()),
+        ("/orgs/acme/actions/permissions", 403, owner_only.clone()),
+        ("/orgs/acme/actions/permissions/workflow", 403, owner_only.clone()),
+        ("/orgs/acme/hooks", 403, owner_only),
+        (
+            "/repos/acme/app",
+            200,
+            r#"{"default_branch": "main", "private": false, "permissions": {"admin": true}, "security_and_analysis": null}"#.into(),
+        ),
+        ("/repos/acme/app/branches/main", 200, r#"{"name": "main", "protected": false}"#.into()),
+        ("/repos/acme/app/rules/branches/main", 200, "[]".into()),
+        (
+            "/repos/acme/app/actions/permissions/workflow",
+            200,
+            r#"{"default_workflow_permissions": "write", "can_approve_pull_request_reviews": false}"#.into(),
+        ),
+        (
+            "/repos/acme/app/hooks",
+            200,
+            r#"[{"id": 1, "active": true, "config": {"url": "https://ci.example/hook", "insecure_ssl": "1", "secret": "********"}}]"#.into(),
+        ),
+    ]);
+    let config = repos.path().join("ghaudit.toml");
+    fs::write(&config, format!("[github]\napi_url = \"{api}\"\n")).unwrap();
+    let out = ghaudit()
+        .args([
+            "org",
+            "acme",
+            "-c",
+            config.to_str().unwrap(),
+            "--no-sca",
+            "-f",
+            "json",
+            "--token",
+            "test-token",
+        ])
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stderr)));
+    let ids = rule_ids(&report);
+    for expected in [
+        "agent/auto-approve",
+        "settings/org-2fa-not-required",
+        "settings/default-branch-unprotected",
+        "settings/actions-default-token-write",
+        "settings/webhook-insecure-ssl",
+        "settings/dependabot-alerts-disabled",
+    ] {
+        assert!(
+            ids.iter().any(|i| i == expected),
+            "{expected} missing from {ids:?}"
+        );
+    }
+    assert!(
+        !ids.iter().any(|i| i == "settings/webhook-no-secret"),
+        "{ids:?}"
+    );
+    let settings = report["settings"].as_array().unwrap();
+    let status_of = |target: &str, check: &str| {
+        settings
+            .iter()
+            .find(|c| c["target"] == target && c["check"] == check)
+            .map(|c| c["status"].as_str().unwrap().to_string())
+    };
+    assert_eq!(
+        status_of("org:acme", "settings/org-members-without-2fa").as_deref(),
+        Some("pass")
+    );
+    assert_eq!(
+        status_of("org:acme", "settings/org-actions-default-token-write").as_deref(),
+        Some("not_assessable")
+    );
+    assert_eq!(
+        status_of("acme/app", "settings/deploy-key-write").as_deref(),
+        Some("not_assessable")
+    );
+    let settings_status = report["analyzers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["analyzer"] == "settings")
+        .unwrap();
+    assert_eq!(settings_status["state"], "completed", "{settings_status}");
+    // Org findings are not attributed to a repository; repository findings are.
+    let f = |rule: &str| {
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["rule_id"] == rule)
+            .unwrap()
+            .clone()
+    };
+    assert!(f("settings/org-2fa-not-required")["repository"].is_null());
+    assert_eq!(f("settings/webhook-insecure-ssl")["repository"], "acme/app");
+    assert_eq!(f("agent/auto-approve")["location"]["start_line"], 3);
+    assert_eq!(out.status.code(), Some(1));
 }

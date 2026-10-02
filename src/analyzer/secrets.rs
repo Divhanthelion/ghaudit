@@ -257,10 +257,11 @@ static NON_SECRET_KEY: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
-/// Values that are clearly not real credentials.
+/// Values that are clearly not real credentials. Keyboard and counting runs
+/// (`12345`, `abcdef`, `a1b2c3`) are as good as absent from random tokens.
 static PLACEHOLDER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)(example|sample|dummy|changeme|change_me|change-me|replace|your[_\-]?|placeholder|redacted|insert|fake|mock|todo|tbd|xxxx|\*\*\*|\.\.\.|<|>|\$\{|\{\{|%\(|\$\(|process\.env|os\.environ|getenv|env\(|^none$|^null$|^nil$|^undefined$|^true$|^false$|^password$|^secret$|^token$)",
+        r"(?i)(12345|23456|34567|45678|56789|67890|abcdef|a1b2c3|qwerty|example|sample|dummy|changeme|change_me|change-me|replace|your[_\-]?|placeholder|redacted|insert|fake|mock|todo|tbd|xxxx|\*\*\*|\.\.\.|<|>|\$\{|\{\{|%\(|\$\(|process\.env|os\.environ|getenv|env\(|^none$|^null$|^nil$|^undefined$|^true$|^false$|^password$|^secret$|^token$)",
     )
     .unwrap()
 });
@@ -776,7 +777,7 @@ mod tests {
             (
                 tok(&[
                     "github_pat_",
-                    "11ABCDEFG0123456789abc_",
+                    "11BQ7XKMA0rT4wZp8nLs2v_",
                     &"aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3zA5bC7dE9fG1hJ3kL5mN7pQ9rS1tU3"[..59],
                 ]),
                 "secret/github-fine-grained-token",
@@ -803,11 +804,11 @@ mod tests {
                 "secret/anthropic-key",
             ),
             (
-                tok(&["npm_", "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"]),
+                tok(&["npm_", "q7Rk2Lm9Pt4Tz8Wn3Vb6Hy1Jd5Fs0GaXc4Eu"]),
                 "secret/npm-token",
             ),
             (
-                tok(&["hf_", "AbCdEfGhIjKlMnOpQrStUvWxYzAbCdEfGh"]),
+                tok(&["hf_", "ZqXrLmKpWtVnBcHyJdFsGaQeRtYuIoPlKw"]),
                 "secret/huggingface-token",
             ),
         ];
@@ -837,7 +838,10 @@ mod tests {
         );
         let runner = tok(&["glrt-", "t1_Zx9Qp2Lm7Kw4Rt8VbN3c"]);
         assert_eq!(ids(&detect("a.sh", &runner)), vec!["secret/gitlab-token"]);
-        let app = tok(&["xapp-1-", "A0123456789-1234567890123-abcdef0123456789"]);
+        let app = tok(&[
+            "xapp-1-",
+            "A07QK2MZP4R-4829163057281-9f3c7e1b5d8a2f60e4b7c9d1",
+        ]);
         assert_eq!(
             ids(&detect("a.py", &format!("t = '{app}'"))),
             vec!["secret/slack-token"]
@@ -893,6 +897,12 @@ mod tests {
             ("app.py", "token_url = \"https://example.com/oauth/token\""),
             ("app.py", "max_tokens = \"40960000\""),
             ("app.py", "password = \"xxxxxxxxxxxx\""),
+            (
+                "app.py",
+                "api_secret = \"a1b2c3d4e5f67890abcdef1234567890\"",
+            ),
+            ("app.rs", "let secret = \"my-api-key-12345\";"),
+            ("app.py", "password = \"Qwerty!2024\""),
             (".env", "DATABASE_PASSWORD=${DB_PASS}"),
             (".env", "SECRET_KEY="),
             ("docs/setup.md", "password = \"Tr0ub4dor&3xq\""),
@@ -1014,13 +1024,13 @@ mod tests {
             (
                 tok(&[
                     "https://hooks.slack.com/workflows/",
-                    "T01ABCDEF/A02BCDEFG/123456789012345678/",
+                    "T05QK7MZP/A06RX2LWN/846201937564018273/",
                     "Zq8Xr3Lm7Kp2Wt9Vn4Bc6Hy1",
                 ]),
                 "secret/slack-webhook",
             ),
             (
-                tok(&["api_org_", "AbCdEfGhIjKlMnOpQrStUvWxYzAbCdEfGh"]),
+                tok(&["api_org_", "ZqXrLmKpWtVnBcHyJdFsGaQeRtYuIoPlKw"]),
                 "secret/huggingface-token",
             ),
             (
@@ -1052,7 +1062,7 @@ mod tests {
         );
         let npmrc = tok(&[
             "//registry.npmjs.org/:_authToken=",
-            "a1b2c3d4-e5f6-4789-abcd-ef0123456789",
+            "7f3c9e1b-5d8a-4f60-9e4b-c7d1a2f86b30",
         ]);
         assert_eq!(ids(&detect(".npmrc", &npmrc)), vec!["secret/npm-token"]);
         assert!(detect(".npmrc", "//registry.npmjs.org/:_authToken=${NPM_TOKEN}").is_empty());
