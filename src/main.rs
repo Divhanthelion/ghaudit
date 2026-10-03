@@ -5,6 +5,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use ghaudit::analyzer::{agents, rules, settings, workflows};
 use ghaudit::config::{Config, FailOn, SUPPORTED_LANGUAGES, TrustRepo};
 use ghaudit::model::{ScanReport, Severity};
+use ghaudit::progress;
 use ghaudit::report::{self, Format};
 use ghaudit::scanner::Scanner;
 use ghaudit::target::{self, Target};
@@ -312,7 +313,11 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
         .map(load_baseline)
         .transpose()?;
 
-    let scanner = Scanner::new(config)?.with_progress(!g.quiet);
+    let mut scanner = Scanner::new(config)?;
+    if !g.quiet {
+        // A line per finished repository of org/user/search scans.
+        scanner = scanner.with_progress_sink(progress::stderr());
+    }
     let mut report = scanner.scan(&target).await?;
     if let Some(baseline) = &baseline {
         report.apply_baseline(baseline);
