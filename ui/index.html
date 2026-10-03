@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>ghaudit</title>
+  <link rel="stylesheet" href="styles.css">
+  <script type="module" src="js/app.js"></script>
+</head>
+<body>
+  <div class="app" id="app">
+    <header class="topbar">
+      <div class="brand" id="brand">ghaudit</div>
+      <nav class="tabs" id="tabs" role="tablist" aria-label="Report" hidden></nav>
+      <div class="topbar-spacer"></div>
+      <div class="topbar-actions" id="topbar-actions"></div>
+    </header>
+    <div class="reportbar" id="reportbar" hidden></div>
+    <main id="main" tabindex="-1"></main>
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  </div>
+</body>
+</html>
