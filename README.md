@@ -71,9 +71,12 @@ Settings: 21 passed, 2 failed, 0 not assessable
 Build from source (Rust 1.88+):
 
 ```bash
-cargo install --git https://github.com/Divhanthelion/ghaudit
+cargo install --git https://github.com/Divhanthelion/ghaudit ghaudit
 # or, from a checkout: cargo install --path .   (or run in place: cargo run --release -- scan .)
 ```
+
+The repository also holds the [desktop app](#desktop-app), so name the `ghaudit` package
+when installing from git. Installing the CLI never builds the app.
 
 Tagged versions also publish binaries for Linux, macOS and Windows on
 [Releases](https://github.com/Divhanthelion/ghaudit/releases), with `SHA256SUMS` and
@@ -195,6 +198,34 @@ Findings are matched by fingerprint, which ignores line numbers, so moving code 
 make old findings new. The report counts the findings the baseline hid. In multi-repo
 scans the repository is part of the match. `baseline = "..."` in `[report]` sets it in
 the config file.
+
+## Desktop app
+
+The desktop app shows ghaudit's results without the command line, in plain language. It
+opens the same JSON reports the CLI writes (`-f json`):
+
+- **Overview**: whether the scan is complete, how many problems there are at each
+  severity and what each severity means, what kinds of problems they are, and which
+  repositories have the most.
+- **Findings**: filter by severity, kind, repository or any text (a file, a package, a
+  CVE), sort, and group by repository. Select one to see what was found, the code
+  around it (credentials masked), how to fix it, and links to the file on GitHub, the
+  commit, the advisory or the settings page.
+- **Coverage**: which checks ran, which didn't and why, and files that weren't fully
+  analyzed. A gap is never shown as a pass.
+
+Run it from a checkout (Rust 1.90+; on Linux, first install Tauri's
+[system libraries](https://v2.tauri.app/start/prerequisites/#linux)):
+
+```bash
+cargo run -p ghaudit-desktop        # or, with tauri-cli installed: cd app && cargo tauri dev
+```
+
+The app is built to show untrusted content safely. Report text from scanned repositories
+is only ever displayed as text, never as HTML. The window runs under a strict content
+security policy and can call nothing but the app's own commands: it has no access to
+files, the shell or the network. Files are opened through the system's file dialog, and
+links open only to github.com and osv.dev.
 
 ## Scanning repositories you don't control
 
@@ -480,7 +511,8 @@ medium: treat them as leads, not verdicts. Detected credentials are replaced wit
 
 ## Documentation
 
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): how a scan works, module by module
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): how a scan works, module by module, and
+  how the desktop app is put together
 - [CONTRIBUTING.md](CONTRIBUTING.md): development setup and writing new rules
 - [CHANGELOG.md](CHANGELOG.md)
 
