@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- Source for the app icons: cargo tauri icon icon.svg -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0.7" y2="1">
+      <stop offset="0" stop-color="#3a74d6"/>
+      <stop offset="1" stop-color="#15306a"/>
+    </linearGradient>
+    <linearGradient id="shield" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#dfe8f7"/>
+    </linearGradient>
+  </defs>
+  <rect x="40" y="40" width="944" height="944" rx="212" fill="url(#bg)"/>
+  <rect x="40" y="40" width="944" height="944" rx="212" fill="none" stroke="#ffffff" stroke-opacity="0.14" stroke-width="8"/>
+  <path d="M512 168 L800 270 V500 C800 676 680 804 512 868 C344 804 224 676 224 500 V270 Z" fill="url(#shield)"/>
+  <circle cx="488" cy="484" r="124" fill="none" stroke="#1b3f86" stroke-width="64"/>
+  <path d="M580 576 L676 672" stroke="#1b3f86" stroke-width="76" stroke-linecap="round"/>
+</svg>
