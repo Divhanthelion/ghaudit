@@ -33,6 +33,7 @@ use crate::model::{
     AnalyzerState, AnalyzerStatus, Category, Finding, LineIndex, Omitted, RepositorySummary,
     ScanReport, SettingsCheck, Severity, SkippedFile,
 };
+use crate::progress::{self, Progress, ProgressSink};
 use crate::report::terminal_safe;
 use crate::target::{self, Target};
 use futures::StreamExt;
@@ -73,7 +74,7 @@ pub struct Scanner {
     sca: Option<OsvScanner>,
     ai: Option<AiAnalyzer>,
     github: GitHub,
-    progress: bool,
+    progress: Option<ProgressSink>,
 }
 
 /// A cloned repository's HEAD commit and scan results.
@@ -154,14 +155,42 @@ impl Scanner {
             ai,
             github,
             config,
-            progress: false,
+            progress: None,
         })
     }
 
-    /// Print one line per finished repository to stderr during multi-repo scans.
-    pub fn with_progress(mut self, progress: bool) -> Self {
-        self.progress = progress;
+    /// Print one line per finished repository to stderr during multi-repo scans: a
+    /// shortcut for [`Scanner::with_progress_sink`] with [`progress::stderr`].
+    pub fn with_progress(self, progress: bool) -> Self {
+        if progress {
+            self.with_progress_sink(progress::stderr())
+        } else {
+            Self {
+                progress: None,
+                ..self
+            }
+        }
+    }
+
+    /// Report the scan's progress to `sink` as it goes (see [`Progress`]). The sink is
+    /// called from the scan's tasks, so it must be quick and must not block.
+    pub fn with_progress_sink(mut self, sink: ProgressSink) -> Self {
+        self.progress = Some(sink);
         self
+    }
+
+    /// Send a progress event, built only when a sink listens.
+    fn emit(&self, event: impl FnOnce() -> Progress) {
+        if let Some(sink) = &self.progress {
+            sink(event());
+        }
+    }
+
+    fn analyzer_finished(&self, repository: Option<&str>, status: &AnalyzerStatus) {
+        self.emit(|| Progress::AnalyzerFinished {
+            repository: repository.map(str::to_string),
+            status: status.clone(),
+        });
     }
 
     pub fn github(&self) -> &GitHub {
@@ -178,10 +207,11 @@ impl Scanner {
                 let trusted = self.config.analysis.trust_repo.resolve(true);
                 let repo = self.github_repo_of(path).await;
                 let (dir, (status, audit)) = tokio::join!(
-                    self.scan_dir(path, trusted),
+                    self.scan_dir(path, trusted, None),
                     self.audit_settings(
                         repo.as_deref(),
-                        "this directory has no origin remote on the configured GitHub host"
+                        "this directory has no origin remote on the configured GitHub host",
+                        None,
                     )
                 );
                 let mut dir = dir?;
@@ -260,6 +290,10 @@ impl Scanner {
             "scanning {} of {total} repositories (forks/archived filtered by config)",
             selected.len()
         );
+        self.emit(|| Progress::RepositoriesListed {
+            listed: total,
+            repositories: selected.iter().map(|r| r.full_name.clone()).collect(),
+        });
         let count = selected.len();
         let done = &AtomicUsize::new(0);
         let min = self.config.report.min_severity;
@@ -269,27 +303,28 @@ impl Scanner {
         let mut results: Vec<(usize, RepoInfo, RemoteScan)> =
             futures::stream::iter(selected.into_iter().enumerate())
                 .map(|(i, repo)| async move {
+                    self.emit(|| Progress::RepositoryStarted {
+                        index: i,
+                        total: count,
+                        name: repo.full_name.clone(),
+                    });
                     let started = Instant::now();
                     let result = self.scan_remote(&repo.clone_url, &repo.full_name).await;
-                    if self.progress {
-                        let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-                        let outcome = match &result {
-                            Ok((_, dir)) => format!(
-                                "{} findings",
-                                dir.findings
-                                    .iter()
-                                    .filter(|f| f.severity.at_least(min))
-                                    .count()
-                            ),
-                            Err(e) => format!("failed: {e}"),
-                        };
-                        eprintln!(
-                            "[{n}/{count}] {}: {} ({:.1}s)",
-                            terminal_safe(&repo.full_name),
-                            terminal_safe(&outcome),
-                            started.elapsed().as_secs_f64()
-                        );
-                    }
+                    let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    self.emit(|| Progress::RepositoryFinished {
+                        index: i,
+                        done: n,
+                        total: count,
+                        name: repo.full_name.clone(),
+                        findings: result.as_ref().map_or(0, |(_, dir)| {
+                            dir.findings
+                                .iter()
+                                .filter(|f| f.severity.at_least(min))
+                                .count()
+                        }),
+                        duration_ms: started.elapsed().as_millis() as u64,
+                        error: result.as_ref().err().map(|e| e.to_string()),
+                    });
                     (i, repo, result)
                 })
                 .buffer_unordered(self.config.github.concurrency)
@@ -370,11 +405,15 @@ impl Scanner {
                     self.config.analysis.history,
                 )
                 .await?;
-                let dir = self.scan_dir(&checkout.path, trusted).await?;
+                let dir = self
+                    .scan_dir(&checkout.path, trusted, Some(full_name))
+                    .await?;
                 Ok::<_, Error>((checkout.commit.clone(), dir))
             };
-            let (scan, (status, audit)) =
-                tokio::join!(scan, self.audit_settings(Some(full_name), ""));
+            let (scan, (status, audit)) = tokio::join!(
+                scan,
+                self.audit_settings(Some(full_name), "", Some(full_name))
+            );
             let (commit, mut dir) = scan?;
             dir.add_settings(status, audit);
             Ok((commit, dir))
@@ -412,8 +451,24 @@ impl Scanner {
         }
     }
 
-    /// Audit one repository's settings. `missing` explains a `None` repository.
-    async fn audit_settings(&self, repo: Option<&str>, missing: &str) -> (AnalyzerStatus, Audit) {
+    /// Audit one repository's settings. `missing` explains a `None` repository;
+    /// `label` names the scanned repository in progress events.
+    async fn audit_settings(
+        &self,
+        repo: Option<&str>,
+        missing: &str,
+        label: Option<&str>,
+    ) -> (AnalyzerStatus, Audit) {
+        let (status, audit) = self.audit_repo_settings(repo, missing).await;
+        self.analyzer_finished(label, &status);
+        (status, audit)
+    }
+
+    async fn audit_repo_settings(
+        &self,
+        repo: Option<&str>,
+        missing: &str,
+    ) -> (AnalyzerStatus, Audit) {
         let skipped = |why: &str| (AnalyzerStatus::skipped("settings", why), Audit::default());
         if !self.config.analysis.settings {
             return skipped("disabled");
@@ -449,8 +504,9 @@ impl Scanner {
     }
 
     /// Scan one directory with every enabled analyzer. `trusted` decides whether the
-    /// tree's own ignore files, suppressions and osv-scanner config are honored.
-    async fn scan_dir(&self, root: &Path, trusted: bool) -> Result<DirScan> {
+    /// tree's own ignore files, suppressions and osv-scanner config are honored;
+    /// `label` names the scanned repository in progress events.
+    async fn scan_dir(&self, root: &Path, trusted: bool, label: Option<&str>) -> Result<DirScan> {
         let cancel = Arc::new(AtomicBool::new(false));
         let _cancel_on_drop = CancelOnDrop(Arc::clone(&cancel));
         let max_file_size = self.config.analysis.max_file_size;
@@ -465,18 +521,46 @@ impl Scanner {
                 .await
                 .map_err(|e| Error::Config(format!("file discovery crashed: {e}")))??;
         let files = Arc::new(discovered.files);
+        self.emit(|| Progress::FilesDiscovered {
+            repository: label.map(str::to_string),
+            files: files.len(),
+        });
 
+        // Each analyzer reports its progress as soon as it finishes, with the status
+        // it gets in the report.
         let local = {
             let engines = Arc::clone(&self.local);
             let files = Arc::clone(&files);
             let cancel = Arc::clone(&cancel);
-            tokio::task::spawn_blocking(move || analyze_files(&engines, &files, trusted, &cancel))
+            let task = tokio::task::spawn_blocking(move || {
+                analyze_files(&engines, &files, trusted, &cancel)
+            });
+            async move {
+                let local = task.await;
+                if local.is_ok() {
+                    for status in self.local_statuses() {
+                        self.analyzer_finished(label, &status);
+                    }
+                }
+                local
+            }
         };
         let sca = async {
-            match &self.sca {
+            let result = match &self.sca {
                 Some(s) => Some(s.scan(root, trusted).await),
                 None => None,
-            }
+            };
+            let status = match &result {
+                None => AnalyzerStatus::skipped("sca", "disabled"),
+                Some(Ok(outcome)) => {
+                    let detail = (!outcome.warnings.is_empty())
+                        .then(|| format!("osv-scanner warnings: {}", outcome.warnings.join("; ")));
+                    AnalyzerStatus::completed("sca").with_detail(detail)
+                }
+                Some(Err(e)) => AnalyzerStatus::failed("sca", e.clone()),
+            };
+            self.analyzer_finished(label, &status);
+            (result, status)
         };
         let history = {
             let engines = Arc::clone(&self.local);
@@ -484,27 +568,38 @@ impl Scanner {
             let root = root.to_path_buf();
             let exclude = self.config.analysis.exclude.clone();
             async move {
-                if !engines.history {
-                    return None;
-                }
-                let task = tokio::task::spawn_blocking(move || {
-                    let detector = engines
-                        .secrets
-                        .as_ref()
-                        .ok_or("needs the secrets analyzer")?;
-                    let filter = PathFilter::new(&root, &exclude).map_err(|e| e.to_string())?;
-                    history::scan_history(
-                        &root,
-                        detector,
-                        &filter,
-                        history::Limits::default(),
-                        &cancel,
-                    )
-                });
-                Some(task.await.unwrap_or_else(|e| Err(format!("crashed: {e}"))))
+                let result = if engines.history {
+                    let task = tokio::task::spawn_blocking(move || {
+                        let detector = engines
+                            .secrets
+                            .as_ref()
+                            .ok_or("needs the secrets analyzer")?;
+                        let filter = PathFilter::new(&root, &exclude).map_err(|e| e.to_string())?;
+                        history::scan_history(
+                            &root,
+                            detector,
+                            &filter,
+                            history::Limits::default(),
+                            &cancel,
+                        )
+                    });
+                    Some(task.await.unwrap_or_else(|e| Err(format!("crashed: {e}"))))
+                } else {
+                    None
+                };
+                let status = match &result {
+                    None => AnalyzerStatus::skipped("history", "disabled (enable with --history)"),
+                    Some(Ok(outcome)) => {
+                        AnalyzerStatus::completed("history").with_detail(Some(outcome.summary()))
+                    }
+                    Some(Err(e)) => AnalyzerStatus::failed("history", e.clone()),
+                };
+                self.analyzer_finished(label, &status);
+                (result, status)
             }
         };
-        let (local, sca, history) = tokio::join!(local, sca, history);
+        let (local, (sca, sca_status), (history, history_status)) =
+            tokio::join!(local, sca, history);
         let local = local.map_err(|e| Error::Config(format!("analysis crashed: {e}")))?;
 
         let mut dir = DirScan {
@@ -527,48 +622,49 @@ impl Scanner {
                 }),
         );
         dir.skipped.sort_by(|a, b| a.path.cmp(&b.path));
-        dir.analyzers
-            .push(status("sast", self.local.sast.is_some()));
-        dir.analyzers
-            .push(status("secrets", self.local.secrets.is_some()));
-        dir.analyzers.push(match history {
-            None => AnalyzerStatus::skipped("history", "disabled (enable with --history)"),
+        let [sast, secrets, workflows, agents] = self.local_statuses();
+        dir.analyzers.push(sast);
+        dir.analyzers.push(secrets);
+        match history {
             Some(Ok(mut outcome)) => {
                 outcome.drop_current(&local.secret_values);
                 dir.findings.append(&mut outcome.findings);
-                AnalyzerStatus::completed("history").with_detail(Some(outcome.summary()))
             }
-            Some(Err(e)) => {
-                warn!("git history search failed: {}", terminal_safe(&e));
-                AnalyzerStatus::failed("history", e)
-            }
-        });
+            Some(Err(e)) => warn!("git history search failed: {}", terminal_safe(&e)),
+            None => {}
+        }
+        dir.analyzers.push(history_status);
 
-        dir.analyzers.push(match sca {
-            None => AnalyzerStatus::skipped("sca", "disabled"),
+        match sca {
             Some(Ok(outcome)) => {
                 dir.packages = outcome.packages;
                 dir.findings.extend(outcome.findings);
-                let detail = (!outcome.warnings.is_empty())
-                    .then(|| format!("osv-scanner warnings: {}", outcome.warnings.join("; ")));
-                AnalyzerStatus::completed("sca").with_detail(detail)
             }
-            Some(Err(e)) => {
-                warn!("dependency scan failed: {}", terminal_safe(&e));
-                AnalyzerStatus::failed("sca", e)
-            }
-        });
+            Some(Err(e)) => warn!("dependency scan failed: {}", terminal_safe(&e)),
+            None => {}
+        }
+        dir.analyzers.push(sca_status);
 
-        dir.analyzers
-            .push(status("workflows", self.local.workflows));
-        dir.analyzers.push(status("agents", self.local.agents));
+        dir.analyzers.push(workflows);
+        dir.analyzers.push(agents);
         let ai = match &self.ai {
             None => AnalyzerStatus::skipped("ai", "disabled (enable with --ai)"),
             Some(ai) => self.run_ai(ai, &files, trusted, &mut dir).await,
         };
+        self.analyzer_finished(label, &ai);
         dir.analyzers.push(ai);
 
         Ok(dir)
+    }
+
+    /// Statuses of the analyzers that run in the per-file pass.
+    fn local_statuses(&self) -> [AnalyzerStatus; 4] {
+        [
+            status("sast", self.local.sast.is_some()),
+            status("secrets", self.local.secrets.is_some()),
+            status("workflows", self.local.workflows),
+            status("agents", self.local.agents),
+        ]
     }
 
     async fn run_ai(
@@ -1097,6 +1193,175 @@ mod tests {
     fn minified_detection() {
         assert!(is_minified(&"var a=1;".repeat(1000)));
         assert!(!is_minified(&"var a = 1;\n".repeat(1000)));
+    }
+
+    /// A progress sink that records every event.
+    fn recorder() -> (ProgressSink, Arc<std::sync::Mutex<Vec<Progress>>>) {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        (Arc::new(move |e| sink.lock().unwrap().push(e)), events)
+    }
+
+    /// The analyzer statuses reported for `repository`, in report order. Fails if an
+    /// analyzer reported twice.
+    fn reported_statuses(events: &[Progress], repository: Option<&str>) -> Vec<AnalyzerStatus> {
+        let mut statuses: Vec<AnalyzerStatus> = events
+            .iter()
+            .filter_map(|e| match e {
+                Progress::AnalyzerFinished {
+                    repository: r,
+                    status,
+                } if r.as_deref() == repository => Some(status.clone()),
+                _ => None,
+            })
+            .collect();
+        statuses.sort_by_key(|s| ANALYZERS.iter().position(|n| *n == s.analyzer));
+        let mut names: Vec<&str> = statuses.iter().map(|s| s.analyzer.as_str()).collect();
+        names.dedup();
+        assert_eq!(names.len(), statuses.len(), "{statuses:?}");
+        statuses
+    }
+
+    #[tokio::test]
+    async fn progress_reports_each_analyzer_once_with_its_report_status() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("app.py"), "import os\nos.system(cmd)\n").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "nothing here\n").unwrap();
+        let mut config = Config::default();
+        // Failed and skipped analyzers report too, with the same status as the report.
+        config.sca.osv_scanner = "ghaudit-test-missing-osv-scanner".into();
+        config.analysis.history = true; // not a git repository: fails
+        let (sink, events) = recorder();
+        let scanner = Scanner::new(config).unwrap().with_progress_sink(sink);
+        let report = scanner
+            .scan(&Target::Local(dir.path().to_path_buf()))
+            .await
+            .unwrap();
+
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, Progress::FilesDiscovered { .. }))
+                .collect::<Vec<_>>(),
+            vec![&Progress::FilesDiscovered {
+                repository: None,
+                files: 2
+            }]
+        );
+        let statuses = reported_statuses(&events, None);
+        assert_eq!(statuses, report.analyzers);
+        assert_eq!(statuses.len(), ANALYZERS.len());
+        assert_eq!(statuses[3].state, AnalyzerState::Failed, "{statuses:?}");
+        assert_eq!(statuses[7].state, AnalyzerState::Skipped, "{statuses:?}");
+        assert!(
+            events.iter().all(|e| matches!(
+                e,
+                Progress::FilesDiscovered { .. } | Progress::AnalyzerFinished { .. }
+            )),
+            "a single directory has no repository events: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn progress_follows_each_repository_of_a_multi_repository_scan() {
+        let git = |dir: &Path, args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        let root = tempfile::tempdir().unwrap();
+        let good = root.path().join("good");
+        std::fs::create_dir_all(&good).unwrap();
+        std::fs::write(good.join("app.py"), "import os\nos.system(cmd)\n").unwrap();
+        if !git(&good, &["init", "-q"]) {
+            return; // git not installed
+        }
+        assert!(git(&good, &["add", "-A"]));
+        assert!(git(&good, &["commit", "-q", "--no-gpg-sign", "-m", "init"]));
+        // file:///tmp/x on Unix, file:///C:/x on Windows.
+        let url = |p: &Path| {
+            let p = p.to_string_lossy().replace('\\', "/");
+            format!("file:///{}", p.trim_start_matches('/'))
+        };
+        let repo = |name: &str, path: &Path, fork: bool| RepoInfo {
+            full_name: name.into(),
+            clone_url: url(path),
+            archived: false,
+            fork,
+            private: false,
+        };
+        let repos = vec![
+            repo("acme/good", &good, false),
+            repo("acme/missing", &root.path().join("missing"), false),
+            repo("acme/fork", &good, true),
+        ];
+        let mut config = Config::default();
+        config.analysis.sca = false;
+        let (sink, events) = recorder();
+        let scanner = Scanner::new(config).unwrap().with_progress_sink(sink);
+        let mut report = ScanReport::new("user:acme");
+        scanner.scan_many(&mut report, repos).await;
+        let events = events.lock().unwrap();
+
+        assert_eq!(
+            events[0],
+            Progress::RepositoriesListed {
+                listed: 3,
+                repositories: vec!["acme/good".into(), "acme/missing".into()],
+            },
+            "forks are left out"
+        );
+        let position = |pred: &dyn Fn(&Progress) -> bool| events.iter().position(pred).unwrap();
+        let mut done = Vec::new();
+        for (index, summary) in report.repositories.iter().enumerate() {
+            let name = summary.name.as_str();
+            let started = position(&|e| {
+                matches!(e, Progress::RepositoryStarted { name: n, index: i, total: 2 }
+                    if n == name && *i == index)
+            });
+            let finished = position(
+                &|e| matches!(e, Progress::RepositoryFinished { name: n, .. } if n == name),
+            );
+            assert!(started < finished, "{events:?}");
+            let Progress::RepositoryFinished {
+                index: i,
+                done: d,
+                total,
+                findings,
+                error,
+                ..
+            } = &events[finished]
+            else {
+                unreachable!()
+            };
+            assert_eq!((*i, *total), (index, 2));
+            assert_eq!(*findings, summary.findings, "{name}");
+            assert_eq!(error, &summary.error, "{name}");
+            done.push(*d);
+        }
+        done.sort();
+        assert_eq!(done, vec![1, 2]);
+
+        assert!(report.repositories[0].findings > 0);
+        assert_eq!(
+            reported_statuses(&events, Some("acme/good")),
+            report.repositories[0].analyzers
+        );
+        assert!(report.repositories[1].error.is_some());
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                Progress::FilesDiscovered { repository: Some(r), .. } if r == "acme/missing"
+            )),
+            "a repository that could not be cloned has no files: {events:?}"
+        );
     }
 
     #[test]

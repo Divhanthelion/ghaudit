@@ -81,8 +81,9 @@ GitHub Enterprise host of `github.api_url`): `gitlab.com/a/b` is an error, not a
   (`buffer_unordered`, so one slow repository does not stall the others; the original
   order is restored afterwards). Each repository, clone included, has
   `github.repo_timeout_secs`. A repository that fails or times out is recorded in the
-  report with its error instead of aborting the run, and a progress line per repository
-  goes to stderr.
+  report with its error instead of aborting the run. Each repository's start and end
+  are [progress events](#7-progress-progressrs); the CLI prints a line per finished
+  repository to stderr.
 
 ### 4. Choosing files (`discovery.rs`)
 
@@ -432,6 +433,33 @@ The three formats:
 
   CI validates it against the official schema.
 
+### 7. Progress (`progress.rs`)
+
+A scan can report what it is doing as it goes. `Scanner::with_progress_sink` takes an
+`Arc<dyn Fn(Progress) + Send + Sync>`, and the scanner calls it with these events:
+
+| Event | When |
+|---|---|
+| `RepositoriesListed { listed, repositories }` | An org, user or search scan listed its repositories; `repositories` are the ones it will scan, after leaving out forks and archived ones |
+| `RepositoryStarted { index, total, name }` | One of them starts (its clone begins) |
+| `RepositoryFinished { index, done, total, name, findings, duration_ms, error }` | One of them finished, or could not be cloned or scanned |
+| `FilesDiscovered { repository, files }` | The files of a directory or clone were listed and analysis begins |
+| `AnalyzerFinished { repository, status }` | One analyzer finished on one directory or repository |
+
+`repository` is `owner/name` for a cloned repository and `None` for a local directory.
+Every analyzer reports exactly once per directory or repository, as soon as it finishes
+(the per-file pass reports `sast`, `secrets`, `workflows` and `agents` together), with
+the same `AnalyzerStatus` the report will carry, so a progress display never disagrees
+with the report. `findings` counts findings at or above the minimum severity.
+
+Events come from the scan's tasks, several at a time in multi-repository scans, so a
+sink must be quick and must not block. The CLI's sink is `progress::stderr()`, which
+prints `progress::line(&event)`: `[3/12] acme/app: 4 findings (2.1s)` for each
+finished repository, with untrusted text passed through `terminal_safe`. `Progress`
+serializes to JSON with a `type` tag (`repository_finished`, ...) for front ends that
+receive events as JSON. Strings in events come from GitHub or from scanned
+repositories, so a front end must treat them as untrusted text.
+
 ## Design decisions
 
 | Decision | Why |
@@ -453,6 +481,7 @@ The three formats:
 | Layer | Where | What |
 |---|---|---|
 | Unit | `#[cfg(test)]` in each module | parsing, filtering, severity mapping, redaction, path handling |
+| Progress | `progress.rs`, `scanner.rs` | the CLI's lines; every analyzer reports once with its report status; repository events of a multi-repository scan agree with the report |
 | Rules | `analyzer/sast.rs` | every rule's examples and counter-examples, on every grammar it targets |
 | osv-scanner | `analyzer/sca.rs` | conversion of recorded real osv-scanner output (`tests/fixtures/osv-scanner/`), plus fake binaries for the error paths |
 | GitHub API | `github.rs` | pagination and errors against an in-process mock HTTP server |
