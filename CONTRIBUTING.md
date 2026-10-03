@@ -4,10 +4,12 @@
 
 You need:
 
-- Rust 1.88 or newer
+- Rust 1.88 or newer (1.90 for the desktop app)
 - `git`
 - optionally, [osv-scanner](https://google.github.io/osv-scanner/installation/) for
   dependency scanning
+- for the desktop app on Linux, Tauri's
+  [system libraries](https://v2.tauri.app/start/prerequisites/#linux)
 
 Then:
 
@@ -19,8 +21,17 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt
 ```
 
-CI runs all of the above on Linux, macOS and Windows, checks the minimum Rust version,
-and validates ghaudit's SARIF output against the official schema.
+These work on the `ghaudit` package, the workspace's default member. For the desktop app:
+
+```bash
+cargo run -p ghaudit-desktop
+cargo test -p ghaudit-desktop
+cargo clippy -p ghaudit-desktop --all-targets -- -D warnings
+```
+
+CI runs all of the above on Linux, macOS and Windows (the app on Windows and macOS),
+checks the minimum Rust version, and validates ghaudit's SARIF output against the
+official schema.
 
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) explains how the pieces fit together.
 
@@ -80,6 +91,20 @@ Agent and editor configs are handled in `src/analyzer/agents.rs`: map the file i
 `kind()`, read it in the tool's method, and report through `push` (or `command` for
 anything that runs a command, so the download-and-execute check applies). Cite the
 tool's documentation for the setting in the test.
+
+## Working on the desktop app
+
+The UI in `ui/` is plain HTML, CSS and JavaScript modules with no build step: edit and
+restart the app. Two rules keep it safe to show reports of repositories you don't trust:
+
+- Never turn a string into HTML. Build elements with `h()` from `ui/js/dom.js`, which
+  inserts text as text nodes. `app/tests/security.rs` fails on `innerHTML` and the like.
+- The page gets no Tauri permissions beyond the app's own commands. To add a command,
+  write it in `app/src/lib.rs`, list it in `app/build.rs` and grant `allow-<name>` in
+  `app/capabilities/default.json`. File access, dialogs and links stay in Rust.
+
+Plain-language wording for severities, kinds of findings and checks lives in
+`ui/js/explain.js`.
 
 ## Commit style
 

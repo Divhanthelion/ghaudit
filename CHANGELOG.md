@@ -36,6 +36,10 @@ repositories) with 0.3.0.
 
 ### New
 
+- **Desktop app** (`app/`, `ui/`, built with Tauri 2): browse a JSON report with an
+  overview in plain language, a filterable findings table with details and fixes, and
+  a coverage page. See the README. The app is a separate package in a new Cargo
+  workspace; the CLI does not depend on it.
 - **Progress events in the library**: `Scanner::with_progress_sink` takes a callback
   that receives a `ghaudit::Progress` for each step of a scan: repositories listed,
   each repository started and finished (findings, duration, error), files discovered,
@@ -46,6 +50,12 @@ repositories) with 0.3.0.
 - **`agent/auto-approve`** also reports, at low severity, Claude Code allow rules that
   install or run any package (`Bash(npm install:*)`, `Bash(npx:*)`, `Bash(pip install *)`,
   ...): install scripts run without asking.
+
+### Changed
+
+- Installing from git needs the package name now that the repository also holds the
+  desktop app: `cargo install --git https://github.com/Divhanthelion/ghaudit ghaudit`.
+- `ghaudit::VERSION` holds the library's version.
 
 ## 0.3.0
 

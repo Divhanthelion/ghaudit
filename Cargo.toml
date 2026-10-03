@@ -10,6 +10,14 @@ readme = "README.md"
 keywords = ["security", "sast", "secrets", "github", "sarif"]
 categories = ["command-line-utilities", "development-tools"]
 
+# The repository is a workspace: this package (the library and the `ghaudit` CLI) and
+# the desktop app in app/. Plain `cargo build`, `cargo test` and `cargo install` work on
+# this package only, so the CLI never pulls in the GUI's dependencies; use
+# `-p ghaudit-desktop` or `--workspace` for the app.
+[workspace]
+members = ["app"]
+default-members = ["."]
+
 [dependencies]
 # Async runtime (network I/O, subprocesses) and data parallelism (file analysis)
 tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "process", "signal", "time", "fs"] }

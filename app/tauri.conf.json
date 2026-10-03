@@ -1,0 +1,45 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "ghaudit",
+  "mainBinaryName": "ghaudit-desktop",
+  "version": "0.1.0",
+  "identifier": "io.github.divhanthelion.ghaudit",
+  "build": {
+    "frontendDist": "../ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "ghaudit",
+        "width": 1280,
+        "height": 840,
+        "minWidth": 720,
+        "minHeight": 520,
+        "dragDropEnabled": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; form-action 'none'",
+      "freezePrototype": true
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "publisher": "Divhanthelion",
+    "copyright": "Copyright © 2026 Divhanthelion. MIT license.",
+    "category": "DeveloperTool",
+    "shortDescription": "Security scanner for GitHub repositories",
+    "longDescription": "Check your GitHub repositories for leaked passwords and keys, risky code, vulnerable dependencies, unsafe GitHub Actions workflows, risky AI-agent configs and weak repository settings, and see what to fix first in plain language.",
+    "licenseFile": "../LICENSE"
+  }
+}

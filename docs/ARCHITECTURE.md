@@ -1,7 +1,28 @@
 # How ghaudit works
 
-This document follows one scan from the command line to the report, then explains the
-main design decisions. File references are to `src/`.
+This document follows one scan from the command line to the report, explains the
+desktop app, then the main design decisions. File references are to `src/` unless
+they say otherwise.
+
+## Repository layout
+
+The repository is a Cargo workspace with two packages:
+
+```text
+Cargo.toml        the ghaudit package (library + CLI) and the workspace
+src/              the library (lib.rs) and the CLI (main.rs)
+tests/            end-to-end tests of the CLI
+app/              ghaudit-desktop: the Tauri 2 desktop app, depends on ghaudit by path
+  build.rs          the commands the page may call (generates their permissions)
+  capabilities/     what the window may do: those commands and nothing else
+  src/              the app's commands (lib.rs), report reading, the link allowlist
+  tests/            guards for the CSP, the capability and the UI scripts
+ui/               the app's page: HTML, CSS and JavaScript modules, no build step
+```
+
+`ghaudit` is the workspace's only default member, so `cargo build`, `cargo test` and
+`cargo install` work on the CLI alone and never compile Tauri. The library and CLI need
+Rust 1.88; the app needs 1.90 (Tauri's plugins). Both share one `Cargo.lock`.
 
 ## The pipeline
 
@@ -460,6 +481,46 @@ serializes to JSON with a `type` tag (`repository_finished`, ...) for front ends
 receive events as JSON. Strings in events come from GitHub or from scanned
 repositories, so a front end must treat them as untrusted text.
 
+## The desktop app (`app/`, `ui/`)
+
+The app is a Tauri 2 window showing `ui/`, with the ghaudit library linked into the
+Rust side. The page is display code: it renders reports and calls the app's commands.
+Anything with side effects (file dialogs, reading files, opening links) happens in Rust.
+
+| Command | What it does |
+|---|---|
+| `catalog` | App and scanner versions, and every rule's name and severity (settings checks are named only there) |
+| `open_report` | Shows the system's open-file dialog and reads the chosen report (UTF-8 or UTF-16, up to 200 MB, `tool` must be `ghaudit`); returns it with its file name, not its path |
+| `open_link` | Opens an https link to github.com or osv.dev in the browser; refuses anything else (other hosts, ports, credentials in the URL, other schemes) |
+
+The frontend is ES modules without a bundler: `app.js` (views and state), `report.js`
+(counts, coverage gaps, GitHub links, filtering and sorting: no DOM), `overview.js`,
+`findings.js`, `coverage.js`, `explain.js` (every plain-language explanation) and
+`dom.js` (element helpers and icons). A report is prepared once (`report.prepare`):
+each finding gets an id, and counts and failures are worked out. The findings table
+renders 300 rows at a time.
+
+### Security model
+
+Reports describe repositories that may be hostile, and their paths, messages, snippets
+and titles reach the page. So:
+
+- **Text only.** `dom.js` creates elements and text nodes; no code parses a string as
+  HTML (`app/tests/security.rs` rejects `innerHTML`, `insertAdjacentHTML`,
+  `document.write`, `eval` and similar in `ui/`). Icons are built with
+  `createElementNS`. ghaudit's own `js/html-injection` rule checks the same in the
+  self-scan.
+- **Content security policy**: `default-src 'self'; script-src 'self'; style-src
+  'self'; img-src 'self' data:; connect-src ipc: http://ipc.localhost; object-src
+  'none'; base-uri 'none'; form-action 'none'`, and `freezePrototype`. Nothing is
+  loaded from the network; inline scripts and styles are refused.
+- **Least privilege.** `build.rs` lists the app's commands, which makes Tauri generate a
+  permission for each, and `capabilities/default.json` grants exactly those to the main
+  window. No plugin permission is granted, so the page cannot use the file-system,
+  shell, dialog or opener APIs directly, even through Tauri's JavaScript API.
+- **Links** are checked in Rust (`links.rs`) after parsing, not by prefix.
+- **Read-only**: the app, like the CLI, only reads from GitHub.
+
 ## Design decisions
 
 | Decision | Why |
@@ -489,3 +550,4 @@ repositories, so a front end must treat them as untrusted text.
 | Git history | `analyzer/history.rs` | real repositories built in a temp dir: deleted, renamed and still-present credentials, limits |
 | End to end | `tests/cli.rs` | the real binary: exit codes, formats, exclusions, redaction, SARIF stability, untrusted clones, org scans and settings audits against a mock API, baselines, history |
 | Live | `tests/cli.rs` (ignored by default) | the real osv-scanner; run in CI with `--include-ignored` |
+| Desktop app | `app/src/*.rs`, `app/tests/security.rs` | report reading (encodings, size limit, other files), the link allowlist, the rule catalog; the CSP, the capability and the UI scripts |
