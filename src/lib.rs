@@ -29,3 +29,6 @@ pub use error::{Error, Result};
 pub use model::{Finding, ScanReport, Severity};
 pub use progress::{Progress, ProgressSink};
 pub use scanner::Scanner;
+
+/// This library's version, which reports carry as `version`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
