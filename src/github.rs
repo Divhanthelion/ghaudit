@@ -141,9 +141,9 @@ impl GitHub {
         .await
     }
 
-    /// Login of the token's user. `None` without a token, or for tokens that are not a
-    /// user's (e.g. GitHub App installation tokens).
-    async fn authenticated_login(&self) -> Option<String> {
+    /// Login of the token's user. `None` without a token, for a token GitHub does not
+    /// accept, or for tokens that are not a user's (e.g. GitHub App installation tokens).
+    pub async fn authenticated_login(&self) -> Option<String> {
         #[derive(Deserialize)]
         struct Me {
             login: String,
