@@ -36,6 +36,13 @@ repositories) with 0.3.0.
 
 ### New
 
+- **Progress events in the library**: `Scanner::with_progress_sink` takes a callback
+  that receives a `ghaudit::Progress` for each step of a scan: repositories listed,
+  each repository started and finished (findings, duration, error), files discovered,
+  and each analyzer finished with the status the report will carry. Events serialize
+  to JSON with a `type` tag. The CLI's per-repository lines on stderr are now printed
+  by such a sink (`progress::stderr()`), with the same output as before;
+  `Scanner::with_progress(bool)` still works.
 - **`agent/auto-approve`** also reports, at low severity, Claude Code allow rules that
   install or run any package (`Bash(npm install:*)`, `Bash(npx:*)`, `Bash(pip install *)`,
   ...): install scripts run without asking.
