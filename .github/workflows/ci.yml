@@ -28,7 +28,9 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: cargo fmt --check
+      - run: cargo fmt --all --check
+      # The ghaudit package (the workspace's default member); the desktop app is linted
+      # in its own job, which has the platform libraries it needs.
       - run: cargo clippy --all-targets --locked -- -D warnings
 
   test:
@@ -59,7 +61,28 @@ jobs:
         with:
           toolchain: "1.88"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: cargo check --locked
+      # The library and CLI only: the desktop app needs a newer Rust (app/Cargo.toml).
+      - run: cargo check -p ghaudit --locked
+
+  desktop:
+    name: Desktop app (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo clippy -p ghaudit-desktop --all-targets --locked -- -D warnings
+      - run: cargo test -p ghaudit-desktop --locked
+      - run: cargo build -p ghaudit-desktop --locked
 
   integration:
     name: osv-scanner integration and self-scan
