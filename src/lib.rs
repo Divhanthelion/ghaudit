@@ -19,6 +19,7 @@ pub mod error;
 pub mod git;
 pub mod github;
 pub mod model;
+mod process;
 pub mod progress;
 pub mod report;
 pub mod scanner;

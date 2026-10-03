@@ -88,6 +88,7 @@ impl OsvScanner {
             cmd.arg("--config").arg(config).arg("--no-ignore");
         }
         cmd.arg(&root).stdin(Stdio::null()).kill_on_drop(true);
+        crate::process::hide_window(&mut cmd);
 
         debug!("running {} on {}", self.program, root.display());
         let output = match tokio::time::timeout(self.timeout, cmd.output()).await {
