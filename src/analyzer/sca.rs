@@ -238,9 +238,15 @@ pub fn convert(output: &Output, root: &Path) -> ScaOutcome {
                 let line = content
                     .as_deref()
                     .map_or(1, |c| find_package_line(c, &pkg.package));
-                outcome
-                    .findings
-                    .push(group_finding(&rel, line, &pkg.package, group, &vulns));
+                let mut finding = group_finding(&rel, line, &pkg.package, group, &vulns);
+                if version_is_resolved(&rel, content.as_deref(), &pkg.package) {
+                    let file = rel.rsplit('/').next().unwrap_or(&rel);
+                    finding.confidence = Confidence::Medium;
+                    finding.message.push_str(&format!(
+                        " (osv-scanner chose this version from the ranges in {file}; the installed version may differ, so pin it or scan a lockfile)"
+                    ));
+                }
+                outcome.findings.push(finding);
             }
         }
     }
@@ -481,6 +487,36 @@ pub fn compare_versions(a: &str, b: &str) -> Option<Ordering> {
 }
 
 /// Best-effort line of a package in its lockfile, for a clickable location.
+/// Whether osv-scanner picked the version itself. A requirements file lists ranges
+/// (`aiohttp>=3.9`) and leaves transitive packages out, so for anything not pinned
+/// with `==` the reported version is osv-scanner's resolution, not an installed one.
+fn version_is_resolved(path: &str, content: Option<&str>, pkg: &Package) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
+    let requirements =
+        (name.ends_with(".txt") && name.contains("requirements")) || name.ends_with(".in");
+    if !requirements {
+        return false;
+    }
+    let Some(content) = content else {
+        return true;
+    };
+    // PEP 503: names compare case-insensitively with runs of `-`, `_` and `.` equal.
+    let name = pkg
+        .name
+        .split(['-', '_', '.'])
+        .filter(|p| !p.is_empty())
+        .map(regex::escape)
+        .collect::<Vec<_>>()
+        .join(r"[-_.]+");
+    // `name==1.2.3` or `name[extra] === 1.2.3`, optionally with a marker or comment;
+    // `==1.2.*` is still a range.
+    let pattern = format!(r"(?i)^\s*{name}\s*(\[[^\]]*\])?\s*===?\s*[^\s,;#*]+\s*(;.*)?(#.*)?$");
+    let Ok(pinned) = Regex::new(&pattern) else {
+        return true;
+    };
+    !content.lines().any(|l| pinned.is_match(l))
+}
+
 fn find_package_line(content: &str, pkg: &Package) -> usize {
     let name = regex::escape(&pkg.name);
     let Ok(re) = Regex::new(&format!(
@@ -877,6 +913,49 @@ mod tests {
         let plain = find(&fixture, "RUSTSEC-2019-0009");
         assert_eq!(plain.dependency.as_ref().unwrap().informational, None);
         assert!(plain.message.contains("is affected by"));
+    }
+
+    #[test]
+    fn versions_resolved_from_requirement_ranges_are_marked() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("requirements.txt"),
+            "aiohttp>=3.9.0\nRequests == 2.31.0  # pinned\n",
+        )
+        .unwrap();
+        let root = tmp.path().to_string_lossy().replace('\\', "/");
+        let pkg = |name: &str, version: &str| {
+            format!(
+                r#"{{"package":{{"name":"{name}","version":"{version}","ecosystem":"PyPI"}},
+                "groups":[{{"ids":["PYSEC-{name}"],"aliases":[],"max_severity":"7.5"}}],
+                "vulnerabilities":[{{"id":"PYSEC-{name}","summary":"s","affected":[]}}]}}"#
+            )
+        };
+        let json = format!(
+            r#"{{"results":[{{"source":{{"path":"{root}/requirements.txt"}},"packages":[{},{},{}]}},
+            {{"source":{{"path":"{root}/poetry.lock"}},"packages":[{}]}}]}}"#,
+            pkg("aiohttp", "3.9.5"),
+            pkg("requests", "2.31.0"),
+            pkg("anyio", "4.9.0"),
+            pkg("urllib3", "1.26.0"),
+        );
+        let o = convert(&parse_output(&json).unwrap(), tmp.path());
+        let get = |id: &str| {
+            o.findings
+                .iter()
+                .find(|f| f.dependency.as_ref().unwrap().advisory == id)
+                .unwrap()
+        };
+        // A range, and a transitive package: the version is osv-scanner's choice.
+        for id in ["PYSEC-aiohttp", "PYSEC-anyio"] {
+            assert_eq!(get(id).confidence, Confidence::Medium, "{id}");
+            assert!(get(id).message.contains("may differ"), "{id}");
+        }
+        // Pinned with `==` (any case or spacing), or read from a lockfile: exact.
+        for id in ["PYSEC-requests", "PYSEC-urllib3"] {
+            assert_eq!(get(id).confidence, Confidence::High, "{id}");
+            assert!(!get(id).message.contains("may differ"), "{id}");
+        }
     }
 
     #[test]

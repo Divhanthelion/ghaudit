@@ -378,6 +378,9 @@ group:
   the installed version.
 - **Location** is the lockfile path relative to the scan root, plus a best-effort line
   number for the package.
+- **Requirements files** list ranges, not installed versions. For a package a
+  `requirements*.txt` (or `.in`) file does not pin with `==`, osv-scanner resolves a
+  version itself, so the finding says so and its confidence is medium.
 
 When the tree is untrusted, ghaudit adds `--config <empty file> --no-ignore`: a
 `--config` file replaces every per-directory `osv-scanner.toml` (which can ignore

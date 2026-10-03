@@ -27,6 +27,10 @@ repositories) with 0.3.0.
   functions, `#![cfg(test)]` files) are treated like values in test files: generic
   matches are skipped and provider tokens are capped at medium. `env:NAME` values are
   recognized as environment references.
+- **Dependencies in requirements files**: for a package that a `requirements*.txt` file
+  does not pin with `==` (a range such as `aiohttp>=3.9`, or a transitive package),
+  the version osv-scanner reports is its own resolution, not necessarily the installed
+  one. Those findings now say so and have medium confidence.
 - **`js/html-injection`**: markup read from an ALL_CAPS constant (`ICONS[name]`,
   `PATHS.home`) is no longer reported.
 
