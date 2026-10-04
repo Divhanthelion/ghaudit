@@ -22,7 +22,7 @@ const state = {
   env: null,
   /** The folder chosen for folder scans (the backend holds the real one). */
   folder: null,
-  /** "home", "setup", "scanning" or "report". */
+  /** "home", "setup", "scanning", "failed" (a scan that couldn't finish) or "report". */
   view: "home",
   /** The report on screen, from report.prepare(): `base`, or with "only what's new",
    * the comparison's. */
@@ -39,6 +39,7 @@ const state = {
   saved: null,
   tab: "overview",
   findings: null,
+  /** Built on the first visit to the Settings tab: a large grid costs time. */
   settings: null,
 };
 
@@ -349,7 +350,7 @@ function showTab(id) {
   };
   if (id === "overview") replace(main, renderOverview(r, go));
   else if (id === "findings") replace(main, state.findings.element);
-  else if (id === "settings") replace(main, state.settings.element);
+  else if (id === "settings") replace(main, settingsView().element);
   else if (id === "coverage") replace(main, renderCoverage(r));
   main.scrollTop = 0;
 }
@@ -368,7 +369,14 @@ function loadReport(report, source) {
 function showReport() {
   state.report = state.compare && state.onlyNew ? state.compare.prepared : state.base;
   state.findings = createFindingsView(state.report, { onError: showError });
-  state.settings = createSettingsView(state.report, {
+  state.settings = null;
+  state.view = "report";
+  renderTopbar();
+  showTab(state.tab);
+}
+
+function settingsView() {
+  state.settings ??= createSettingsView(state.report, {
     rules: new Map((state.catalog?.rules ?? []).map((r) => [r.id, r])),
     onError: showError,
     showFindings: (filter) => {
@@ -376,9 +384,7 @@ function showReport() {
       showTab("findings");
     },
   });
-  state.view = "report";
-  renderTopbar();
-  showTab(state.tab);
+  return state.settings;
 }
 
 async function compareWith() {
@@ -424,7 +430,7 @@ const FORMATS = [
 ];
 
 function exportDialog() {
-  if (!state.report) return;
+  if (!state.report || document.querySelector("dialog[open]")) return;
   let format = "json";
   const comparing = Boolean(state.compare);
   const onlyNew = h("input", { type: "checkbox", checked: comparing && state.onlyNew });
@@ -493,7 +499,8 @@ async function refreshEnvironment() {
 
 document.addEventListener("keydown", (e) => {
   const mod = e.ctrlKey || e.metaKey;
-  if (!mod || state.view === "scanning") return;
+  // No shortcuts behind an open dialog, or while a scan runs.
+  if (!mod || state.view === "scanning" || document.querySelector("dialog[open]")) return;
   const key = e.key.toLowerCase();
   if (key === "o") {
     e.preventDefault();

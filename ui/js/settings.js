@@ -17,6 +17,8 @@ const ROW_HEAD_WIDTH = 220;
 const CHECK_WIDTH = 30;
 /** Areas narrower than this many columns go unlabeled (their columns say enough). */
 const LABEL_MIN_COLUMNS = 3;
+/** Rows rendered at a time; "Show more" adds another page. */
+const PAGE = 200;
 
 const OWNER_REPO = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9._-]{1,100}$/;
 const ALLOWED = /^https:\/\/github\.com\//;
@@ -64,7 +66,7 @@ export function createSettingsView(prepared, { rules, showFindings, onError }) {
   const totals = { pass: 0, fail: 0, not_assessable: 0 };
   for (const e of entries) totals[e.status] = (totals[e.status] ?? 0) + 1;
 
-  const state = { show: "all", text: "", selected: null };
+  const state = { show: "all", text: "", selected: null, limit: PAGE };
 
   // ---------------------------------------------------------------- controls
 
@@ -78,11 +80,13 @@ export function createSettingsView(prepared, { rules, showFindings, onError }) {
   );
   showSelect.addEventListener("change", () => {
     state.show = showSelect.value;
+    state.limit = PAGE;
     renderGrid();
   });
   const search = h("input", { class: "input", type: "search", placeholder: "Find a repository", "aria-label": "Find a repository", spellcheck: "false" });
   search.addEventListener("input", () => {
     state.text = search.value.trim().toLowerCase();
+    state.limit = PAGE;
     renderGrid();
   });
 
@@ -102,7 +106,8 @@ export function createSettingsView(prepared, { rules, showFindings, onError }) {
   }
 
   function renderGrid() {
-    const shown = visibleRows();
+    const matching = visibleRows();
+    const shown = matching.slice(0, state.limit);
     if (!shown.length) {
       replace(gridWrap, h("div", { class: "empty" }, icon("filter"), h("h3", {}, "No repositories match")));
       return;
@@ -160,7 +165,26 @@ export function createSettingsView(prepared, { rules, showFindings, onError }) {
       body,
     );
     table.style.width = `${ROW_HEAD_WIDTH + columns.length * CHECK_WIDTH}px`;
-    replace(gridWrap, table);
+    const more =
+      matching.length > shown.length
+        ? h(
+            "div",
+            { class: "more" },
+            h(
+              "button",
+              {
+                type: "button",
+                class: "btn",
+                onclick: () => {
+                  state.limit += PAGE;
+                  renderGrid();
+                },
+              },
+              `Show ${Math.min(PAGE, matching.length - shown.length).toLocaleString()} more of ${matching.length.toLocaleString()}`,
+            ),
+          )
+        : null;
+    replace(gridWrap, table, more);
     const first = gridWrap.querySelector("button.cell");
     if (first) first.tabIndex = 0;
   }
