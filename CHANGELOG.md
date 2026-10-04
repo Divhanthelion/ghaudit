@@ -36,10 +36,14 @@ repositories) with 0.3.0.
 
 ### New
 
-- **Desktop app** (`app/`, `ui/`, built with Tauri 2): browse a JSON report with an
-  overview in plain language, a filterable findings table with details and fixes, and
-  a coverage page. See the README. The app is a separate package in a new Cargo
-  workspace; the CLI does not depend on it.
+- **Desktop app** (`app/`, `ui/`, built with Tauri 2): scan your repositories in one
+  click (or a repository, folder, organization, user or search) with live progress
+  per repository and Cancel, or open a JSON report. Results come with an overview in
+  plain language, a filterable findings table with details and fixes, and a coverage
+  page. GitHub access comes from `GITHUB_TOKEN`, the GitHub CLI's login, or a token
+  kept in the system keychain; osv-scanner is found on `PATH` or where winget installs
+  it. See the README. The app is a separate package in a new Cargo workspace; the CLI
+  does not depend on it.
 - **Progress events in the library**: `Scanner::with_progress_sink` takes a callback
   that receives a `ghaudit::Progress` for each step of a scan: repositories listed,
   each repository started and finished (findings, duration, error), files discovered,
@@ -55,7 +59,10 @@ repositories) with 0.3.0.
 
 - Installing from git needs the package name now that the repository also holds the
   desktop app: `cargo install --git https://github.com/Divhanthelion/ghaudit ghaudit`.
-- `ghaudit::VERSION` holds the library's version.
+- `ghaudit::VERSION` holds the library's version, and `GitHub::authenticated_login` is
+  public.
+- On Windows, git and osv-scanner run without a console window, so a GUI front end
+  doesn't flash one per repository.
 
 ## 0.3.0
 
