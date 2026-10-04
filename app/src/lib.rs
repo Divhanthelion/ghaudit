@@ -34,6 +34,24 @@ struct AppState {
     folder: Mutex<Option<PathBuf>>,
     /// Set while a scan runs; notifying it stops the scan.
     scan: Mutex<Option<Arc<Notify>>>,
+    /// The report on screen, kept here so exports and comparisons work on the scanner's
+    /// own data rather than on anything the page sends back.
+    current: Mutex<Option<Current>>,
+}
+
+struct Current {
+    report: ScanReport,
+    /// An earlier report to compare with.
+    baseline: Option<ScanReport>,
+}
+
+impl AppState {
+    fn show(&self, report: &ScanReport) {
+        *self.current.lock().unwrap() = Some(Current {
+            report: report.clone(),
+            baseline: None,
+        });
+    }
 }
 
 /// A rule the page can describe: names and default severities for every check.
@@ -96,7 +114,10 @@ struct Opened {
 
 /// Ask for a report file and read it. `None` when the dialog is cancelled.
 #[tauri::command]
-async fn open_report(window: WebviewWindow) -> Result<Option<Opened>, String> {
+async fn open_report(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<Option<Opened>, String> {
     let Some(path) = pick_report(&window, "Open a ghaudit report").await else {
         return Ok(None);
     };
@@ -104,7 +125,101 @@ async fn open_report(window: WebviewWindow) -> Result<Option<Opened>, String> {
     let report = tauri::async_runtime::spawn_blocking(move || reports::load(&path))
         .await
         .map_err(|e| e.to_string())??;
+    state.show(&report);
     Ok(Some(Opened { name, report }))
+}
+
+/// The report on screen compared with an earlier one.
+#[derive(Serialize)]
+struct Compared {
+    /// The earlier report's file name and when it was scanned.
+    name: String,
+    scanned: chrono::DateTime<chrono::Utc>,
+    /// The report on screen without the findings the earlier one already had
+    /// (`ScanReport::apply_baseline`, as `--baseline` in the CLI).
+    report: ScanReport,
+}
+
+/// Ask for an earlier report and compare the one on screen with it.
+#[tauri::command]
+async fn compare_with(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<Option<Compared>, String> {
+    if state.current.lock().unwrap().is_none() {
+        return Err("Open or run a scan first.".into());
+    }
+    let Some(path) = pick_report(&window, "Compare with an earlier report").await else {
+        return Ok(None);
+    };
+    let name = reports::display_name(&path);
+    let baseline = tauri::async_runtime::spawn_blocking(move || reports::load(&path))
+        .await
+        .map_err(|e| e.to_string())??;
+    let mut current = state.current.lock().unwrap();
+    let current = current.as_mut().ok_or("Open or run a scan first.")?;
+    let mut report = current.report.clone();
+    report.apply_baseline(&baseline);
+    let scanned = baseline.started_at;
+    current.baseline = Some(baseline);
+    Ok(Some(Compared {
+        name,
+        scanned,
+        report,
+    }))
+}
+
+/// Stop comparing with an earlier report.
+#[tauri::command]
+fn clear_comparison(state: State<'_, AppState>) {
+    if let Some(current) = state.current.lock().unwrap().as_mut() {
+        current.baseline = None;
+    }
+}
+
+/// Save the report on screen as JSON, SARIF or text, through the save dialog. With
+/// `only_new`, findings the compared report already had are left out, as on screen.
+/// Returns the saved file's name, or `None` if the dialog is cancelled.
+#[tauri::command]
+async fn export_report(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    format: ghaudit::report::Format,
+    only_new: bool,
+) -> Result<Option<String>, String> {
+    let report = {
+        let current = state.current.lock().unwrap();
+        let current = current.as_ref().ok_or("There is no report to export.")?;
+        let mut report = current.report.clone();
+        if let (true, Some(baseline)) = (only_new, &current.baseline) {
+            report.apply_baseline(baseline);
+        }
+        report
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let (label, ext) = match format {
+        ghaudit::report::Format::Json => ("ghaudit report (JSON)", "json"),
+        ghaudit::report::Format::Sarif => ("SARIF log", "sarif"),
+        ghaudit::report::Format::Text => ("Text", "txt"),
+    };
+    window
+        .dialog()
+        .file()
+        .set_parent(&window)
+        .set_title("Export the report")
+        .set_file_name(reports::export_name(&report, format))
+        .add_filter(label, &[ext])
+        .save_file(move |file| {
+            let _ = tx.send(file);
+        });
+    let Some(path) = rx.await.ok().flatten().and_then(|f| f.into_path().ok()) else {
+        return Ok(None);
+    };
+    let name = reports::display_name(&path);
+    tauri::async_runtime::spawn_blocking(move || reports::export(&report, format, &path))
+        .await
+        .map_err(|e| e.to_string())??;
+    Ok(Some(name))
 }
 
 /// The system's open-file dialog, for JSON reports.
@@ -288,10 +403,14 @@ async fn start_scan(
         scan::run(config, target, sink).await
     };
     // Dropping `work` stops the scan: clones are deleted and child processes killed.
-    tokio::select! {
-        result = work => result.map(|report| ScanResult::Finished { report: Box::new(report) }),
-        () = stop.notified() => Ok(ScanResult::Cancelled),
-    }
+    let report = tokio::select! {
+        result = work => result?,
+        () = stop.notified() => return Ok(ScanResult::Cancelled),
+    };
+    state.show(&report);
+    Ok(ScanResult::Finished {
+        report: Box::new(report),
+    })
 }
 
 /// Stop the running scan, if any.
@@ -349,7 +468,10 @@ pub fn run() {
             forget_token,
             pick_folder,
             start_scan,
-            cancel_scan
+            cancel_scan,
+            compare_with,
+            clear_comparison,
+            export_report
         ])
         .run(tauri::generate_context!())
         .expect("error while running ghaudit");

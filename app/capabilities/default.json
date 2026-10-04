@@ -12,6 +12,9 @@
     "allow-forget-token",
     "allow-pick-folder",
     "allow-start-scan",
-    "allow-cancel-scan"
+    "allow-cancel-scan",
+    "allow-compare-with",
+    "allow-clear-comparison",
+    "allow-export-report"
   ]
 }
