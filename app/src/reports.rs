@@ -6,9 +6,10 @@ use ghaudit::report::{self, Format};
 use std::io::Write;
 use std::path::Path;
 
-/// Larger files are refused rather than read into memory. A scan of 100 repositories
-/// with a few thousand findings is a few megabytes.
-pub const MAX_REPORT_BYTES: u64 = 200 * 1024 * 1024;
+/// Larger files are refused rather than read. A scan of 100 repositories with a few
+/// thousand findings is a few megabytes; at 40 MB (40,000 findings) the page takes
+/// about three seconds to show a report, and three times that at 120 MB.
+pub const MAX_REPORT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Read and check a report. Errors are sentences for the page to show.
 pub fn load(path: &Path) -> Result<ScanReport, String> {
@@ -22,7 +23,7 @@ fn load_limited(path: &Path, max_bytes: u64) -> Result<ScanReport, String> {
         .len();
     if size > max_bytes {
         return Err(format!(
-            "{name} is {} MB, more than a ghaudit report should be ({} MB at most).",
+            "{name} is {} MB, too large to show here ({} MB at most). Scan fewer repositories at a time, or leave out low-severity findings.",
             size / (1024 * 1024),
             max_bytes / (1024 * 1024)
         ));
@@ -58,6 +59,21 @@ fn decode(bytes: &[u8]) -> Option<String> {
         [0xFE, 0xFF, rest @ ..] => utf16(rest, u16::from_be_bytes),
         _ => String::from_utf8(bytes.to_vec()).ok(),
     }
+}
+
+/// `current` without the findings `earlier` already had (`ScanReport::apply_baseline`,
+/// as `--baseline` in the CLI). Refuses the same report, which would hide everything,
+/// and a later one, which would read as "new since" a date after the scan.
+pub fn compare(current: &ScanReport, earlier: &ScanReport) -> Result<ScanReport, String> {
+    if earlier.started_at == current.started_at && earlier.target == current.target {
+        return Err("That's the report on screen. Choose a report from an earlier scan.".into());
+    }
+    if earlier.started_at > current.started_at {
+        return Err("That report is from a later scan than the one on screen. Open the later one, then compare it with this one.".into());
+    }
+    let mut report = current.clone();
+    report.apply_baseline(earlier);
+    Ok(report)
 }
 
 /// A file name for exporting `report`, such as `ghaudit-octocat-2026-10-03.json`.
@@ -231,6 +247,37 @@ mod tests {
             report.target = target.into();
             assert_eq!(export_name(&report, Format::Text), name, "{target}");
         }
+    }
+
+    #[test]
+    fn comparisons_need_an_earlier_report() {
+        use ghaudit::model::{Category, Confidence, Finding, Location};
+        let finding = |basis: &str| {
+            Finding::new(
+                "python/eval",
+                Category::Sast,
+                ghaudit::Severity::High,
+                Confidence::High,
+                "t",
+                "m",
+                Location::new("a.py", 1, 1),
+                basis,
+            )
+        };
+        let mut earlier = ScanReport::new("user:octocat");
+        earlier.started_at = "2026-09-01T12:00:00Z".parse().unwrap();
+        earlier.findings = vec![finding("eval(a)")];
+        let mut current = ScanReport::new("user:octocat");
+        current.started_at = "2026-10-01T12:00:00Z".parse().unwrap();
+        current.findings = vec![finding("eval(a)"), finding("eval(b)")];
+
+        let compared = compare(&current, &earlier).unwrap();
+        assert_eq!(compared.findings.len(), 1);
+        assert_eq!(compared.stats.findings_baselined, 1);
+        let same = compare(&current, &current).unwrap_err();
+        assert!(same.contains("report on screen"), "{same}");
+        let later = compare(&earlier, &current).unwrap_err();
+        assert!(later.contains("later scan"), "{later}");
     }
 
     #[test]

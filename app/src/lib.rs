@@ -158,8 +158,7 @@ async fn compare_with(
         .map_err(|e| e.to_string())??;
     let mut current = state.current.lock().unwrap();
     let current = current.as_mut().ok_or("Open or run a scan first.")?;
-    let mut report = current.report.clone();
-    report.apply_baseline(&baseline);
+    let report = reports::compare(&current.report, &baseline)?;
     let scanned = baseline.started_at;
     current.baseline = Some(baseline);
     Ok(Some(Compared {

@@ -490,13 +490,13 @@ Anything with side effects (file dialogs, reading files, opening links) happens 
 | Command | What it does |
 |---|---|
 | `catalog` | App and scanner versions, and every rule's name and severity (settings checks are named only there) |
-| `open_report` | Shows the system's open-file dialog and reads the chosen report (UTF-8 or UTF-16, up to 200 MB, `tool` must be `ghaudit`); returns it with its file name, not its path |
+| `open_report` | Shows the system's open-file dialog and reads the chosen report (UTF-8 or UTF-16, up to 64 MB, `tool` must be `ghaudit`); returns it with its file name, not its path |
 | `open_link` | Opens an https link to github.com or osv.dev in the browser; refuses anything else (other hosts, ports, credentials in the URL, other schemes) |
 | `environment` | What scans can use: where the GitHub token comes from and whose it is (never the token), whether a token is saved in the keychain, the GitHub CLI, osv-scanner and git with their versions |
 | `save_token`, `forget_token` | Check a pasted token with `GET /user` and keep it in the system keychain; remove it |
 | `pick_folder` | Shows the folder dialog and remembers the choice: the only folder a scan can target |
 | `start_scan`, `cancel_scan` | Run a scan, streaming `Progress` events through a Tauri channel, and resolve with the report or as cancelled; stop it |
-| `compare_with`, `clear_comparison` | Ask for an earlier report and return the one on screen with `ScanReport::apply_baseline` applied (as `--baseline`); forget it |
+| `compare_with`, `clear_comparison` | Ask for an earlier report and return the one on screen with `ScanReport::apply_baseline` applied (as `--baseline`), refusing the same report or a later one; forget it |
 | `export_report` | Render the report on screen as JSON, SARIF or text (`report::render`, without colors), optionally without the compared report's findings, and save it through the save dialog, via a temporary file renamed into place |
 
 The report on screen is kept in Rust (`AppState::current`) when it is opened or a scan
