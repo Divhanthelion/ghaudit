@@ -173,6 +173,14 @@ export function createFindingsView(prepared, { onError }) {
     detail,
   );
 
+  // Escape closes the details where they cover the list (narrow windows).
+  element.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape" || !state.detailOpen) return;
+    state.detailOpen = false;
+    detail.classList.add("closed");
+    tbody.querySelector('tr.finding[aria-selected="true"]')?.focus();
+  });
+
   // ---------------------------------------------------------------- behaviour
 
   function sortBy(column) {
@@ -459,8 +467,8 @@ export function createFindingsView(prepared, { onError }) {
   // ---------------------------------------------------------------- public
 
   function applyFilter(filter = {}) {
-    state.text = "";
-    search.value = "";
+    state.text = filter.text ?? "";
+    search.value = state.text;
     state.severities = new Set(filter.severities ?? []);
     state.category = filter.category ?? "";
     state.repository = filter.repository ?? "";
