@@ -22,3 +22,33 @@ export const openReport = () => invoke("open_report");
 
 /** Open a github.com or osv.dev link in the browser (anything else is refused). */
 export const openLink = (url) => invoke("open_link", { url });
+
+/**
+ * What scans can use: { github: {source, login}, keychain: {available, saved},
+ * github_cli, osv_scanner: {path, version} | null, git: {...} | null }.
+ * Never the token itself.
+ */
+export const environment = () => invoke("environment");
+
+/** Check a token with GitHub and keep it in the system keychain. Resolves to its login. */
+export const saveToken = (token) => invoke("save_token", { token });
+
+/** Remove the token saved in the system keychain. */
+export const forgetToken = () => invoke("forget_token");
+
+/** Ask for a folder to scan. Resolves to its path for display, or null if cancelled. */
+export const pickFolder = () => invoke("pick_folder");
+
+/**
+ * Run a scan. `onProgress` receives ghaudit's progress events as they happen. Resolves
+ * to {outcome: "finished", report} or {outcome: "cancelled"}.
+ */
+export function startScan(options, onProgress) {
+  if (!tauri) return invoke("start_scan");
+  const channel = new tauri.core.Channel();
+  channel.onmessage = onProgress;
+  return invoke("start_scan", { options, onProgress: channel });
+}
+
+/** Stop the running scan; startScan then resolves as cancelled. */
+export const cancelScan = () => invoke("cancel_scan");
