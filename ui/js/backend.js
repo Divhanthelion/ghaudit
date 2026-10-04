@@ -52,3 +52,18 @@ export function startScan(options, onProgress) {
 
 /** Stop the running scan; startScan then resolves as cancelled. */
 export const cancelScan = () => invoke("cancel_scan");
+
+/**
+ * Ask for an earlier report and compare the one on screen with it. Resolves to
+ * {name, scanned, report} (the report without findings the earlier one had), or null.
+ */
+export const compareWith = () => invoke("compare_with");
+
+/** Stop comparing with an earlier report. */
+export const clearComparison = () => invoke("clear_comparison");
+
+/**
+ * Save the report on screen through the save dialog. format: "json", "sarif" or "text";
+ * onlyNew leaves out findings the compared report had. Resolves to the file name, or null.
+ */
+export const exportReport = (format, onlyNew) => invoke("export_report", { format, onlyNew });

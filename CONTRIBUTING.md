@@ -29,7 +29,7 @@ cargo test -p ghaudit-desktop
 cargo clippy -p ghaudit-desktop --all-targets -- -D warnings
 ```
 
-CI runs all of the above on Linux, macOS and Windows (the app on Windows and macOS),
+CI runs all of the above on Linux, macOS and Windows,
 checks the minimum Rust version, and validates ghaudit's SARIF output against the
 official schema.
 

@@ -16,7 +16,9 @@ export function h(tag, attrs = {}, ...children) {
 function setAttrs(el, attrs) {
   for (const [key, value] of Object.entries(attrs ?? {})) {
     if (value === null || value === undefined || value === false) continue;
-    if (key.startsWith("on") && typeof value === "function") {
+    if (key.toLowerCase().startsWith("on")) {
+      // Event handlers are functions; a string here would be an inline script.
+      if (typeof value !== "function") throw new TypeError(`${key} must be a function`);
       el.addEventListener(key.slice(2), value);
     } else if (key === "dataset") {
       Object.assign(el.dataset, value);

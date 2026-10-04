@@ -11,6 +11,9 @@ const COMMANDS: &[&str] = &[
     "pick_folder",
     "start_scan",
     "cancel_scan",
+    "compare_with",
+    "clear_comparison",
+    "export_report",
 ];
 
 fn main() {

@@ -121,12 +121,12 @@ export const ANALYZER_STATE = {
 
 export const CHECK_STATUS = {
   pass: { label: "Passed", short: "Pass", icon: "check", text: "This setting is configured safely." },
-  fail: { label: "Needs attention", short: "Fail", icon: "close", text: "This setting is unsafe. It is also listed as a finding." },
+  fail: { label: "Needs attention", short: "Fail", icon: "close", text: "This setting is unsafe. It is also listed under Findings, with how to fix it." },
   not_assessable: {
     label: "Couldn't check",
     short: "Couldn't check",
     icon: "helpCircle",
-    text: "GitHub didn't let this token see the setting. This is a gap in what was checked, not a pass.",
+    text: "ghaudit couldn't read this setting, so it may or may not be safe: a gap in what was checked, not a pass. The reason says why; often the token isn't an admin of the repository, or GitHub doesn't offer the feature there.",
   },
 };
 
@@ -142,3 +142,85 @@ export function categoryLabel(id) {
 export function analyzerLabel(id) {
   return ANALYZER[id]?.label ?? id;
 }
+
+/**
+ * Settings checks in report order, grouped by area, each with a short label that says
+ * what a pass means (the column headings of the settings grid). Names of checks a newer
+ * ghaudit adds come from the rule catalog.
+ */
+export const SETTINGS_AREAS = [
+  {
+    id: "branch",
+    label: "Default branch",
+    checks: [
+      ["settings/default-branch-unprotected", "Branch protected"],
+      ["settings/direct-push-allowed", "No direct pushes"],
+      ["settings/no-required-review", "Review required"],
+      ["settings/force-push-allowed", "No force pushes"],
+      ["settings/branch-deletion-allowed", "Can't be deleted"],
+      ["settings/admins-bypass-protection", "Applies to admins"],
+    ],
+  },
+  {
+    id: "features",
+    label: "Security features",
+    checks: [
+      ["settings/secret-scanning-disabled", "Secret scanning"],
+      ["settings/push-protection-disabled", "Push protection"],
+      ["settings/dependabot-alerts-disabled", "Dependabot alerts"],
+      ["settings/dependabot-updates-disabled", "Dependabot updates"],
+      ["settings/private-vulnerability-reporting-disabled", "Private reporting"],
+    ],
+  },
+  {
+    id: "actions",
+    label: "GitHub Actions",
+    checks: [
+      ["settings/actions-default-token-write", "Read-only token"],
+      ["settings/actions-can-approve-prs", "Can't approve PRs"],
+      ["settings/actions-sha-pinning-not-required", "SHA pins required"],
+      ["settings/actions-all-allowed", "Actions limited"],
+      ["settings/fork-pr-approval-weak", "Fork runs need approval"],
+      ["settings/fork-pr-secrets", "No secrets for forks"],
+      ["settings/self-hosted-runner-public", "No public runners"],
+    ],
+  },
+  {
+    id: "access",
+    label: "Access",
+    checks: [
+      ["settings/deploy-key-write", "Read-only deploy keys"],
+      ["settings/deploy-key-stale", "No stale deploy keys"],
+      ["settings/outside-collaborator-admin", "No outside admins"],
+      ["settings/environment-unprotected", "Environments protected"],
+    ],
+  },
+  {
+    id: "webhooks",
+    label: "Webhooks",
+    checks: [
+      ["settings/webhook-insecure-ssl", "Verify TLS"],
+      ["settings/webhook-plain-http", "HTTPS only"],
+      ["settings/webhook-no-secret", "Have a secret"],
+    ],
+  },
+  {
+    id: "org",
+    label: "Organization",
+    checks: [
+      ["settings/org-2fa-not-required", "2FA required"],
+      ["settings/org-members-without-2fa", "Members use 2FA"],
+      ["settings/org-members-insecure-2fa", "No SMS 2FA"],
+      ["settings/org-default-permission", "Limited default access"],
+      ["settings/org-actions-default-token-write", "Read-only token"],
+      ["settings/org-actions-can-approve-prs", "Can't approve PRs"],
+      ["settings/org-actions-sha-pinning-not-required", "SHA pins required"],
+      ["settings/org-actions-all-allowed", "Actions limited"],
+      ["settings/org-fork-pr-approval-weak", "Fork runs need approval"],
+      ["settings/org-fork-pr-secrets", "No secrets for forks"],
+      ["settings/org-webhook-insecure-ssl", "Webhooks verify TLS"],
+      ["settings/org-webhook-plain-http", "Webhooks use HTTPS"],
+      ["settings/org-webhook-no-secret", "Webhooks have a secret"],
+    ],
+  },
+];

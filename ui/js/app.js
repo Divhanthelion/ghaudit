@@ -1,12 +1,13 @@
 // ghaudit desktop: the start page, scanning, and the report views.
 
-import { h, replace, icon, logo, toast, formatDate } from "./dom.js";
+import { h, replace, icon, logo, toast, formatDate, plural } from "./dom.js";
 import * as backend from "./backend.js";
 import { CATEGORIES } from "./explain.js";
 import { prepare } from "./report.js";
 import { renderOverview } from "./overview.js";
 import { createFindingsView } from "./findings.js";
 import { renderCoverage } from "./coverage.js";
+import { createSettingsView } from "./settings.js";
 import { renderSetup, loadOptions, saveOptions, scanRequest, scanLabel, TARGETS } from "./scan.js";
 import { createProgressView } from "./progress.js";
 
@@ -21,19 +22,35 @@ const state = {
   env: null,
   /** The folder chosen for folder scans (the backend holds the real one). */
   folder: null,
-  /** "home", "setup", "scanning" or "report". */
+  /** "home", "setup", "scanning", "failed" (a scan that couldn't finish) or "report". */
   view: "home",
-  /** The report on screen, from report.prepare(). */
+  /** The report on screen, from report.prepare(): `base`, or with "only what's new",
+   * the comparison's. */
   report: null,
+  /** The report as opened or scanned. */
+  base: null,
+  /** An earlier report to compare with: { name, scanned, prepared }. */
+  compare: null,
+  /** With a comparison, show only what's new. */
+  onlyNew: true,
   /** Where it came from: { kind: "file", name } or { kind: "scan" }. */
   source: null,
+  /** The file the report was last exported to as JSON. */
+  saved: null,
   tab: "overview",
   findings: null,
+  /** Built on the first visit to the Settings tab: a large grid costs time. */
+  settings: null,
 };
 
 const TABS = [
   { id: "overview", label: "Overview" },
   { id: "findings", label: "Findings", count: (r) => r.findings.length },
+  {
+    id: "settings",
+    label: "Settings",
+    count: (r) => (r.settings.length ? r.settings.filter((s) => s.status === "fail").length : undefined),
+  },
   { id: "coverage", label: "Coverage" },
 ];
 
@@ -116,15 +133,58 @@ function renderReportbar() {
   const shown = state.view === "report" && state.report;
   reportbar.hidden = !shown;
   if (!shown) return;
-  const r = state.report.raw;
+  const r = state.base.raw;
+  const unsaved = state.source?.kind === "scan" && !state.saved;
   const parts = [
     h("span", { class: "target" }, targetLabel(r.target ?? "")),
     `Scanned ${formatDate(r.started_at)}`,
-    state.source?.kind === "file" ? `Opened from ${state.source.name}` : "Not saved yet",
+    state.saved
+      ? `Saved as ${state.saved}`
+      : state.source?.kind === "file"
+        ? `Opened from ${state.source.name}`
+        : h("span", { class: "unsaved" }, "Not saved yet"),
   ];
   replace(
     reportbar,
     parts.flatMap((p, i) => (i ? [h("span", { class: "sep", "aria-hidden": "true" }, "·"), p] : [p])),
+    h("div", { class: "reportbar-actions" }, compareControls(), h(
+      "button",
+      { type: "button", class: unsaved ? "btn primary" : "btn", onclick: exportDialog, title: "Save or export the report (Ctrl+S)" },
+      icon("download"),
+      unsaved ? "Save report…" : "Export…",
+    )),
+  );
+}
+
+function compareControls() {
+  if (!state.compare) {
+    return h(
+      "button",
+      { type: "button", class: "btn quiet", onclick: compareWith, title: "Show only what's new since an earlier report" },
+      icon("history"),
+      "Compare with earlier…",
+    );
+  }
+  const toggle = h("input", { type: "checkbox", checked: state.onlyNew });
+  toggle.addEventListener("change", () => {
+    state.onlyNew = toggle.checked;
+    showReport();
+  });
+  const baselined = state.compare.prepared.raw.stats?.findings_baselined ?? 0;
+  return h(
+    "div",
+    { class: "compare" },
+    h(
+      "label",
+      { class: "check", title: `${plural(baselined, "finding")} from ${state.compare.name} hidden` },
+      toggle,
+      `Only what's new since ${state.compare.name} (${formatDate(state.compare.scanned)})`,
+    ),
+    h(
+      "button",
+      { type: "button", class: "btn quiet icon-only", onclick: clearCompare, "aria-label": "Stop comparing", title: "Stop comparing" },
+      icon("close"),
+    ),
   );
 }
 
@@ -290,17 +350,131 @@ function showTab(id) {
   };
   if (id === "overview") replace(main, renderOverview(r, go));
   else if (id === "findings") replace(main, state.findings.element);
+  else if (id === "settings") replace(main, settingsView().element);
   else if (id === "coverage") replace(main, renderCoverage(r));
   main.scrollTop = 0;
 }
 
 function loadReport(report, source) {
-  state.report = prepare(report);
+  state.base = prepare(report);
+  state.compare = null;
+  state.onlyNew = true;
+  state.saved = null;
   state.source = source;
+  state.tab = "overview";
+  showReport();
+}
+
+/** Show `base`, or the comparison's report when only what's new is wanted. */
+function showReport() {
+  state.report = state.compare && state.onlyNew ? state.compare.prepared : state.base;
   state.findings = createFindingsView(state.report, { onError: showError });
+  state.settings = null;
   state.view = "report";
   renderTopbar();
-  showTab("overview");
+  showTab(state.tab);
+}
+
+function settingsView() {
+  state.settings ??= createSettingsView(state.report, {
+    rules: new Map((state.catalog?.rules ?? []).map((r) => [r.id, r])),
+    onError: showError,
+    showFindings: (filter) => {
+      state.findings.applyFilter(filter);
+      showTab("findings");
+    },
+  });
+  return state.settings;
+}
+
+async function compareWith() {
+  try {
+    const compared = await backend.compareWith();
+    if (!compared) return;
+    state.compare = { name: compared.name, scanned: compared.scanned, prepared: prepare(compared.report) };
+    state.onlyNew = true;
+    showReport();
+    const hidden = compared.report.stats?.findings_baselined ?? 0;
+    toast(`${plural(hidden, "finding")} from ${compared.name} hidden; ${plural(compared.report.findings.length, "new one")} left.`);
+  } catch (e) {
+    showError(e.message);
+  }
+}
+
+async function clearCompare() {
+  try {
+    await backend.clearComparison();
+  } catch (e) {
+    showError(e.message);
+  }
+  state.compare = null;
+  showReport();
+}
+
+const FORMATS = [
+  {
+    id: "json",
+    label: "ghaudit report (JSON)",
+    text: "Everything in the report. Open it here again later, or compare a new scan with it.",
+  },
+  {
+    id: "sarif",
+    label: "SARIF",
+    text: "For GitHub code scanning and other security tools.",
+  },
+  {
+    id: "text",
+    label: "Text",
+    text: "A readable summary to share or print.",
+  },
+];
+
+function exportDialog() {
+  if (!state.report || document.querySelector("dialog[open]")) return;
+  let format = "json";
+  const comparing = Boolean(state.compare);
+  const onlyNew = h("input", { type: "checkbox", checked: comparing && state.onlyNew });
+  const radios = FORMATS.map((f) => {
+    const input = h("input", { type: "radio", name: "export-format", value: f.id, checked: f.id === format });
+    input.addEventListener("change", () => {
+      format = f.id;
+    });
+    return h("label", { class: "format-option" }, input, h("span", {}, h("b", {}, f.label), h("span", { class: "muted" }, f.text)));
+  });
+  const message = h("p", { class: "form-message", role: "status" });
+  const save = h("button", { type: "button", class: "btn primary" }, "Save…");
+  const dismiss = () => {
+    dialog.close();
+    dialog.remove();
+  };
+  const dialog = h(
+    "dialog",
+    { class: "confirm export-dialog", "aria-labelledby": "export-title" },
+    h("h2", { id: "export-title" }, "Save the report"),
+    h("div", { class: "format-options", role: "radiogroup", "aria-labelledby": "export-title" }, radios),
+    comparing ? h("label", { class: "check" }, onlyNew, `Only what's new since ${state.compare.name}`) : null,
+    message,
+    h("div", { class: "confirm-actions" }, h("button", { type: "button", class: "btn", onclick: dismiss }, "Cancel"), save),
+  );
+  save.addEventListener("click", async () => {
+    save.disabled = true;
+    try {
+      const name = await backend.exportReport(format, comparing && onlyNew.checked);
+      if (name) {
+        if (format === "json" && !(comparing && onlyNew.checked)) state.saved = name;
+        dismiss();
+        renderReportbar();
+        toast(`Saved ${name}.`);
+      }
+    } catch (e) {
+      replace(message, h("span", { class: "error-text" }, e.message));
+    } finally {
+      save.disabled = false;
+    }
+  });
+  dialog.addEventListener("close", () => dialog.remove()); // Esc
+  document.body.append(dialog);
+  dialog.showModal();
 }
 
 async function openReport() {
@@ -325,7 +499,8 @@ async function refreshEnvironment() {
 
 document.addEventListener("keydown", (e) => {
   const mod = e.ctrlKey || e.metaKey;
-  if (!mod || state.view === "scanning") return;
+  // No shortcuts behind an open dialog, or while a scan runs.
+  if (!mod || state.view === "scanning" || document.querySelector("dialog[open]")) return;
   const key = e.key.toLowerCase();
   if (key === "o") {
     e.preventDefault();
@@ -333,6 +508,9 @@ document.addEventListener("keydown", (e) => {
   } else if (key === "n") {
     e.preventDefault();
     showSetup();
+  } else if ((key === "s" || key === "e") && state.view === "report") {
+    e.preventDefault();
+    exportDialog();
   } else if (key === "f" && state.view === "report") {
     e.preventDefault();
     showTab("findings");

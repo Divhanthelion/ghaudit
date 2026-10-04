@@ -1,11 +1,15 @@
-//! Reading ghaudit JSON reports the user picked: to browse them, or as a baseline.
+//! Reading ghaudit JSON reports the user picked (to browse them, or as a baseline), and
+//! writing exports.
 
 use ghaudit::ScanReport;
+use ghaudit::report::{self, Format};
+use std::io::Write;
 use std::path::Path;
 
-/// Larger files are refused rather than read into memory. A scan of 100 repositories
-/// with a few thousand findings is a few megabytes.
-pub const MAX_REPORT_BYTES: u64 = 200 * 1024 * 1024;
+/// Larger files are refused rather than read. A scan of 100 repositories with a few
+/// thousand findings is a few megabytes; at 40 MB (40,000 findings) the page takes
+/// about three seconds to show a report, and three times that at 120 MB.
+pub const MAX_REPORT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Read and check a report. Errors are sentences for the page to show.
 pub fn load(path: &Path) -> Result<ScanReport, String> {
@@ -19,7 +23,7 @@ fn load_limited(path: &Path, max_bytes: u64) -> Result<ScanReport, String> {
         .len();
     if size > max_bytes {
         return Err(format!(
-            "{name} is {} MB, more than a ghaudit report should be ({} MB at most).",
+            "{name} is {} MB, too large to show here ({} MB at most). Scan fewer repositories at a time, or leave out low-severity findings.",
             size / (1024 * 1024),
             max_bytes / (1024 * 1024)
         ));
@@ -55,6 +59,86 @@ fn decode(bytes: &[u8]) -> Option<String> {
         [0xFE, 0xFF, rest @ ..] => utf16(rest, u16::from_be_bytes),
         _ => String::from_utf8(bytes.to_vec()).ok(),
     }
+}
+
+/// `current` without the findings `earlier` already had (`ScanReport::apply_baseline`,
+/// as `--baseline` in the CLI). Refuses the same report, which would hide everything,
+/// and a later one, which would read as "new since" a date after the scan.
+pub fn compare(current: &ScanReport, earlier: &ScanReport) -> Result<ScanReport, String> {
+    if earlier.started_at == current.started_at && earlier.target == current.target {
+        return Err("That's the report on screen. Choose a report from an earlier scan.".into());
+    }
+    if earlier.started_at > current.started_at {
+        return Err("That report is from a later scan than the one on screen. Open the later one, then compare it with this one.".into());
+    }
+    let mut report = current.clone();
+    report.apply_baseline(earlier);
+    Ok(report)
+}
+
+/// A file name for exporting `report`, such as `ghaudit-octocat-2026-10-03.json`.
+pub fn export_name(report: &ScanReport, format: Format) -> String {
+    let target = report.target.trim();
+    let repo = target.split('/').count() == 2
+        && !target.starts_with(['/', '.'])
+        && !target.contains(['\\', ':']);
+    let base = if let Some(rest) = ["user:", "org:", "search:"]
+        .iter()
+        .find_map(|p| target.strip_prefix(p))
+    {
+        rest
+    } else if repo {
+        target
+    } else {
+        // A local folder: its last component.
+        target
+            .trim_end_matches(['/', '\\'])
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or_default()
+    };
+    let mut slug = String::new();
+    for c in base.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            slug.push(c);
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    let slug: String = slug.trim_end_matches('-').chars().take(60).collect();
+    let slug = if slug.is_empty() { "report" } else { &slug };
+    // The user's own calendar date, not UTC's.
+    let date = report
+        .started_at
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d");
+    format!("ghaudit-{slug}-{date}.{}", extension(format))
+}
+
+pub fn extension(format: Format) -> &'static str {
+    match format {
+        Format::Json => "json",
+        Format::Sarif => "sarif",
+        Format::Text => "txt",
+    }
+}
+
+/// Render `report` and write it to `path` through a temporary file next to it, so a
+/// failed write never leaves half a report behind.
+pub fn export(report: &ScanReport, format: Format, path: &Path) -> Result<(), String> {
+    let name = display_name(path);
+    let text = report::render(report, format, false);
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let mut file = tempfile::NamedTempFile::new_in(dir)
+        .map_err(|e| format!("Couldn't write in the folder of {name}: {e}"))?;
+    file.write_all(text.as_bytes())
+        .map_err(|e| format!("Couldn't write {name}: {e}"))?;
+    file.persist(path)
+        .map_err(|e| format!("Couldn't save {name}: {}", e.error))?;
+    Ok(())
 }
 
 /// The file's name, for messages; the page never sees full paths it did not need.
@@ -122,6 +206,78 @@ mod tests {
         }
         let missing = load(&dir.path().join("gone.json")).unwrap_err();
         assert!(missing.starts_with("Couldn't open gone.json"), "{missing}");
+    }
+
+    #[test]
+    fn exports_round_trip_and_are_named_after_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut report = ScanReport::new("user:octocat");
+        // Midday UTC is 2026-10-03 in every time zone from UTC-11 to UTC+11.
+        report.started_at = "2026-10-03T12:00:00Z".parse().unwrap();
+        assert_eq!(
+            export_name(&report, Format::Json),
+            "ghaudit-octocat-2026-10-03.json"
+        );
+        assert_eq!(
+            export_name(&report, Format::Sarif),
+            "ghaudit-octocat-2026-10-03.sarif"
+        );
+        let path = dir.path().join(export_name(&report, Format::Json));
+        export(&report, Format::Json, &path).unwrap();
+        assert_eq!(load(&path).unwrap().target, "user:octocat");
+        let text_path = dir.path().join("report.txt");
+        export(&report, Format::Text, &text_path).unwrap();
+        let text = std::fs::read_to_string(&text_path).unwrap();
+        assert!(
+            text.contains("user:octocat") && !text.contains('\u{1b}'),
+            "{text}"
+        );
+        for (target, name) in [
+            ("acme/app", "ghaudit-acme-app-2026-10-03.txt"),
+            ("org:acme", "ghaudit-acme-2026-10-03.txt"),
+            (
+                "search:topic:cli language:rust",
+                "ghaudit-topic-cli-language-rust-2026-10-03.txt",
+            ),
+            ("/home/me/code/shop", "ghaudit-shop-2026-10-03.txt"),
+            (r"C:\Users\me\code\shop\", "ghaudit-shop-2026-10-03.txt"),
+            ("../shop", "ghaudit-shop-2026-10-03.txt"),
+            (".", "ghaudit-report-2026-10-03.txt"),
+        ] {
+            report.target = target.into();
+            assert_eq!(export_name(&report, Format::Text), name, "{target}");
+        }
+    }
+
+    #[test]
+    fn comparisons_need_an_earlier_report() {
+        use ghaudit::model::{Category, Confidence, Finding, Location};
+        let finding = |basis: &str| {
+            Finding::new(
+                "python/eval",
+                Category::Sast,
+                ghaudit::Severity::High,
+                Confidence::High,
+                "t",
+                "m",
+                Location::new("a.py", 1, 1),
+                basis,
+            )
+        };
+        let mut earlier = ScanReport::new("user:octocat");
+        earlier.started_at = "2026-09-01T12:00:00Z".parse().unwrap();
+        earlier.findings = vec![finding("eval(a)")];
+        let mut current = ScanReport::new("user:octocat");
+        current.started_at = "2026-10-01T12:00:00Z".parse().unwrap();
+        current.findings = vec![finding("eval(a)"), finding("eval(b)")];
+
+        let compared = compare(&current, &earlier).unwrap();
+        assert_eq!(compared.findings.len(), 1);
+        assert_eq!(compared.stats.findings_baselined, 1);
+        let same = compare(&current, &current).unwrap_err();
+        assert!(same.contains("report on screen"), "{same}");
+        let later = compare(&earlier, &current).unwrap_err();
+        assert!(later.contains("later scan"), "{later}");
     }
 
     #[test]

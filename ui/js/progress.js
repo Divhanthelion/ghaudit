@@ -90,7 +90,9 @@ export function createProgressView({ label, options, multi, onCancel, onBack }) 
         if (r) {
           Object.assign(r, { state: event.error ? "failed" : "done", findings: event.findings, ms: event.duration_ms, error: event.error });
         }
-        run.done = event.done;
+        // Two repositories finishing together can deliver their events in either
+        // order, so count them rather than trusting the last `done`.
+        run.done += 1;
         if (event.error) run.failed += 1;
         else run.findings += event.findings;
         break;
