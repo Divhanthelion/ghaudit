@@ -39,8 +39,10 @@ repositories) with 0.3.0.
 - **Desktop app** (`app/`, `ui/`, built with Tauri 2): scan your repositories in one
   click (or a repository, folder, organization, user or search) with live progress
   per repository and Cancel, or open a JSON report. Results come with an overview in
-  plain language, a filterable findings table with details and fixes, and a coverage
-  page. GitHub access comes from `GITHUB_TOKEN`, the GitHub CLI's login, or a token
+  plain language, a filterable findings table with details and fixes, a grid of every
+  repository's settings (passed, needs attention, couldn't check), and a coverage
+  page. Compare with an earlier report to see only what's new, and save as JSON,
+  SARIF or text. GitHub access comes from `GITHUB_TOKEN`, the GitHub CLI's login, or a token
   kept in the system keychain; osv-scanner is found on `PATH` or where winget installs
   it. See the README. The app is a separate package in a new Cargo workspace; the CLI
   does not depend on it.

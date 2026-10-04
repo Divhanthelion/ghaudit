@@ -217,8 +217,16 @@ language.
   CVE), sort, and group by repository. Select one to see what was found, the code
   around it (credentials masked), how to fix it, and links to the file on GitHub, the
   commit, the advisory or the settings page.
+- **Settings**: a grid of every repository's security settings, each passed, needing
+  attention, or couldn't be checked. A check that couldn't run is shown as a gap with
+  its reason, never as a pass. Select a square to see what it means and open the
+  settings page.
 - **Coverage**: which checks ran, which didn't and why, and files that weren't fully
   analyzed. A gap is never shown as a pass.
+- **Only what's new**: compare with an earlier report to hide what it already had,
+  as `--baseline` does.
+- **Save and export**: save the report as JSON (to open again or compare with later),
+  SARIF (for GitHub code scanning) or text.
 
 GitHub access comes, in this order, from `GITHUB_TOKEN`, from the
 [GitHub CLI](https://cli.github.com/)'s login (`gh auth login`), or from a token you

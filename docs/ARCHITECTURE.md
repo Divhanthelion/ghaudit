@@ -496,6 +496,12 @@ Anything with side effects (file dialogs, reading files, opening links) happens 
 | `save_token`, `forget_token` | Check a pasted token with `GET /user` and keep it in the system keychain; remove it |
 | `pick_folder` | Shows the folder dialog and remembers the choice: the only folder a scan can target |
 | `start_scan`, `cancel_scan` | Run a scan, streaming `Progress` events through a Tauri channel, and resolve with the report or as cancelled; stop it |
+| `compare_with`, `clear_comparison` | Ask for an earlier report and return the one on screen with `ScanReport::apply_baseline` applied (as `--baseline`); forget it |
+| `export_report` | Render the report on screen as JSON, SARIF or text (`report::render`, without colors), optionally without the compared report's findings, and save it through the save dialog, via a temporary file renamed into place |
+
+The report on screen is kept in Rust (`AppState::current`) when it is opened or a scan
+finishes, so comparisons and exports work on the scanner's own data, not on anything
+the page sends back.
 
 ### Scanning
 
@@ -525,7 +531,7 @@ without a console window.
 
 The frontend is ES modules without a bundler: `app.js` (views and state), `scan.js`
 (the setup page, options remembered in `localStorage`, which holds nothing secret),
-`progress.js` (the live progress page), `report.js`
+`progress.js` (the live progress page), `settings.js` (the settings grid), `report.js`
 (counts, coverage gaps, GitHub links, filtering and sorting: no DOM), `overview.js`,
 `findings.js`, `coverage.js`, `explain.js` (every plain-language explanation) and
 `dom.js` (element helpers and icons). A report is prepared once (`report.prepare`):
