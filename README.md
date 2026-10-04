@@ -201,9 +201,15 @@ the config file.
 
 ## Desktop app
 
-The desktop app shows ghaudit's results without the command line, in plain language. It
-opens the same JSON reports the CLI writes (`-f json`):
+The desktop app runs ghaudit without the command line and explains the results in plain
+language.
 
+- **Scan**: "Scan my repositories" scans everything you own in one click. Or pick one
+  repository, a folder on this computer, an organization, someone's repositories or a
+  GitHub search, and choose the checks, git history, archived repositories and forks.
+  A row per repository shows the scan as it runs (status, findings, time, errors), and
+  Cancel stops it within seconds.
+- **Open a saved report**: the app also browses JSON reports the CLI writes (`-f json`).
 - **Overview**: whether the scan is complete, how many problems there are at each
   severity and what each severity means, what kinds of problems they are, and which
   repositories have the most.
@@ -213,6 +219,14 @@ opens the same JSON reports the CLI writes (`-f json`):
   commit, the advisory or the settings page.
 - **Coverage**: which checks ran, which didn't and why, and files that weren't fully
   analyzed. A gap is never shown as a pass.
+
+GitHub access comes, in this order, from `GITHUB_TOKEN`, from the
+[GitHub CLI](https://cli.github.com/)'s login (`gh auth login`), or from a token you
+paste into the app, which keeps it in the system keychain (Windows Credential Manager,
+the macOS Keychain or the Secret Service), never in a file. The token stays in the
+app's Rust side and is never shown or logged. Dependency checks need osv-scanner; the
+app finds it on `PATH` or where `winget install --id Google.OSVScanner` puts it, and
+offers to scan without dependency checks if it's missing.
 
 Run it from a checkout (Rust 1.90+; on Linux, first install Tauri's
 [system libraries](https://v2.tauri.app/start/prerequisites/#linux)):
@@ -224,8 +238,9 @@ cargo run -p ghaudit-desktop        # or, with tauri-cli installed: cd app && ca
 The app is built to show untrusted content safely. Report text from scanned repositories
 is only ever displayed as text, never as HTML. The window runs under a strict content
 security policy and can call nothing but the app's own commands: it has no access to
-files, the shell or the network. Files are opened through the system's file dialog, and
-links open only to github.com and osv.dev.
+files, the shell or the network. Files and folders are chosen through the system's
+dialogs, and links open only to github.com and osv.dev. Like the CLI, the app only
+reads from GitHub.
 
 ## Scanning repositories you don't control
 

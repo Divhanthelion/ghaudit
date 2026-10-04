@@ -146,6 +146,7 @@ fn git_command() -> Command {
         .env("GIT_TERMINAL_PROMPT", "0") // fail instead of prompting for credentials
         .stdin(Stdio::null())
         .kill_on_drop(true);
+    crate::process::hide_window(&mut cmd);
     cmd
 }
 

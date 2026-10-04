@@ -3,5 +3,15 @@
   "identifier": "default",
   "description": "The main window may call the app's own commands and nothing else: no file system, shell, dialog or opener access from the page. Dialogs, file reads and links are handled in Rust.",
   "windows": ["main"],
-  "permissions": ["allow-catalog", "allow-open-report", "allow-open-link"]
+  "permissions": [
+    "allow-catalog",
+    "allow-open-report",
+    "allow-open-link",
+    "allow-environment",
+    "allow-save-token",
+    "allow-forget-token",
+    "allow-pick-folder",
+    "allow-start-scan",
+    "allow-cancel-scan"
+  ]
 }

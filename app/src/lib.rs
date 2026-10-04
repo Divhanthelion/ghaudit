@@ -3,19 +3,38 @@
 //! The page is treated as untrusted display code. It renders report content (paths,
 //! messages, snippets from scanned repositories) and can only call the commands below:
 //! it has no file-system, shell, dialog or opener access of its own. File dialogs and
-//! file reads happen here, and links open only to GitHub and OSV (see [`links`]).
+//! file reads happen here, and links open only to GitHub and OSV (see [`links`]). The
+//! GitHub token stays here too (see [`token`]): the page never receives it.
 
+mod keychain;
 mod links;
 mod reports;
+mod scan;
+mod token;
+mod tools;
 
-use ghaudit::Severity;
 use ghaudit::analyzer::{agents, rules, settings, workflows};
 use ghaudit::model::ScanReport;
+use ghaudit::{Progress, ProgressSink, Severity};
+use scan::{Context, ScanOptions, TargetSpec};
 use serde::Serialize;
 use std::path::PathBuf;
-use tauri::{AppHandle, WebviewWindow};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tauri::ipc::Channel;
+use tauri::{AppHandle, Manager, State, WebviewWindow, WindowEvent};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
+use token::Token;
+use tokio::sync::Notify;
+
+#[derive(Default)]
+struct AppState {
+    /// The folder last chosen in the folder dialog: the only folder the page can scan.
+    folder: Mutex<Option<PathBuf>>,
+    /// Set while a scan runs; notifying it stops the scan.
+    scan: Mutex<Option<Arc<Notify>>>,
+}
 
 /// A rule the page can describe: names and default severities for every check.
 #[derive(Serialize)]
@@ -103,6 +122,209 @@ async fn pick_report(window: &WebviewWindow, title: &str) -> Option<PathBuf> {
     rx.await.ok().flatten()?.into_path().ok()
 }
 
+// ---------------------------------------------------------------- what this computer has
+
+#[derive(Serialize)]
+struct GithubAccess {
+    /// Where the token comes from; `None` without one.
+    source: Option<token::Source>,
+    /// Whose it is; `None` if GitHub doesn't accept it.
+    login: Option<String>,
+}
+
+#[derive(Serialize)]
+struct Keychain {
+    available: bool,
+    /// A token is saved there (used only when there is no other source).
+    saved: bool,
+}
+
+#[derive(Serialize)]
+struct Environment {
+    github: GithubAccess,
+    keychain: Keychain,
+    /// The GitHub CLI is installed.
+    github_cli: bool,
+    osv_scanner: Option<tools::Program>,
+    git: Option<tools::Program>,
+}
+
+async fn probe(path: Option<PathBuf>) -> Option<tools::Program> {
+    tools::probe(path?).await
+}
+
+/// GitHub access, osv-scanner and git: what scans can use, without the token itself.
+#[tauri::command]
+async fn environment() -> Environment {
+    let token = token::resolve().await;
+    let login = match &token {
+        Some(t) => token::login(t.secret()).await,
+        None => None,
+    };
+    let (osv_scanner, git) = tokio::join!(
+        probe(tools::find_osv_scanner()),
+        probe(tools::find_program("git"))
+    );
+    Environment {
+        github: GithubAccess {
+            source: token.as_ref().map(|t| t.source),
+            login,
+        },
+        keychain: Keychain {
+            available: keychain::available(),
+            saved: keychain::get().ok().flatten().is_some(),
+        },
+        github_cli: tools::find_gh().is_some(),
+        osv_scanner,
+        git,
+    }
+}
+
+/// Check a token with GitHub and keep it in the system keychain. Returns its login.
+#[tauri::command]
+async fn save_token(token: String) -> Result<String, String> {
+    let token = token.trim().to_string();
+    if !token::plausible(&token) {
+        return Err("That doesn't look like a GitHub token. Copy the whole token: it starts with ghp_ or github_pat_.".into());
+    }
+    if !keychain::available() {
+        return Err("This computer has no system keychain to keep a token in. Sign in with the GitHub CLI (gh auth login) or set GITHUB_TOKEN instead.".into());
+    }
+    let login = token::login(&token).await.ok_or(
+        "GitHub didn't accept this token. Check that it's complete and hasn't expired or been revoked.",
+    )?;
+    keychain::set(&token)?;
+    Ok(login)
+}
+
+/// Remove the saved token from the system keychain.
+#[tauri::command]
+fn forget_token() -> Result<(), String> {
+    keychain::delete()
+}
+
+// ---------------------------------------------------------------- scanning
+
+/// Ask for a folder to scan. Returns its path for display, or `None` if cancelled.
+#[tauri::command]
+async fn pick_folder(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    window
+        .dialog()
+        .file()
+        .set_parent(&window)
+        .set_title("Choose a folder to scan")
+        .pick_folder(move |folder| {
+            let _ = tx.send(folder);
+        });
+    let Some(path) = rx.await.ok().flatten().and_then(|f| f.into_path().ok()) else {
+        return Ok(None);
+    };
+    let shown = path.display().to_string();
+    *state.folder.lock().unwrap() = Some(path);
+    Ok(Some(shown))
+}
+
+#[derive(Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+enum ScanResult {
+    Finished { report: Box<ScanReport> },
+    Cancelled,
+}
+
+/// Clears the running scan when the command ends, however it ends.
+struct Running<'a>(&'a Mutex<Option<Arc<Notify>>>);
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap() = None;
+    }
+}
+
+/// Run a scan, sending progress events to `on_progress`. Resolves with the report, or
+/// as cancelled when `cancel_scan` is called.
+#[tauri::command]
+async fn start_scan(
+    state: State<'_, AppState>,
+    options: ScanOptions,
+    on_progress: Channel<Progress>,
+) -> Result<ScanResult, String> {
+    let stop = Arc::new(Notify::new());
+    {
+        let mut running = state.scan.lock().unwrap();
+        if running.is_some() {
+            return Err("A scan is already running.".into());
+        }
+        *running = Some(Arc::clone(&stop));
+    }
+    let _running = Running(&state.scan);
+    let work = async {
+        let token = token::resolve().await;
+        let login = match (&options.target, &token) {
+            (TargetSpec::Mine, Some(t)) => token::login(t.secret()).await,
+            _ => None,
+        };
+        let osv_scanner = if options.sca {
+            tools::find_osv_scanner()
+        } else {
+            None
+        };
+        let folder = state.folder.lock().unwrap().clone();
+        let (config, target) = scan::prepare(
+            &options,
+            &Context {
+                token: token.as_ref().map(Token::secret),
+                login: login.as_deref(),
+                osv_scanner: osv_scanner.as_deref(),
+                folder: folder.as_deref(),
+            },
+        )?;
+        let sink: ProgressSink = Arc::new(move |event| {
+            let _ = on_progress.send(event);
+        });
+        scan::run(config, target, sink).await
+    };
+    // Dropping `work` stops the scan: clones are deleted and child processes killed.
+    tokio::select! {
+        result = work => result.map(|report| ScanResult::Finished { report: Box::new(report) }),
+        () = stop.notified() => Ok(ScanResult::Cancelled),
+    }
+}
+
+/// Stop the running scan, if any.
+#[tauri::command]
+fn cancel_scan(state: State<'_, AppState>) {
+    if let Some(stop) = state.scan.lock().unwrap().as_ref() {
+        stop.notify_one();
+    }
+}
+
+/// Closing the window during a scan stops the scan first, so its temporary clones are
+/// removed rather than left behind.
+fn on_window_event(window: &tauri::Window, event: &WindowEvent) {
+    let WindowEvent::CloseRequested { api, .. } = event else {
+        return;
+    };
+    let Some(stop) = window.state::<AppState>().scan.lock().unwrap().clone() else {
+        return;
+    };
+    api.prevent_close();
+    stop.notify_one();
+    let window = window.clone();
+    tauri::async_runtime::spawn(async move {
+        for _ in 0..100 {
+            if window.state::<AppState>().scan.lock().unwrap().is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let _ = window.destroy();
+    });
+}
+
 /// Open a GitHub or OSV link in the system browser.
 #[tauri::command]
 fn open_link(app: AppHandle, url: String) -> Result<(), String> {
@@ -116,7 +338,19 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![catalog, open_report, open_link])
+        .manage(AppState::default())
+        .on_window_event(on_window_event)
+        .invoke_handler(tauri::generate_handler![
+            catalog,
+            open_report,
+            open_link,
+            environment,
+            save_token,
+            forget_token,
+            pick_folder,
+            start_scan,
+            cancel_scan
+        ])
         .run(tauri::generate_context!())
         .expect("error while running ghaudit");
 }

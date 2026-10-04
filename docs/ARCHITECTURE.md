@@ -492,8 +492,40 @@ Anything with side effects (file dialogs, reading files, opening links) happens 
 | `catalog` | App and scanner versions, and every rule's name and severity (settings checks are named only there) |
 | `open_report` | Shows the system's open-file dialog and reads the chosen report (UTF-8 or UTF-16, up to 200 MB, `tool` must be `ghaudit`); returns it with its file name, not its path |
 | `open_link` | Opens an https link to github.com or osv.dev in the browser; refuses anything else (other hosts, ports, credentials in the URL, other schemes) |
+| `environment` | What scans can use: where the GitHub token comes from and whose it is (never the token), whether a token is saved in the keychain, the GitHub CLI, osv-scanner and git with their versions |
+| `save_token`, `forget_token` | Check a pasted token with `GET /user` and keep it in the system keychain; remove it |
+| `pick_folder` | Shows the folder dialog and remembers the choice: the only folder a scan can target |
+| `start_scan`, `cancel_scan` | Run a scan, streaming `Progress` events through a Tauri channel, and resolve with the report or as cancelled; stop it |
 
-The frontend is ES modules without a bundler: `app.js` (views and state), `report.js`
+### Scanning
+
+`scan.rs` turns the page's options into a `Config` and a `Target` the way `main.rs` turns
+flags into them, so a scan in the app finds what the same CLI command finds (a test
+compares the configurations). "My repositories" is `Target::User` with the token's
+login. The repository field goes through `parse_scan_target` but refuses anything that
+resolves to a local path: folders come only from the folder dialog.
+
+The scan runs inside the `start_scan` command, raced against a `Notify` that
+`cancel_scan` triggers. Cancelling drops the scan future, which (as Ctrl-C does in the
+CLI) deletes temporary clones, kills child processes and tells analysis threads to
+stop; the page is back on the setup page within a few seconds. Closing the window
+during a scan cancels it and waits for that cleanup before the app exits. One scan
+runs at a time.
+
+The GitHub token is resolved for each scan (`token.rs`): `GITHUB_TOKEN`, then
+`gh auth token --hostname github.com`, then the keychain (`keychain.rs`, keyring-core
+with Windows Credential Manager, the macOS Keychain or the Secret Service; no file
+fallback). It never crosses to the page, and `Token`'s `Debug` output is redacted.
+Helper programs (`tools.rs`) are found by absolute path: osv-scanner on `PATH`, then
+winget's install folder, since a running app keeps the `PATH` it started with; git and
+the GitHub CLI on `PATH` (and the CLI's default install folders on Windows). They run
+without a console window.
+
+### Frontend
+
+The frontend is ES modules without a bundler: `app.js` (views and state), `scan.js`
+(the setup page, options remembered in `localStorage`, which holds nothing secret),
+`progress.js` (the live progress page), `report.js`
 (counts, coverage gaps, GitHub links, filtering and sorting: no DOM), `overview.js`,
 `findings.js`, `coverage.js`, `explain.js` (every plain-language explanation) and
 `dom.js` (element helpers and icons). A report is prepared once (`report.prepare`):
@@ -519,6 +551,8 @@ and titles reach the page. So:
   window. No plugin permission is granted, so the page cannot use the file-system,
   shell, dialog or opener APIs directly, even through Tauri's JavaScript API.
 - **Links** are checked in Rust (`links.rs`) after parsing, not by prefix.
+- **The token stays in Rust**: the page gets its source and login only. A token the
+  user pastes crosses to Rust once and is kept in the system keychain, never in a file.
 - **Read-only**: the app, like the CLI, only reads from GitHub.
 
 ## Design decisions
@@ -550,4 +584,4 @@ and titles reach the page. So:
 | Git history | `analyzer/history.rs` | real repositories built in a temp dir: deleted, renamed and still-present credentials, limits |
 | End to end | `tests/cli.rs` | the real binary: exit codes, formats, exclusions, redaction, SARIF stability, untrusted clones, org scans and settings audits against a mock API, baselines, history |
 | Live | `tests/cli.rs` (ignored by default) | the real osv-scanner; run in CI with `--include-ignored` |
-| Desktop app | `app/src/*.rs`, `app/tests/security.rs` | report reading (encodings, size limit, other files), the link allowlist, the rule catalog; the CSP, the capability and the UI scripts |
+| Desktop app | `app/src/*.rs`, `app/tests/security.rs` | report reading (encodings, size limit, other files), the link allowlist, the rule catalog, scan options against the CLI's configuration, target checks, token redaction, program lookup; the CSP, the capability and the UI scripts |

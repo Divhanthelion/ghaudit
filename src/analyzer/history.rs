@@ -240,6 +240,7 @@ fn git(root: &Path) -> Command {
         ])
         .stdin(Stdio::null())
         .stderr(Stdio::null());
+    crate::process::hide_window_std(&mut cmd);
     cmd
 }
 

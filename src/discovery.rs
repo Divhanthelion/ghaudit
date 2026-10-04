@@ -265,7 +265,9 @@ fn keep_tracked(rel: &str, overrides: &Override) -> bool {
 /// Files git tracks although an ignore rule matches them (`git ls-files -ci`).
 /// Empty outside a git work tree or without git.
 fn tracked_but_ignored(root: &Path) -> Vec<String> {
-    let output = Command::new("git")
+    let mut git = Command::new("git");
+    crate::process::hide_window_std(&mut git);
+    let output = git
         .arg("-C")
         .arg(root)
         // A copied-in .git/config must not run a command for us.
