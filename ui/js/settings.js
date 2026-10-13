@@ -1,10 +1,12 @@
 // The Settings tab: each repository's security settings as a grid of passed, needs
-// attention and couldn't check. A setting ghaudit couldn't read is a gap in what was
-// checked, shown with its reason, and never counted as a pass.
+// attention and couldn't check (on a phone, a list of repositories that opens each one's
+// checks). A setting ghaudit couldn't read is a gap in what was checked, shown with its
+// reason, and never counted as a pass.
 
-import { h, replace, icon, plural } from "./dom.js";
+import { h, replace, icon, plural, phone, shortRepo, reportOwner } from "./dom.js";
 import { SETTINGS_AREAS, CHECK_STATUS, ANALYZER_STATE } from "./explain.js";
 import * as backend from "./backend.js";
+import * as nav from "./nav.js";
 
 const CELL = {
   pass: { cls: "pass", icon: "check" },
@@ -67,6 +69,9 @@ export function createSettingsView(prepared, { rules, showFindings, onError }) {
   for (const e of entries) totals[e.status] = (totals[e.status] ?? 0) + 1;
 
   const state = { show: "all", text: "", selected: null, limit: PAGE };
+  /** Phones list repositories instead of the grid; the app rebuilds this view on a change. */
+  const onPhone = phone.matches;
+  const owner = reportOwner(prepared.raw.target);
 
   // ---------------------------------------------------------------- controls
 
@@ -81,14 +86,24 @@ export function createSettingsView(prepared, { rules, showFindings, onError }) {
   showSelect.addEventListener("change", () => {
     state.show = showSelect.value;
     state.limit = PAGE;
-    renderGrid();
+    render();
   });
   const search = h("input", { class: "input", type: "search", placeholder: "Find a repository", "aria-label": "Find a repository", spellcheck: "false" });
   search.addEventListener("input", () => {
     state.text = search.value.trim().toLowerCase();
     state.limit = PAGE;
-    renderGrid();
+    render();
   });
+  search.setAttribute("autocapitalize", "off");
+  search.setAttribute("enterkeyhint", "search");
+  search.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && onPhone) search.blur();
+  });
+
+  function render() {
+    if (onPhone) renderList();
+    else renderGrid();
+  }
 
   // ---------------------------------------------------------------- grid
 
@@ -221,6 +236,135 @@ export function createSettingsView(prepared, { rules, showFindings, onError }) {
     );
   }
 
+  // ---------------------------------------------------------------- phone list
+
+  function counts(r) {
+    const parts = [];
+    if (r.counts.fail) parts.push(h("span", { class: "c-fail" }, `${r.counts.fail} to fix`));
+    if (r.counts.not_assessable) parts.push(h("span", { class: "c-na" }, `${r.counts.not_assessable} unchecked`));
+    if (!parts.length) parts.push(h("span", { class: "c-pass" }, "all passed"));
+    return parts;
+  }
+
+  function renderList() {
+    const matching = visibleRows();
+    const shown = matching.slice(0, state.limit);
+    if (!shown.length) {
+      replace(gridWrap, h("div", { class: "empty" }, icon("filter"), h("h3", {}, "No repositories match")));
+      return;
+    }
+    replace(
+      gridWrap,
+      h(
+        "ul",
+        { class: "settings-list" },
+        shown.map((r) =>
+          h(
+            "li",
+            {},
+            h(
+              "button",
+              { type: "button", class: "repo-setting", onclick: () => openRepository(r) },
+              h("span", { class: "repo-name" }, shortName(r.target)),
+              h("span", { class: "row-counts" }, counts(r)),
+              // The grid's at-a-glance view: one square per check, in its order.
+              h(
+                "span",
+                { class: "strip", "aria-hidden": "true" },
+                columns.map((c) => h("span", { class: `dot ${CELL[r.cells.get(c.id)?.status]?.cls ?? (r.cells.has(c.id) ? "na" : "none")}` })),
+              ),
+              icon("chevronRight", "chev"),
+            ),
+          ),
+        ),
+      ),
+      matching.length > shown.length
+        ? h(
+            "div",
+            { class: "more" },
+            h(
+              "button",
+              {
+                type: "button",
+                class: "btn",
+                onclick: () => {
+                  state.limit += PAGE;
+                  renderList();
+                },
+              },
+              `Show ${Math.min(PAGE, matching.length - shown.length).toLocaleString()} more of ${matching.length.toLocaleString()}`,
+            ),
+          )
+        : null,
+    );
+  }
+
+  function shortName(target) {
+    return target.startsWith("org:") ? targetName(target) : shortRepo(target, owner);
+  }
+
+  /** A repository's checks, area by area, each opening to its explanation. */
+  function openRepository(r) {
+    let close = () => {};
+    const content = areas.map((a) =>
+      h(
+        "section",
+        { class: "check-area" },
+        h("h3", {}, a.label),
+        h(
+          "div",
+          { class: "card check-rows" },
+          columns
+            .filter((c) => c.area === a.id)
+            .map((c) => {
+              const e = r.cells.get(c.id);
+              if (!e) {
+                return h(
+                  "div",
+                  { class: "check-row none" },
+                  h("span", { class: "cell mini none", "aria-hidden": "true" }, "·"),
+                  h("span", { class: "check-label" }, c.label),
+                  h("span", { class: "check-status" }, "Doesn't apply"),
+                );
+              }
+              const kind = CELL[e.status] ?? CELL.not_assessable;
+              const status = CHECK_STATUS[e.status] ?? CHECK_STATUS.not_assessable;
+              return h(
+                "details",
+                { class: `check-row ${kind.cls}` },
+                h(
+                  "summary",
+                  {},
+                  h("span", { class: `cell mini ${kind.cls}`, "aria-hidden": "true" }, icon(kind.icon)),
+                  h("span", { class: "check-label" }, c.label),
+                  h("span", { class: "check-status" }, status.label),
+                ),
+                h(
+                  "div",
+                  { class: "check-body" },
+                  checkBody(r.target, c.id, () => close()),
+                  h("div", { class: "rule-id" }, `Fails as “${c.name}” · ${c.id}`),
+                ),
+              );
+            }),
+        ),
+      ),
+    );
+    close = nav.openSheet({
+      title: shortName(r.target),
+      subtitle: [
+        r.counts.fail ? `${r.counts.fail} to fix` : null,
+        r.counts.not_assessable ? `${r.counts.not_assessable} couldn't be checked` : null,
+        !r.counts.fail && !r.counts.not_assessable ? "Every check passed" : null,
+      ]
+        .filter(Boolean)
+        .join(" · "),
+      content,
+      full: true,
+      className: "settings-sheet",
+    });
+  }
+
   gridWrap.addEventListener("click", (e) => {
     const button = e.target.closest("button.cell");
     if (button) select(button);
@@ -271,8 +415,6 @@ export function createSettingsView(prepared, { rules, showFindings, onError }) {
     const column = columns.find((c) => c.id === check);
     const status = CHECK_STATUS[e.status] ?? CHECK_STATUS.not_assessable;
     const kind = CELL[e.status] ?? CELL.not_assessable;
-    const finding = prepared.findings.find((f) => f.rule_id === check && (f.repository ?? prepared.singleRepo) === (target.startsWith("org:") ? null : target));
-    const settingsPage = finding?.help_url ?? (OWNER_REPO.test(target) ? `https://github.com/${target}/settings` : null);
     replace(
       detail,
       h(
@@ -281,30 +423,51 @@ export function createSettingsView(prepared, { rules, showFindings, onError }) {
         h("div", { class: "badges" }, h("span", { class: `check-badge ${kind.cls}` }, icon(kind.icon), status.label)),
         h("div", {}, h("h2", {}, column.label), h("div", { class: "rule-id" }, `Fails as “${column.name}” · ${check}`)),
         h("dl", { class: "facts" }, h("dt", {}, target.startsWith("org:") ? "Organization" : "Repository"), h("dd", {}, targetName(target))),
-        h("p", {}, status.text),
-        e.detail ? h("section", {}, h("h3", {}, e.status === "fail" ? "What was found" : "Why"), h("p", { class: "prose" }, e.detail)) : null,
-        finding?.remediation ? h("section", {}, h("h3", {}, "How to fix it"), h("div", { class: "fix" }, finding.remediation)) : null,
-        h(
-          "div",
-          { class: "links" },
-          settingsPage && ALLOWED.test(settingsPage)
-            ? h(
-                "button",
-                { type: "button", class: "link", title: settingsPage, onclick: () => backend.openLink(settingsPage).catch((err) => onError(err.message)) },
-                "Open the settings page",
-                icon("external"),
-              )
-            : null,
-          finding
-            ? h(
-                "button",
-                { type: "button", class: "link", onclick: () => showFindings({ repository: finding.repository ?? "", category: "settings", text: check }) },
-                "See it in Findings",
-              )
-            : null,
-        ),
+        checkBody(target, check, () => {}),
       ),
     );
+  }
+
+  /**
+   * What a check's status means, what was found, how to fix it, and links. `leave`
+   * closes whatever shows it before going to Findings.
+   */
+  function checkBody(target, check, leave) {
+    const e = byTarget.get(target).get(check);
+    const status = CHECK_STATUS[e.status] ?? CHECK_STATUS.not_assessable;
+    const finding = prepared.findings.find((f) => f.rule_id === check && (f.repository ?? prepared.singleRepo) === (target.startsWith("org:") ? null : target));
+    const settingsPage = finding?.help_url ?? (OWNER_REPO.test(target) ? `https://github.com/${target}/settings` : null);
+    return [
+      h("p", {}, status.text),
+      e.detail ? h("section", {}, h("h3", {}, e.status === "fail" ? "What was found" : "Why"), h("p", { class: "prose" }, e.detail)) : null,
+      finding?.remediation ? h("section", {}, h("h3", {}, "How to fix it"), h("div", { class: "fix" }, finding.remediation)) : null,
+      h(
+        "div",
+        { class: "links" },
+        settingsPage && ALLOWED.test(settingsPage)
+          ? h(
+              "button",
+              { type: "button", class: "link", title: settingsPage, onclick: () => backend.openLink(settingsPage).catch((err) => onError(err.message)) },
+              "Open the settings page",
+              icon("external"),
+            )
+          : null,
+        finding
+          ? h(
+              "button",
+              {
+                type: "button",
+                class: "link",
+                onclick: () => {
+                  leave();
+                  showFindings({ repository: finding.repository ?? "", category: "settings", text: check });
+                },
+              },
+              "See it in Findings",
+            )
+          : null,
+      ),
+    ];
   }
 
   // ---------------------------------------------------------------- page
@@ -316,7 +479,7 @@ export function createSettingsView(prepared, { rules, showFindings, onError }) {
       "div",
       { class: "section-head" },
       h("h2", {}, "Repository settings"),
-      h("p", {}, "Security settings on GitHub, for each repository. Select a square for details."),
+      h("p", {}, onPhone ? "Security settings on GitHub, for each repository. Tap one to see its checks." : "Security settings on GitHub, for each repository. Select a square for details."),
     ),
     h(
       "div",
@@ -337,13 +500,15 @@ export function createSettingsView(prepared, { rules, showFindings, onError }) {
             h(
               "p",
               {},
-              "ghaudit couldn't read these settings, so they may or may not be safe: count them as gaps in what was checked, not as passes. Select one to see why. Often the token isn't an admin of the repository, or GitHub doesn't offer the feature there.",
+              `ghaudit couldn't read these settings, so they may or may not be safe: count them as gaps in what was checked, not as passes. ${onPhone ? "Open one" : "Select one"} to see why. Often the token isn't an admin of the repository, or GitHub doesn't offer the feature there.`,
             ),
           ),
         )
       : null,
     h("div", { class: "filters settings-filters" }, h("div", { class: "search" }, icon("search"), search), showSelect, legend()),
-    h("div", { class: "settings-layout" }, h("div", { class: "card settings-grid-card" }, gridWrap), detail),
+    onPhone
+      ? h("div", { class: "card settings-list-card" }, gridWrap)
+      : h("div", { class: "settings-layout" }, h("div", { class: "card settings-grid-card" }, gridWrap), detail),
   );
 
   function summaryChip(status, n) {
@@ -360,9 +525,9 @@ export function createSettingsView(prepared, { rules, showFindings, onError }) {
     );
   }
 
-  renderGrid();
-  renderDetail();
-  return { element };
+  render();
+  if (!onPhone) renderDetail();
+  return { element, phone: onPhone };
 }
 
 /** The Settings tab when the report has no settings checks: say why. */

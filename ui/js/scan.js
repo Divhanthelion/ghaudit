@@ -1,8 +1,9 @@
 // The scan setup page: what to scan, what to check, and GitHub access. Options are
 // remembered on this computer (they hold nothing secret); the token never comes here.
 
-import { h, replace, icon, toast } from "./dom.js";
+import { h, replace, icon, toast, phone } from "./dom.js";
 import * as backend from "./backend.js";
+import * as nav from "./nav.js";
 import { ANALYZER, SEVERITIES } from "./explain.js";
 
 const STORE_KEY = "ghaudit.scan-options.v1";
@@ -64,15 +65,56 @@ export const TARGETS = [
 
 const CHECKS = ["sast", "secrets", "sca", "workflows", "agents", "settings"];
 
+/** Shown where a phone can't do what the desktop app does (the backend's wording). */
+export const PHONE_NOTES = {
+  sca: "Not available on phones: dependency checks need osv-scanner, a desktop program. Scan from a computer to check dependencies.",
+  history: "Needs the full git history, which a phone can't download.",
+};
+
+/**
+ * What this device can do, from environment(). An app without these fields is a
+ * desktop app from before phones, which can do everything.
+ */
+export function capabilities(env) {
+  const c = env?.capabilities ?? {};
+  return {
+    folders: c.folders ?? true,
+    history: c.history ?? true,
+    dependencies: c.dependencies ?? true,
+    download: c.download ?? "git",
+    pasteToken: c.paste_token ?? false,
+  };
+}
+
+/** The scan targets this device offers. */
+export function targetsFor(env) {
+  const caps = capabilities(env);
+  return TARGETS.filter((t) => t.kind !== "folder" || caps.folders);
+}
+
 /** How to install osv-scanner on this system. */
-function installOsv() {
-  const ua = navigator.userAgent;
-  if (ua.includes("Windows")) return "winget install --id Google.OSVScanner";
-  if (ua.includes("Mac")) return "brew install osv-scanner";
+function installOsv(env) {
+  const platform = env?.platform ?? (navigator.userAgent.includes("Windows") ? "windows" : navigator.userAgent.includes("Mac") ? "macos" : "linux");
+  if (platform === "windows") return "winget install --id Google.OSVScanner";
+  if (platform === "macos") return "brew install osv-scanner";
   return "go install github.com/google/osv-scanner/v2/cmd/osv-scanner@latest";
 }
 
 // ------------------------------------------------------------------ options
+
+/**
+ * The options a scan really runs with: checks this device can't do are off, whatever
+ * was saved (the saved choice comes back on a computer).
+ */
+export function effectiveOptions(o, env) {
+  const caps = capabilities(env);
+  return {
+    ...o,
+    kind: o.kind === "folder" && !caps.folders ? "mine" : o.kind,
+    checks: { ...o.checks, sca: o.checks.sca && caps.dependencies },
+    history: o.history && caps.history,
+  };
+}
 
 /** Saved options, checked field by field (anything odd falls back to the default). */
 export function loadOptions() {
@@ -147,14 +189,19 @@ export function scanLabel(o, env, folder) {
 }
 
 /** Why a scan can't start yet, or null. */
-function problem(o, env, folder) {
+function problem(options, env, folder) {
+  const o = effectiveOptions(options, env);
   const target = TARGETS.find((t) => t.kind === o.kind);
   if (o.kind === "mine" && !env?.github?.login) return "Scanning your repositories needs GitHub access (see below).";
   if (o.kind === "folder" && !folder) return "Choose a folder to scan.";
   if (target.field && !o[target.field.key].trim()) return `Enter ${target.field.label.toLowerCase()} to scan.`;
   if (o.kind === "search" && !env?.github?.source) return "GitHub search needs GitHub access (see below).";
+  // Without a token GitHub allows 60 requests an hour: a few repositories' worth.
+  if (env?.mobile && target.multi && !env.github?.login) return "Scanning many repositories needs GitHub access (see below).";
   if (!CHECKS.some((c) => o.checks[c])) return "Turn on at least one check.";
-  if (target.kind !== "folder" && !env?.git) return "Downloading repositories needs git, which isn't installed (see below).";
+  if (target.kind !== "folder" && capabilities(env).download === "git" && !env?.git) {
+    return "Downloading repositories needs git, which isn't installed (see below).";
+  }
   return null;
 }
 
@@ -169,6 +216,9 @@ function problem(o, env, folder) {
  */
 export function renderSetup(ctx) {
   const o = loadOptions();
+  const caps = capabilities(ctx.env);
+  const mobile = Boolean(ctx.env?.mobile);
+  if (!targetsFor(ctx.env).some((t) => t.kind === o.kind)) o.kind = "mine";
   const root = h("div", { class: "page setup" });
 
   function rerender() {
@@ -193,7 +243,7 @@ export function renderSetup(ctx) {
 
   function whatSection(target) {
     const login = ctx.env?.github?.login;
-    const cards = TARGETS.map((t) =>
+    const cards = targetsFor(ctx.env).map((t) =>
       h(
         "button",
         {
@@ -204,7 +254,8 @@ export function renderSetup(ctx) {
           onclick: () => {
             o.kind = t.kind;
             rerender();
-            root.querySelector(".target-field input")?.focus();
+            // On a touch screen focus would open the keyboard over the other options.
+            if (!mobile && !phone.matches) root.querySelector(".target-field input")?.focus();
           },
         },
         icon(t.icon),
@@ -234,6 +285,10 @@ export function renderSetup(ctx) {
       placeholder: field.placeholder,
       spellcheck: "false",
       autocomplete: "off",
+      autocapitalize: "off",
+      autocorrect: "off",
+      enterkeyhint: "go",
+      inputmode: field.key === "repo" ? "url" : null,
       "aria-label": field.label,
     });
     input.addEventListener("input", () => {
@@ -282,14 +337,18 @@ export function renderSetup(ctx) {
 
   // -------------------------------------------------------------- what to check
 
+  /** extra: { sub, disabled, note, unavailable: why this device can't do it } */
   function toggle(label, text, checked, onchange, extra = {}) {
-    const input = h("input", { type: "checkbox", checked, disabled: extra.disabled });
+    const input = h("input", { type: "checkbox", checked, disabled: extra.disabled || Boolean(extra.unavailable) });
     input.addEventListener("change", () => onchange(input.checked));
+    const cls = ["toggle-row", extra.sub ? "sub" : "", extra.disabled || extra.unavailable ? "disabled" : "", extra.unavailable ? "unavailable" : ""];
     return h(
       "label",
-      { class: `toggle-row${extra.sub ? " sub" : ""}${extra.disabled ? " disabled" : ""}` },
+      { class: cls.filter(Boolean).join(" ") },
       input,
       h("span", { class: "toggle-text" }, h("b", {}, label), h("span", {}, text), extra.note ?? null),
+      // Not faded with the rest of the row: it says why.
+      extra.unavailable ? h("span", { class: "unavailable-note" }, icon("info"), extra.unavailable) : null,
     );
   }
 
@@ -298,27 +357,34 @@ export function renderSetup(ctx) {
     const rows = [];
     for (const id of CHECKS) {
       const a = ANALYZER[id];
+      const unavailable = id === "sca" && !caps.dependencies ? PHONE_NOTES.sca : null;
       let note = null;
-      if (id === "sca" && env && !env.osv_scanner) note = osvMissing();
+      if (id === "sca" && env && !env.osv_scanner && !unavailable) note = osvMissing();
       if (id === "sca" && env?.osv_scanner?.version) note = h("span", { class: "ok-note" }, icon("check"), env.osv_scanner.version);
       if (id === "settings" && env && !env.github.login) note = h("span", { class: "warn-note" }, "Needs GitHub access; without it this check is skipped.");
       rows.push(
-        toggle(a.label, a.text, o.checks[id], (on) => {
-          o.checks[id] = on;
-          rerender();
-        }, { note }),
+        toggle(
+          a.label,
+          a.text,
+          o.checks[id] && !unavailable,
+          (on) => {
+            o.checks[id] = on;
+            rerender();
+          },
+          { note, unavailable },
+        ),
       );
       if (id === "secrets") {
         rows.push(
           toggle(
             "Also search git history",
             "Finds credentials that were deleted but are still in old commits. Slower: every commit is downloaded.",
-            o.history && o.checks.secrets,
+            o.history && o.checks.secrets && caps.history,
             (on) => {
               o.history = on;
               rerender();
             },
-            { sub: true, disabled: !o.checks.secrets },
+            { sub: true, disabled: !o.checks.secrets, unavailable: caps.history ? null : PHONE_NOTES.history },
           ),
         );
       }
@@ -331,7 +397,7 @@ export function renderSetup(ctx) {
       "span",
       { class: "warn-note" },
       "osv-scanner isn't installed, so dependencies can't be checked. Install it with ",
-      h("code", {}, installOsv()),
+      h("code", {}, installOsv(ctx.env)),
       ", then ",
       h("button", { type: "button", class: "link", onclick: () => ctx.refreshEnvironment() }, "check again"),
       ".",
@@ -341,7 +407,16 @@ export function renderSetup(ctx) {
   // -------------------------------------------------------------- repositories
 
   function repositoriesSection() {
-    const max = h("input", { class: "input narrow", type: "number", min: 1, max: 1000, value: o.maxRepos, "aria-label": "Most repositories to scan" });
+    const max = h("input", {
+      class: "input narrow",
+      type: "number",
+      min: 1,
+      max: 1000,
+      value: o.maxRepos,
+      inputmode: "numeric",
+      enterkeyhint: "done",
+      "aria-label": "Most repositories to scan",
+    });
     max.addEventListener("change", () => {
       const n = Math.round(Number(max.value));
       o.maxRepos = Number.isFinite(n) ? Math.min(1000, Math.max(1, n)) : DEFAULTS.maxRepos;
@@ -406,7 +481,7 @@ export function renderSetup(ctx) {
       const how = {
         environment: "using the GITHUB_TOKEN environment variable",
         github_cli: "through the GitHub CLI",
-        keychain: "with the token saved in your system keychain",
+        keychain: mobile ? "with the token saved on this phone" : "with the token saved in your system keychain",
       }[source];
       if (login) {
         body.push(h("p", { class: "status-line ok" }, icon("checkCircle"), `Signed in to GitHub as ${login}, ${how}.`));
@@ -417,7 +492,7 @@ export function renderSetup(ctx) {
             { class: "status-line warn" },
             icon("alert"),
             `GitHub didn't accept the token ${how}. It may have expired: `,
-            source === "github_cli" ? h("span", {}, "run ", h("code", {}, "gh auth login"), " again.") : "replace it.",
+            source === "github_cli" ? h("span", {}, "run ", h("code", {}, "gh auth login"), " again.") : mobile ? "create a new one below." : "replace it.",
           ),
         );
       } else {
@@ -426,11 +501,15 @@ export function renderSetup(ctx) {
             "p",
             { class: "status-line warn" },
             icon("alert"),
-            "No GitHub access. Public repositories and folders can still be scanned, but not private repositories or settings, and GitHub allows only 60 requests an hour.",
+            caps.folders
+              ? "No GitHub access. Public repositories and folders can still be scanned, but not private repositories or settings, and GitHub allows only 60 requests an hour."
+              : "No GitHub access. Public repositories can still be scanned, but not private repositories or settings, and GitHub allows only 60 requests an hour.",
           ),
         );
       }
-      if (!login) {
+      if (caps.pasteToken) {
+        body.push(phoneToken(env));
+      } else if (!login && !mobile) {
         body.push(
           h(
             "p",
@@ -443,9 +522,9 @@ export function renderSetup(ctx) {
           ),
         );
       }
-      body.push(tokenForm(env));
+      if (!caps.pasteToken) body.push(tokenForm(env));
     }
-    if (env && !env.git) {
+    if (env && !env.git && caps.download === "git") {
       body.push(
         h(
           "p",
@@ -510,7 +589,7 @@ export function renderSetup(ctx) {
       h(
         "p",
         { class: "muted" },
-        "A token is kept in your system keychain, never in a file. ghaudit only reads: a classic token with the repo and read:org scopes covers everything, and settings are fully checked only for repositories where you are an admin. A saved token is used only when GITHUB_TOKEN isn't set and the GitHub CLI isn't signed in.",
+        "A token is kept in your system keychain, never in a file. ghaudit only reads. A classic token needs the repo scope to read private repositories (and read:org for organizations), but even then settings are fully checked only for repositories where the token's user is an admin. A saved token is used only when GITHUB_TOKEN isn't set and the GitHub CLI isn't signed in.",
       ),
       usedElsewhere ? h("p", { class: "muted" }, "A token is saved, but the sign-in above is being used instead.") : null,
       h("div", { class: "token-row" }, input, save),
@@ -538,6 +617,88 @@ export function renderSetup(ctx) {
     return details;
   }
 
+  /**
+   * Phones: no password field. GitHub's token page opens in the browser, filled in; the
+   * backend takes the copied token from the clipboard, so it never reaches the page.
+   */
+  function phoneToken(env) {
+    const saved = env.keychain.saved;
+    const message = h("p", { class: "form-message", role: "status" });
+    const fail = (e) => replace(message, h("span", { class: "error-text" }, e.message));
+    const create = h(
+      "button",
+      {
+        type: "button",
+        class: "btn",
+        onclick: () => {
+          replace(message);
+          backend.openTokenPage().catch(fail);
+        },
+      },
+      icon("external"),
+      "Create a token on GitHub",
+    );
+    const paste = h(
+      "button",
+      {
+        type: "button",
+        class: "btn primary",
+        onclick: async () => {
+          paste.disabled = true;
+          replace(message, "Checking the token with GitHub…");
+          try {
+            const login = await backend.pasteToken();
+            replace(message);
+            toast(`Token saved on this phone (${login}).`);
+            ctx.refreshEnvironment();
+          } catch (e) {
+            fail(e);
+          } finally {
+            paste.disabled = false;
+          }
+        },
+      },
+      icon("clipboard"),
+      "Paste token",
+    );
+    const steps = [
+      h(
+        "ol",
+        { class: "token-steps" },
+        h("li", {}, "Tap ", h("b", {}, "Create a token on GitHub"), ". GitHub opens in your browser with a read-only token already filled in."),
+        h("li", {}, "Under Repository access, choose ", h("b", {}, "All repositories"), ", then tap ", h("b", {}, "Generate token"), " and copy the token."),
+        h("li", {}, "Come back here and tap ", h("b", {}, "Paste token"), ". ghaudit checks the token with GitHub, keeps it in this phone's secure storage and clears the clipboard."),
+      ),
+      h("div", { class: "token-actions" }, create, paste),
+      message,
+      h("p", { class: "muted" }, "The token can only read, and only the repositories of the account or organization you choose on GitHub. Settings are fully checked only for repositories where you are an admin."),
+    ];
+    if (!saved) return h("div", { class: "token-phone" }, steps);
+    return h(
+      "details",
+      { class: "token-form", open: env.github.login ? null : true },
+      h("summary", {}, "Replace the saved token"),
+      steps,
+      h(
+        "button",
+        {
+          type: "button",
+          class: "btn quiet danger",
+          onclick: async () => {
+            try {
+              await backend.forgetToken();
+              toast("The saved token was removed from this phone.");
+              ctx.refreshEnvironment();
+            } catch (e) {
+              toast(e.message, { error: true });
+            }
+          },
+        },
+        "Forget the saved token",
+      ),
+    );
+  }
+
   // -------------------------------------------------------------- start
 
   const startButton = h("button", { type: "button", class: "btn primary large", onclick: () => start() }, icon("play"), "Start scan");
@@ -556,19 +717,17 @@ export function renderSetup(ctx) {
 
   function start() {
     if (problem(o, ctx.env, ctx.folder) || !ctx.env) return;
-    if (o.checks.sca && !ctx.env.osv_scanner) {
-      confirmWithoutSca();
+    const run = effectiveOptions(o, ctx.env);
+    if (run.checks.sca && !ctx.env.osv_scanner) {
+      confirmWithoutSca(run);
       return;
     }
     saveOptions(o);
-    ctx.start(scanRequest(o), scanLabel(o, ctx.env, ctx.folder), o);
+    ctx.start(scanRequest(run), scanLabel(run, ctx.env, ctx.folder), run);
   }
 
-  function confirmWithoutSca() {
-    const dismiss = () => {
-      dialog.close();
-      dialog.remove();
-    };
+  function confirmWithoutSca(run) {
+    let dismiss = () => {};
     const dialog = h(
       "dialog",
       { class: "confirm", "aria-labelledby": "osv-title" },
@@ -577,13 +736,13 @@ export function renderSetup(ctx) {
         "p",
         {},
         "osv-scanner isn't installed, so known vulnerabilities in packages would be missed. Install it with ",
-        h("code", {}, installOsv()),
+        h("code", {}, installOsv(ctx.env)),
         ", or scan everything else now.",
       ),
       h(
         "div",
         { class: "confirm-actions" },
-        h("button", { type: "button", class: "btn", onclick: dismiss }, "Cancel"),
+        h("button", { type: "button", class: "btn", onclick: () => dismiss() }, "Cancel"),
         h(
           "button",
           {
@@ -591,17 +750,15 @@ export function renderSetup(ctx) {
             class: "btn primary",
             onclick: () => {
               dismiss();
-              const without = { ...o, checks: { ...o.checks, sca: false } };
-              ctx.start(scanRequest(without), scanLabel(o, ctx.env, ctx.folder), without);
+              const without = { ...run, checks: { ...run.checks, sca: false } };
+              ctx.start(scanRequest(without), scanLabel(run, ctx.env, ctx.folder), without);
             },
           },
           "Scan without dependency checks",
         ),
       ),
     );
-    dialog.addEventListener("close", () => dialog.remove()); // Esc
-    document.body.append(dialog);
-    dialog.showModal();
+    dismiss = nav.showDialog(dialog);
   }
 
   rerender();

@@ -18,6 +18,11 @@ export function renderCoverage(prepared) {
   );
 }
 
+/** "not available on phones: …" → "Not available on phones: …" */
+function sentence(text) {
+  return text ? text[0].toUpperCase() + text.slice(1) : "";
+}
+
 function stateCell(a) {
   const s = ANALYZER_STATE[a?.state] ?? ANALYZER_STATE.skipped;
   return h("span", { class: `state ${s.cls}` }, icon(s.icon), a ? s.label : "Not in report");
@@ -40,7 +45,7 @@ function checksSection(r) {
       { class: "card table-wrap" },
       h(
         "table",
-        { class: "data" },
+        { class: "data stack" },
         h("thead", {}, h("tr", {}, h("th", {}, "Check"), h("th", {}, "Status"), h("th", {}, "Details"))),
         h(
           "tbody",
@@ -51,9 +56,9 @@ function checksSection(r) {
             return h(
               "tr",
               {},
-              h("td", {}, h("b", {}, analyzerLabel(id)), info ? h("div", { class: "muted" }, info.text) : null),
-              h("td", {}, stateCell(a)),
-              h("td", {}, a?.detail === "disabled" ? "Turned off for this scan" : (a?.detail ?? "")),
+              h("td", { class: "stack-head" }, h("b", {}, analyzerLabel(id)), info ? h("div", { class: "muted" }, info.text) : null),
+              h("td", { "data-label": "Status" }, stateCell(a)),
+              h("td", { "data-label": "Details", class: a?.detail ? null : "stack-empty" }, a?.detail === "disabled" ? "Turned off for this scan" : sentence(a?.detail)),
             );
           }),
         ),
@@ -94,7 +99,7 @@ function repositoryProblems(prepared) {
           { class: "card table-wrap" },
           h(
             "table",
-            { class: "data" },
+            { class: "data stack" },
             h("thead", {}, h("tr", {}, h("th", {}, "Repository"), h("th", {}, "Check"), h("th", {}, "What happened"))),
             h(
               "tbody",
@@ -103,11 +108,11 @@ function repositoryProblems(prepared) {
                 h(
                   "tr",
                   {},
-                  h("td", {}, h("span", { class: "f-repo" }, repo)),
-                  h("td", {}, check),
+                  h("td", { class: "stack-head" }, h("span", { class: "f-repo" }, repo)),
+                  h("td", { "data-label": "Check" }, check),
                   h(
                     "td",
-                    {},
+                    { "data-label": "What happened" },
                     kind === "failed" ? h("span", { class: "state failed" }, icon("xCircle"), "Failed") : h("span", { class: "state skipped" }, icon("info"), "Note"),
                     h("div", {}, detail),
                   ),
@@ -143,7 +148,7 @@ function skippedSection(r, multi) {
           { class: "card table-wrap" },
           h(
             "table",
-            { class: "data" },
+            { class: "data stack" },
             h("thead", {}, h("tr", {}, multi ? h("th", {}, "Repository") : null, h("th", {}, "File"), h("th", {}, "Why"))),
             h(
               "tbody",
@@ -152,9 +157,9 @@ function skippedSection(r, multi) {
                 h(
                   "tr",
                   {},
-                  multi ? h("td", {}, h("span", { class: "f-repo" }, s.repository ?? "")) : null,
-                  h("td", {}, h("span", { class: "f-loc" }, s.path)),
-                  h("td", {}, skipReason(s.reason)),
+                  multi ? h("td", { "data-label": "Repository" }, h("span", { class: "f-repo" }, s.repository ?? "")) : null,
+                  h("td", { "data-label": "File" }, h("span", { class: "f-loc" }, s.path)),
+                  h("td", { "data-label": "Why" }, skipReason(s.reason)),
                 ),
               ),
             ),
@@ -205,7 +210,7 @@ function leftOutSection(r, multi) {
           { class: "card table-wrap" },
           h(
             "table",
-            { class: "data" },
+            { class: "data stack" },
             h("thead", {}, h("tr", {}, multi ? h("th", {}, "Repository") : null, h("th", {}, "File"), h("th", {}, "Rule"), h("th", { class: "num" }, "Not listed"))),
             h(
               "tbody",
@@ -214,10 +219,10 @@ function leftOutSection(r, multi) {
                 h(
                   "tr",
                   {},
-                  multi ? h("td", {}, h("span", { class: "f-repo" }, o.repository ?? "")) : null,
-                  h("td", {}, h("span", { class: "f-loc" }, o.path)),
-                  h("td", {}, h("span", { class: "mono" }, o.rule_id)),
-                  h("td", { class: "num" }, o.count.toLocaleString()),
+                  multi ? h("td", { "data-label": "Repository" }, h("span", { class: "f-repo" }, o.repository ?? "")) : null,
+                  h("td", { "data-label": "File" }, h("span", { class: "f-loc" }, o.path)),
+                  h("td", { "data-label": "Rule" }, h("span", { class: "mono" }, o.rule_id)),
+                  h("td", { class: "num", "data-label": "Not listed" }, o.count.toLocaleString()),
                 ),
               ),
             ),

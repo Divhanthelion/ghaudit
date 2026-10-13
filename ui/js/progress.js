@@ -2,7 +2,7 @@
 // of checks for one repository or folder, and Cancel. Fed by ghaudit's progress events
 // (see src/progress.rs); every name and message in them is shown as text.
 
-import { h, replace, icon, plural, formatDuration } from "./dom.js";
+import { h, replace, icon, plural, formatDuration, shortRepo } from "./dom.js";
 import { ANALYZER, analyzerLabel } from "./explain.js";
 
 const ROW_STATE = {
@@ -15,9 +15,11 @@ const ROW_STATE = {
 /**
  * label: what is being scanned; options: the setup options (which checks are on, the
  * repository limit); multi: whether repositories will be listed; onCancel().
- * Returns { element, handle(event), fail(message), cancelling() }.
+ * unavailable: checks this device can't run (a phone's); owner: whose repositories,
+ * to shorten names on a phone; keepOpen: a note that leaving the app may stop the scan.
+ * Returns { element, handle(event), fail(message), stop(), cancel() }.
  */
-export function createProgressView({ label, options, multi, onCancel, onBack }) {
+export function createProgressView({ label, options, multi, onCancel, onBack, unavailable = new Set(), owner = null, keepOpen = null }) {
   const started = Date.now();
   const checkIds = ["sast", "secrets", "history", "sca", "workflows", "agents", "settings"];
   const enabled = new Set(
@@ -39,21 +41,14 @@ export function createProgressView({ label, options, multi, onCancel, onBack }) 
 
   const title = h("h1", {}, `Scanning ${label}`);
   const elapsed = h("span", { class: "elapsed" });
-  const cancel = h(
-    "button",
-    {
-      type: "button",
-      class: "btn",
-      onclick: () => {
-        run.cancelling = true;
-        cancel.disabled = true;
-        replace(cancel, icon("stop"), "Stopping…");
-        onCancel();
-      },
-    },
-    icon("stop"),
-    "Cancel",
-  );
+  function requestCancel() {
+    if (run.cancelling) return;
+    run.cancelling = true;
+    cancel.disabled = true;
+    replace(cancel, icon("stop"), "Stopping…");
+    onCancel();
+  }
+  const cancel = h("button", { type: "button", class: "btn", onclick: requestCancel }, icon("stop"), "Cancel");
   const summary = h("p", { class: "progress-summary", role: "status", "aria-live": "polite" });
   const bar = h("div", { class: "progress-bar", role: "progressbar", "aria-label": "Scan progress" });
   const fill = h("div", { class: "progress-fill" });
@@ -64,6 +59,7 @@ export function createProgressView({ label, options, multi, onCancel, onBack }) 
     "div",
     { class: "page progress-page" },
     h("div", { class: "progress-head" }, h("div", {}, title, elapsed), cancel),
+    keepOpen ? h("p", { class: "status-line keep-open" }, icon("info"), keepOpen) : null,
     h("div", { class: "card progress-card" }, summary, bar, body),
   );
 
@@ -193,13 +189,20 @@ export function createProgressView({ label, options, multi, onCancel, onBack }) 
       status = h("span", { class: `state ${s.cls}` }, icon(s.icon, "spin"), run.files.has(r.name) ? `Checking (${n} of ${checkIds.length} checks done)` : "Downloading…");
     }
     const ms = r.state === "running" ? Date.now() - r.startedAt : r.ms;
+    const short = shortRepo(r.name, owner);
     return h(
       "tr",
       { class: `repo-row ${s.cls}` },
-      h("td", {}, h("span", { class: "f-repo" }, r.name), r.error ? h("div", { class: "error-text row-error" }, r.error) : null),
-      h("td", {}, status),
-      h("td", { class: "num" }, r.state === "done" ? r.findings.toLocaleString() : ""),
-      h("td", { class: "num" }, r.state === "queued" ? "" : formatDuration(ms)),
+      h(
+        "td",
+        { class: "c-name" },
+        h("span", { class: short === r.name ? "f-repo" : "f-repo desktop-only" }, r.name),
+        short === r.name ? null : h("span", { class: "f-repo phone-only" }, short),
+        r.error ? h("div", { class: "error-text row-error" }, r.error) : null,
+      ),
+      h("td", { class: "c-status" }, status),
+      h("td", { class: "num c-findings" }, r.state === "done" ? r.findings.toLocaleString() : ""),
+      h("td", { class: "num c-time" }, r.state === "queued" ? "" : formatDuration(ms)),
     );
   }
 
@@ -224,7 +227,8 @@ export function createProgressView({ label, options, multi, onCancel, onBack }) 
         checkIds.map((id) => {
           const st = statuses.get(id);
           let state;
-          if (!enabled.has(id)) state = h("span", { class: "state skipped" }, icon("minusCircle"), "Off");
+          if (unavailable.has(id)) state = h("span", { class: "state skipped" }, icon("minusCircle"), "Not available");
+          else if (!enabled.has(id)) state = h("span", { class: "state skipped" }, icon("minusCircle"), "Off");
           else if (st?.state === "completed") state = h("span", { class: "state done" }, icon("checkCircle"), "Done");
           else if (st?.state === "failed") state = h("span", { class: "state failed" }, icon("xCircle"), "Failed");
           else if (st?.state === "skipped") state = h("span", { class: "state skipped" }, icon("minusCircle"), "Not run");
@@ -256,9 +260,16 @@ export function createProgressView({ label, options, multi, onCancel, onBack }) 
   function stop() {
     clearInterval(timer);
     if (frame) cancelAnimationFrame(frame);
+    document.removeEventListener("visibilitychange", onVisible);
   }
+
+  // Timers and animation frames pause while the app is in the background: catch up at once.
+  function onVisible() {
+    if (document.visibilityState === "visible" && !run.error) render();
+  }
+  document.addEventListener("visibilitychange", onVisible);
 
   const timer = setInterval(schedule, 1000);
   render();
-  return { element, handle, fail, stop };
+  return { element, handle, fail, stop, cancel: requestCancel };
 }
