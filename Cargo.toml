@@ -50,6 +50,13 @@ regex = "1.11"
 sha2 = "0.11"
 base64 = "0.23"
 
+# Repository archives, for scans without git (snapshot.rs): reading a .tar.gz, and the
+# git blob ids its files are checked against. tar 0.4.46 fixes 2026's PAX parsing
+# advisories; ghaudit never calls its unpack functions.
+tar = { version = "0.4.46", default-features = false }
+flate2 = "1.1"
+sha1 = "0.11"
+
 # CLI, errors, logging
 clap = { version = "4.5", features = ["derive", "env"] }
 thiserror = "2.0"
