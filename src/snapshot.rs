@@ -199,6 +199,17 @@ pub async fn fetch(
     } else {
         &check.unexpected
     };
+    // Paths that are not UTF-8 can reach the API as one lossy path: which file is which
+    // cannot be told.
+    let mut listed = HashSet::new();
+    let repeated = tree
+        .entries
+        .iter()
+        .filter(|e| e.kind == "blob" && !listed.insert(e.path.as_str()))
+        .count();
+    if repeated > 0 {
+        incomplete.push(format!("GitHub lists {repeated} file paths twice"));
+    }
     for path in unexpected {
         // Not part of the commit: the scan must not report on it.
         fs::remove_file(snapshot.path.join(path))?;
@@ -209,15 +220,22 @@ pub async fn fetch(
     }
 
     // Files written with other content than the commit's go; the commit's version is
-    // fetched instead. Files the extraction could not write (names this system does not
-    // allow) would fail again: they stay listed with their reason.
-    let unwritable: HashSet<&str> = extracted.skipped.iter().map(|(p, _)| p.as_str()).collect();
+    // fetched instead. Missing files the extraction could not write (names this system
+    // does not allow) would fail again: they stay listed with their reason. A changed
+    // file was written under its name, and can be again.
     for entry in &check.changed {
         fs::remove_file(snapshot.path.join(&entry.path))?;
     }
+    let missing = check
+        .missing
+        .iter()
+        .filter(|e| !extracted.unwritable.contains(&e.path));
     let mut wanted = Vec::new();
-    for entry in check.changed.iter().chain(&check.missing) {
-        if unwritable.contains(entry.path.as_str()) {
+    for entry in check.changed.iter().chain(missing) {
+        if entry.path.len() > MAX_PATH_BYTES {
+            snapshot
+                .skipped
+                .push((shown(entry.path.as_bytes()), PATH_TOO_LONG.into()));
             continue;
         }
         // With `write_all`, osv-scanner reads files of any size: a large lockfile is
@@ -388,6 +406,20 @@ pub struct Extracted {
     pub stored_bytes: u64,
     /// The directories created, for a [`Writer`] that goes on writing there.
     pub(crate) dirs: HashSet<String>,
+    /// The exact paths of members in `skipped` that would fail again. A member whose
+    /// name is not UTF-8 or too long is listed under a lossy or shortened name, which
+    /// could be another file's: it is not here.
+    pub(crate) unwritable: HashSet<String>,
+}
+
+impl Extracted {
+    /// List a member as not written, under its path (`exact` when that is not lossy).
+    fn skip(&mut self, path: String, why: String, exact: bool) {
+        if exact {
+            self.unwritable.insert(path.clone());
+        }
+        self.skipped.push((path, why));
+    }
 }
 
 #[derive(Debug)]
@@ -519,11 +551,15 @@ pub fn extract_tar_gz<R: Read>(
             continue; // directories are created as files need them
         }
         let rel_text = String::from_utf8_lossy(&rel).into_owned();
+        let exact = std::str::from_utf8(&rel).is_ok();
         if opts.filter.is_some_and(|f| !f.keeps(&rel_text)) {
             continue;
         }
         if rel.len() > MAX_PATH_BYTES {
             out.skipped.push((shown(&rel), PATH_TOO_LONG.into()));
+            if exact {
+                out.unwritable.insert(rel_text);
+            }
             continue;
         }
 
@@ -537,8 +573,8 @@ pub fn extract_tar_gz<R: Read>(
                     .unwrap_or_default(),
             ),
             other => {
-                out.skipped
-                    .push((rel_text, format!("{} in the archive", member_kind(other))));
+                let why = format!("{} in the archive", member_kind(other));
+                out.skip(rel_text, why, exact);
                 continue;
             }
         };
@@ -558,7 +594,7 @@ pub fn extract_tar_gz<R: Read>(
             Ok(id) => {
                 out.files.insert(rel_text, id);
             }
-            Err(why) => out.skipped.push((rel_text, why)),
+            Err(why) => out.skip(rel_text, why, exact),
         }
     }
     // tar stops at its end-of-archive marker. Read the gzip stream to its end as well,
@@ -669,6 +705,9 @@ impl<'a> Writer<'a> {
                     Ok(()) => {
                         self.dirs.insert(dir.to_string());
                     }
+                    Err(e) if e.kind() == io::ErrorKind::InvalidFilename => {
+                        return Ok(Err(PATH_TOO_LONG_HERE.into()));
+                    }
                     Err(e) if is_name_conflict(&e) || fs::symlink_metadata(&target).is_ok() => {
                         return Ok(Err(DIR_TAKEN.into()));
                     }
@@ -685,6 +724,10 @@ impl<'a> Writer<'a> {
             .open(&target)
         {
             Ok(f) => f,
+            // The whole path, under `dest`, is over this system's limit (1 KiB on macOS).
+            Err(e) if e.kind() == io::ErrorKind::InvalidFilename => {
+                return Ok(Err(PATH_TOO_LONG_HERE.into()));
+            }
             // Windows refuses a file over a directory (`docs` over `Docs/`) as access
             // denied, not as an existing name.
             Err(e)
@@ -730,6 +773,7 @@ const DIR_TAKEN: &str =
     "cannot be written: a directory on its path has the name of another file on this file system";
 const MAX_PATH_BYTES: usize = 4096;
 const PATH_TOO_LONG: &str = "path longer than 4096 bytes";
+const PATH_TOO_LONG_HERE: &str = "path too long for this file system";
 
 fn is_name_conflict(e: &io::Error) -> bool {
     matches!(

@@ -611,6 +611,30 @@ fn excluded_paths_are_not_written() {
     assert!(x.skipped.is_empty(), "excluded paths are not listed");
 }
 
+/// A path within 4096 bytes can still be over this system's limit once under the
+/// destination (about 1 KiB on macOS, 4 KiB on Linux and Android): it is listed, and
+/// the extraction goes on.
+#[test]
+fn a_path_too_long_for_the_file_system_is_listed() {
+    let deep = format!("{}x", format!("{}/", "d".repeat(250)).repeat(16));
+    assert!(deep.len() <= MAX_PATH_BYTES);
+    let mut b = builder();
+    long_name(&mut b, format!("o-r-abc/{deep}").as_bytes(), b"deep");
+    raw(
+        &mut b,
+        tar::EntryType::Regular,
+        b"o-r-abc/after.txt",
+        b"after",
+    );
+    let (outer, x) = run(b);
+    assert!(x.files.contains_key("after.txt"), "{:#?}", reasons(&x));
+    assert_eq!(x.files.len() + x.skipped.len(), 2, "{:#?}", reasons(&x));
+    if let Some((_, why)) = x.skipped.first() {
+        assert_eq!(why, PATH_TOO_LONG_HERE);
+    }
+    assert!(outer.path().join("tree/after.txt").exists());
+}
+
 #[test]
 fn cancelling_stops_the_extraction() {
     let mut b = builder();
@@ -830,6 +854,12 @@ pub(crate) const SHA: &str = "5e7a1c0de5e7a1c0de5e7a1c0de5e7a1c0de5e7a";
 /// GitHub's archive of a commit with these files: the commit in a pax global header,
 /// then everything under `acme-app-5e7a1c0/`.
 pub(crate) fn github_archive(commit: &str, files: &[(&str, &[u8])]) -> Vec<u8> {
+    let files: Vec<(&[u8], &[u8])> = files.iter().map(|(p, d)| (p.as_bytes(), *d)).collect();
+    github_archive_raw(commit, &files)
+}
+
+/// [`github_archive`], with names as raw bytes, of any length.
+fn github_archive_raw(commit: &str, files: &[(&[u8], &[u8])]) -> Vec<u8> {
     let mut b = tar::Builder::new(Vec::new());
     let comment = pax_record("comment", commit.as_bytes());
     raw(
@@ -840,8 +870,13 @@ pub(crate) fn github_archive(commit: &str, files: &[(&str, &[u8])]) -> Vec<u8> {
     );
     raw(&mut b, tar::EntryType::Directory, b"acme-app-5e7a1c0/", b"");
     for (path, data) in files {
-        let name = format!("acme-app-5e7a1c0/{path}");
-        raw(&mut b, tar::EntryType::Regular, name.as_bytes(), data);
+        let mut name = b"acme-app-5e7a1c0/".to_vec();
+        name.extend_from_slice(path);
+        if name.len() < 100 {
+            raw(&mut b, tar::EntryType::Regular, &name, data);
+        } else {
+            long_name(&mut b, &name, data);
+        }
     }
     gz(&b.into_inner().unwrap())
 }
@@ -1133,6 +1168,64 @@ async fn dependency_checks_get_large_files_too() {
         "{:?}",
         snapshot.skipped
     );
+}
+
+/// What could not be written is listed under its exact path only. A lossy name (not
+/// UTF-8) or a shortened one (too long) could be another file's, and must not stop that
+/// file from being fetched.
+#[tokio::test]
+async fn files_listed_under_another_name_are_still_fetched() {
+    // `ci\u{FFFD}.yml` is a real file, changed in the archive (line endings); beside it
+    // is a name that is not UTF-8 and reads the same once decoded lossily.
+    let real = "ci\u{FFFD}.yml";
+    let commit: Vec<(&str, &[u8])> = vec![(real, b"on: push\n")];
+    let long = format!("{}x", "d/".repeat(2100));
+    let archived: Vec<(&[u8], &[u8])> = vec![
+        (real.as_bytes(), b"on: push\r\n"),
+        (b"ci\xff.yml", b"other"),
+        (long.as_bytes(), b"x"),
+    ];
+    let mut tree = commit.clone();
+    tree.push((&long, b"x"));
+    let (api, log) = serve_repo(
+        Some(github_archive_raw(SHA, &archived)),
+        tree_json(&tree, false),
+        vec![commit[0].1.to_vec()],
+    )
+    .await;
+    let snapshot = fetch_app(&api, &fetch_options()).await.unwrap();
+    assert_eq!(fs::read(snapshot.path.join(real)).unwrap(), b"on: push\n");
+    assert_eq!(snapshot.incomplete, None);
+    // The long path is listed once, shortened, and not fetched.
+    let long_listed: Vec<&(String, String)> = snapshot
+        .skipped
+        .iter()
+        .filter(|(p, _)| p.starts_with("d/d/"))
+        .collect();
+    assert_eq!(long_listed.len(), 1, "{:?}", snapshot.skipped);
+    assert!(long_listed[0].0.ends_with('…'));
+    let fetched = log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|l| l.contains("/git/blobs/"))
+        .count();
+    assert_eq!(fetched, 1, "only the changed file");
+}
+
+/// Two names that are not UTF-8 can reach the API as one lossy path.
+#[tokio::test]
+async fn a_path_listed_twice_is_not_confirmed() {
+    let files: Vec<(&str, &[u8])> = vec![("a\u{FFFD}.txt", b"a\n"), ("a\u{FFFD}.txt", b"b\n")];
+    let (api, _) = serve_repo(
+        Some(github_archive(SHA, &files[..1])),
+        tree_json(&files, false),
+        vec![b"b\n".to_vec()],
+    )
+    .await;
+    let snapshot = fetch_app(&api, &fetch_options()).await.unwrap();
+    let why = snapshot.incomplete.unwrap();
+    assert!(why.contains("paths twice"), "{why}");
 }
 
 #[tokio::test]
