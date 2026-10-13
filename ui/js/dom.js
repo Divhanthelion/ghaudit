@@ -84,6 +84,12 @@ const ICONS = {
   layers: [["path", { d: "M12 3l9 5-9 5-9-5zM3 13l9 5 9-5" }]],
   commit: [["circle", { cx: 12, cy: 12, r: 3.5 }], ["path", { d: "M3 12h5.5M15.5 12H21" }]],
   link: [["path", { d: "M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1" }]],
+  arrowLeft: [["path", { d: "M20 12H4M10 6l-6 6 6 6" }]],
+  chevronLeft: [["path", { d: "M15 18l-6-6 6-6" }]],
+  chevronRight: [["path", { d: "M9 6l6 6-6 6" }]],
+  more: [["circle", { cx: 12, cy: 5.5, r: 1.3 }], ["circle", { cx: 12, cy: 12, r: 1.3 }], ["circle", { cx: 12, cy: 18.5, r: 1.3 }]],
+  list: [["path", { d: "M9 6h11M9 12h11M9 18h11M4.5 6h.01M4.5 12h.01M4.5 18h.01" }]],
+  clipboard: [["rect", { x: 7, y: 3, width: 10, height: 4, rx: 1.5 }], ["path", { d: "M7 5H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-1" }]],
 };
 
 const SVG = "http://www.w3.org/2000/svg";
@@ -130,6 +136,26 @@ export function logo() {
     svgElement("path", { d: "M580 576 L676 672", stroke: "#1b3f86", "stroke-width": 76, "stroke-linecap": "round" }),
   );
   return svg;
+}
+
+// ------------------------------------------------------------------ layout
+
+/** The phone layout (narrow screens); styles.css switches at the same width. */
+export const phone = window.matchMedia("(max-width: 699px)");
+
+/**
+ * "owner/name" without "owner/" when the report is about that owner, so narrow rows
+ * show the part that differs.
+ */
+export function shortRepo(name, owner) {
+  if (!name || !owner) return name ?? "";
+  return name.startsWith(`${owner}/`) ? name.slice(owner.length + 1) : name;
+}
+
+/** The owner a report is about ("user:octocat" or "org:acme" → the name), or null. */
+export function reportOwner(target) {
+  const m = /^(?:user|org):([A-Za-z0-9-]+)$/.exec(target ?? "");
+  return m ? m[1] : null;
 }
 
 // ------------------------------------------------------------------ formatting
