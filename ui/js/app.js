@@ -1,20 +1,28 @@
-// ghaudit desktop: the start page, scanning, and the report views.
+// ghaudit desktop: the start page, scanning, and the report views. Below 700 px wide
+// (a phone) the report tabs move to a bar at the bottom, the report's actions to a
+// "More" sheet, and the system Back button works through nav.js.
 
-import { h, replace, icon, logo, toast, formatDate, plural } from "./dom.js";
+import { h, replace, icon, logo, toast, formatDate, plural, phone } from "./dom.js";
 import * as backend from "./backend.js";
+import * as nav from "./nav.js";
 import { CATEGORIES } from "./explain.js";
 import { prepare } from "./report.js";
 import { renderOverview } from "./overview.js";
 import { createFindingsView } from "./findings.js";
 import { renderCoverage } from "./coverage.js";
 import { createSettingsView } from "./settings.js";
-import { renderSetup, loadOptions, saveOptions, scanRequest, scanLabel, TARGETS } from "./scan.js";
+import { renderSetup, loadOptions, saveOptions, scanRequest, scanLabel, TARGETS, capabilities, effectiveOptions } from "./scan.js";
 import { createProgressView } from "./progress.js";
 
+const app = document.getElementById("app");
 const main = document.getElementById("main");
 const tabsEl = document.getElementById("tabs");
+const tabbar = document.getElementById("tabbar");
 const reportbar = document.getElementById("reportbar");
 const actions = document.getElementById("topbar-actions");
+const navBack = document.getElementById("nav-back");
+const pageTitle = document.getElementById("page-title");
+const moreButton = document.getElementById("more");
 
 const state = {
   catalog: null,
@@ -41,18 +49,26 @@ const state = {
   findings: null,
   /** Built on the first visit to the Settings tab: a large grid costs time. */
   settings: null,
+  /** Where the setup page was opened from, for Back: "home" or "report". */
+  setupFrom: "home",
+  /** The progress page of the running scan. */
+  progress: null,
 };
 
 const TABS = [
-  { id: "overview", label: "Overview" },
-  { id: "findings", label: "Findings", count: (r) => r.findings.length },
+  { id: "overview", label: "Overview", icon: "shield" },
+  { id: "findings", label: "Findings", icon: "list", count: (r) => r.findings.length },
   {
     id: "settings",
     label: "Settings",
+    icon: "sliders",
     count: (r) => (r.settings.length ? r.settings.filter((s) => s.status === "fail").length : undefined),
   },
-  { id: "coverage", label: "Coverage" },
+  { id: "coverage", label: "Coverage", icon: "checkCircle" },
 ];
+
+/** The title in a phone's top bar. */
+const VIEW_TITLES = { home: "", setup: "New scan", scanning: "", failed: "" };
 
 function showError(message) {
   toast(message, { error: true });
@@ -79,12 +95,39 @@ function renderTopbar() {
   );
   renderTabs();
   renderReportbar();
+  renderPhoneBar();
+}
+
+/** The phone's top bar: back arrow, the view's title, and More on a report. */
+function renderPhoneBar() {
+  const report = state.view === "report" && state.report;
+  app.dataset.view = state.view;
+  pageTitle.textContent = report ? (TABS.find((t) => t.id === state.tab)?.label ?? "") : (VIEW_TITLES[state.view] ?? "");
+  moreButton.hidden = !report;
+  syncBack();
+}
+
+function syncBack() {
+  navBack.hidden = state.view === "scanning" || !nav.canGoBack();
 }
 
 function renderTabs() {
   const shown = state.view === "report" && state.report;
   tabsEl.hidden = !shown;
+  tabbar.hidden = !shown;
   if (!shown) return;
+  replace(
+    tabbar,
+    TABS.map((t) => {
+      const count = t.count?.(state.report);
+      return h(
+        "button",
+        { type: "button", class: "tabbar-tab", "aria-current": state.tab === t.id ? "page" : null, onclick: () => showTab(t.id) },
+        h("span", { class: "tabbar-icon" }, icon(t.icon), count ? h("span", { class: "tabbar-count" }, count > 999 ? "999+" : count.toLocaleString()) : null),
+        h("span", { class: "tabbar-label" }, t.label),
+      );
+    }),
+  );
   replace(
     tabsEl,
     TABS.map((t) => {
@@ -137,16 +180,18 @@ function renderReportbar() {
   const unsaved = state.source?.kind === "scan" && !state.saved;
   const parts = [
     h("span", { class: "target" }, targetLabel(r.target ?? "")),
-    `Scanned ${formatDate(r.started_at)}`,
+    h("span", { class: "when" }, `Scanned ${formatDate(r.started_at)}`),
     state.saved
-      ? `Saved as ${state.saved}`
+      ? h("span", { class: "source" }, `Saved as ${state.saved}`)
       : state.source?.kind === "file"
-        ? `Opened from ${state.source.name}`
+        ? h("span", { class: "source" }, `Opened from ${state.source.name}`)
         : h("span", { class: "unsaved" }, "Not saved yet"),
   ];
   replace(
     reportbar,
     parts.flatMap((p, i) => (i ? [h("span", { class: "sep", "aria-hidden": "true" }, "·"), p] : [p])),
+    // Phones: the comparison's switch is in the More sheet; say here what is shown.
+    state.compare && state.onlyNew ? h("span", { class: "compare-note phone-only" }, `Only what's new since ${state.compare.name}`) : null,
     h("div", { class: "reportbar-actions" }, compareControls(), h(
       "button",
       { type: "button", class: unsaved ? "btn primary" : "btn", onclick: exportDialog, title: "Save or export the report (Ctrl+S)" },
@@ -200,7 +245,9 @@ function setView(view) {
 
 function showHome() {
   setView("home");
+  nav.setPage(null);
   const env = state.env;
+  const caps = capabilities(env);
   const login = env?.github?.login;
   const mineText = !env
     ? "Checking GitHub access…"
@@ -223,7 +270,9 @@ function showHome() {
           h(
             "p",
             {},
-            "ghaudit finds leaked passwords and keys, vulnerable dependencies, risky code and workflows, and weak repository settings, and explains in plain language what to fix first.",
+            caps.dependencies
+              ? "ghaudit finds leaked passwords and keys, vulnerable dependencies, risky code and workflows, and weak repository settings, and explains in plain language what to fix first."
+              : "ghaudit finds leaked passwords and keys, risky code and workflows, and weak repository settings, and explains in plain language what to fix first.",
           ),
         ),
       ),
@@ -242,7 +291,7 @@ function showHome() {
           { type: "button", class: "choice", onclick: showSetup },
           h("span", { class: "icon-wrap" }, icon("search")),
           h("h2", {}, "Scan something else"),
-          h("p", {}, "One repository, a folder on this computer, an organization or a search."),
+          h("p", {}, caps.folders ? "One repository, a folder on this computer, an organization or a search." : "One repository, an organization, someone's repositories or a search."),
         ),
         h(
           "button",
@@ -257,18 +306,34 @@ function showHome() {
         { class: "card explainer" },
         h("h3", {}, "What ghaudit checks"),
         CATEGORIES.filter((c) => c.id !== "ai").map((c) =>
-          h("div", { class: "item" }, icon(c.icon), h("div", {}, h("b", {}, c.label), h("span", {}, c.text))),
+          h(
+            "div",
+            { class: "item" },
+            icon(c.icon),
+            h(
+              "div",
+              {},
+              h("b", {}, c.label),
+              h("span", {}, c.id === "dependency" && !caps.dependencies ? `${c.text} Checked only by the computer version.` : c.text),
+            ),
+          ),
         ),
       ),
       state.catalog
-        ? h("p", { class: "home-footer" }, `ghaudit desktop ${state.catalog.app_version} · scanner ${state.catalog.scanner_version} · reads from GitHub, never changes anything`)
+        ? h(
+            "p",
+            { class: "home-footer" },
+            `ghaudit ${env?.mobile ? "app" : "desktop"} ${state.catalog.app_version} · scanner ${state.catalog.scanner_version} · reads from GitHub, never changes anything`,
+          )
         : null,
     ),
   );
 }
 
 function showSetup() {
+  if (state.view === "home" || state.view === "report") state.setupFrom = state.view;
   setView("setup");
+  nav.setPage(setupBack);
   replace(
     main,
     renderSetup({
@@ -289,10 +354,22 @@ function showSetup() {
   main.scrollTop = 0;
 }
 
+/** Back from the setup page: to the report it was opened from, or the start page. */
+function setupBack() {
+  if (state.setupFrom === "report" && state.report) {
+    state.view = "report";
+    renderTopbar();
+    showTab(state.tab);
+  } else {
+    showHome();
+  }
+}
+
 /** "Scan my repositories" from the start page, with the saved options. */
 function scanMine() {
-  const options = { ...loadOptions(), kind: "mine" };
-  saveOptions(options);
+  const saved = { ...loadOptions(), kind: "mine" };
+  saveOptions(saved);
+  const options = effectiveOptions(saved, state.env);
   if (!state.env?.github?.login) {
     showSetup();
     return;
@@ -305,8 +382,18 @@ function scanMine() {
   runScan(scanRequest(options), scanLabel(options, state.env, null), options);
 }
 
+/** Owner of the repositories a scan lists, to shorten their names on a phone. */
+function scanOwner(options) {
+  if (options.kind === "mine") return state.env?.github?.login ?? null;
+  if (options.kind === "user") return options.user.trim();
+  if (options.kind === "org") return options.org.trim();
+  return null;
+}
+
 async function runScan(request, label, options) {
   setView("scanning");
+  nav.setPage(scanningBack);
+  const caps = capabilities(state.env);
   const multi = Boolean(TARGETS.find((t) => t.kind === options.kind)?.multi);
   const view = createProgressView({
     label,
@@ -314,7 +401,13 @@ async function runScan(request, label, options) {
     multi,
     onCancel: () => backend.cancelScan().catch((e) => showError(e.message)),
     onBack: showSetup,
+    unavailable: new Set([caps.dependencies ? null : "sca", caps.history ? null : "history"].filter(Boolean)),
+    owner: scanOwner(options),
+    keepOpen: state.env?.mobile
+      ? `Keep ghaudit open until the scan finishes. If you switch to another app, ${state.env.platform === "android" ? "Android" : "the phone"} may stop it.`
+      : null,
   });
+  state.progress = view;
   replace(main, view.element);
   try {
     const result = await backend.startScan(request, (event) => view.handle(event));
@@ -329,14 +422,48 @@ async function runScan(request, label, options) {
     view.stop();
     view.fail(e.message);
     setView("failed");
+    nav.setPage(showSetup);
     replace(main, view.element);
+  } finally {
+    state.progress = null;
   }
+}
+
+/** Back during a scan asks first: leaving the page would lose the scan. */
+function scanningBack() {
+  nav.setPage(scanningBack);
+  const dialog = h(
+    "dialog",
+    { class: "confirm", "aria-labelledby": "stop-title" },
+    h("h2", { id: "stop-title" }, "Stop the scan?"),
+    h("p", {}, "What ghaudit has found so far will be discarded."),
+    h(
+      "div",
+      { class: "confirm-actions" },
+      h("button", { type: "button", class: "btn", onclick: () => close() }, "Keep scanning"),
+      h(
+        "button",
+        {
+          type: "button",
+          class: "btn primary",
+          onclick: () => {
+            close();
+            state.progress?.cancel();
+          },
+        },
+        "Stop the scan",
+      ),
+    ),
+  );
+  const close = nav.showDialog(dialog);
 }
 
 function showTab(id) {
   state.tab = id;
   state.view = "report";
+  nav.setPage(id === "overview" ? null : () => showTab("overview"));
   renderTabs();
+  renderPhoneBar();
   const r = state.report;
   main.setAttribute("role", "tabpanel");
   main.setAttribute("aria-labelledby", `tab-${id}`);
@@ -353,6 +480,73 @@ function showTab(id) {
   else if (id === "settings") replace(main, settingsView().element);
   else if (id === "coverage") replace(main, renderCoverage(r));
   main.scrollTop = 0;
+}
+
+// ------------------------------------------------------------------ phone: More sheet
+
+/** The report bar's actions, and New scan and Open, in a sheet. */
+function openMore() {
+  if (!state.report) return;
+  let close = () => {};
+  const unsaved = state.source?.kind === "scan" && !state.saved;
+  const item = (name, label, text, action, cls = "") =>
+    h(
+      "button",
+      {
+        type: "button",
+        class: `sheet-item ${cls}`.trim(),
+        onclick: () => {
+          close();
+          action();
+        },
+      },
+      icon(name),
+      h("span", { class: "sheet-item-text" }, h("b", {}, label), text ? h("span", {}, text) : null),
+    );
+  const compare = [];
+  if (!state.compare) {
+    compare.push(item("history", "Compare with earlier…", "Show only what's new since an earlier report.", compareWith));
+  } else {
+    const baselined = state.compare.prepared.raw.stats?.findings_baselined ?? 0;
+    const toggle = h("input", { type: "checkbox", checked: state.onlyNew });
+    toggle.addEventListener("change", () => {
+      close();
+      state.onlyNew = toggle.checked;
+      showReport();
+    });
+    compare.push(
+      h(
+        "label",
+        { class: "sheet-item sheet-switch" },
+        icon("layers"),
+        h(
+          "span",
+          { class: "sheet-item-text" },
+          h("b", {}, `Only what's new since ${state.compare.name}`),
+          h("span", {}, `${formatDate(state.compare.scanned)}. ${plural(baselined, "finding")} from it ${baselined === 1 ? "is" : "are"} hidden.`),
+        ),
+        toggle,
+      ),
+      item("close", "Stop comparing", null, clearCompare),
+    );
+  }
+  close = nav.openSheet({
+    title: targetLabel(state.base.raw.target ?? ""),
+    subtitle: [
+      `Scanned ${formatDate(state.base.raw.started_at)}`,
+      state.saved ? `Saved as ${state.saved}` : state.source?.kind === "file" ? `Opened from ${state.source.name}` : null,
+    ]
+      .filter(Boolean)
+      .join(" · "),
+    className: "more-sheet",
+    content: [
+      item("download", unsaved ? "Save report…" : "Export…", "As a ghaudit report, SARIF or text.", exportDialog, unsaved ? "accent" : ""),
+      compare,
+      h("hr", {}),
+      item("search", "New scan", null, showSetup),
+      item("file", "Open a saved report…", null, openReport),
+    ],
+  });
 }
 
 function loadReport(report, source) {
@@ -443,10 +637,7 @@ function exportDialog() {
   });
   const message = h("p", { class: "form-message", role: "status" });
   const save = h("button", { type: "button", class: "btn primary" }, "Save…");
-  const dismiss = () => {
-    dialog.close();
-    dialog.remove();
-  };
+  let dismiss = () => {};
   const dialog = h(
     "dialog",
     { class: "confirm export-dialog", "aria-labelledby": "export-title" },
@@ -454,7 +645,7 @@ function exportDialog() {
     h("div", { class: "format-options", role: "radiogroup", "aria-labelledby": "export-title" }, radios),
     comparing ? h("label", { class: "check" }, onlyNew, `Only what's new since ${state.compare.name}`) : null,
     message,
-    h("div", { class: "confirm-actions" }, h("button", { type: "button", class: "btn", onclick: dismiss }, "Cancel"), save),
+    h("div", { class: "confirm-actions" }, h("button", { type: "button", class: "btn", onclick: () => dismiss() }, "Cancel"), save),
   );
   save.addEventListener("click", async () => {
     save.disabled = true;
@@ -472,9 +663,7 @@ function exportDialog() {
       save.disabled = false;
     }
   });
-  dialog.addEventListener("close", () => dialog.remove()); // Esc
-  document.body.append(dialog);
-  dialog.showModal();
+  dismiss = nav.showDialog(dialog);
 }
 
 async function openReport() {
@@ -492,10 +681,43 @@ async function openReport() {
 async function refreshEnvironment() {
   try {
     state.env = await backend.environment();
+    document.documentElement.dataset.platform = state.env.platform ?? "";
+    // Android's Back button closes what the page has open first (see nav.js).
+    nav.useSystemBack(state.env.mobile);
   } catch (e) {
     showError(e.message);
   }
 }
+
+// Android draws the page under the status and navigation bars, and its WebView may not
+// report their size to CSS, so the app's activity passes them in (CSS pixels).
+function syncAndroidInsets() {
+  let insets;
+  try {
+    insets = JSON.parse(window.AndroidInsets.get());
+  } catch {
+    return;
+  }
+  for (const side of ["top", "right", "bottom", "left"]) {
+    const px = Number(insets[side]);
+    if (Number.isFinite(px)) document.documentElement.style.setProperty(`--native-inset-${side}`, `${px}px`);
+  }
+}
+
+/** Between the phone layout and the wider one, views that differ are redrawn. */
+phone.addEventListener("change", () => {
+  renderTopbar();
+  if (state.view !== "report" || !state.report) return;
+  state.settings = null;
+  state.findings?.relayout();
+  if (state.tab !== "findings") showTab(state.tab);
+});
+
+nav.onChange(syncBack);
+navBack.append(icon("arrowLeft"));
+navBack.addEventListener("click", () => nav.back());
+moreButton.append(icon("more"));
+moreButton.addEventListener("click", openMore);
 
 document.addEventListener("keydown", (e) => {
   const mod = e.ctrlKey || e.metaKey;
@@ -519,11 +741,18 @@ document.addEventListener("keydown", (e) => {
 });
 
 async function start() {
+  if (window.AndroidInsets) {
+    syncAndroidInsets();
+    window.addEventListener("androidinsets", syncAndroidInsets);
+    window.addEventListener("resize", syncAndroidInsets);
+  }
   replace(document.getElementById("brand"), logo(), "ghaudit");
   showHome();
   const [catalog] = await Promise.all([backend.catalog().catch((e) => showError(e.message)), refreshEnvironment()]);
   state.catalog = catalog ?? null;
   if (state.view === "home") showHome();
+  // The setup page depends on what this device can do.
+  else if (state.view === "setup") showSetup();
 }
 
 start();

@@ -33,6 +33,12 @@ repositories) with 0.3.0.
   one. Those findings now say so and have medium confidence.
 - **`js/html-injection`**: markup read from an ALL_CAPS constant (`ICONS[name]`,
   `PATHS.home`) is no longer reported.
+- **Multi-repository scans** (`org`, `user`, `search`): when a repository could not be
+  cloned, the report's analyzer summary still said "completed" for the file analyzers,
+  and the repository's settings audit was thrown away. Its file analyzers are now
+  `failed` ("could not download the repository: ..."), the summary says "failed in 1 of
+  N repositories", and its settings checks and findings are kept. A repository that
+  times out counts as failed for every analyzer. Single-repository scans are unchanged.
 
 ### New
 
@@ -46,6 +52,12 @@ repositories) with 0.3.0.
   kept in the system keychain; osv-scanner is found on `PATH` or where winget installs
   it. See the README. The app is a separate package in a new Cargo workspace; the CLI
   does not depend on it.
+- **The app on Android phones**, with a phone layout and the Back button. Repositories
+  are downloaded as archives (see "Scanning without git"); dependency checks and the
+  history search aren't available there and reports say so. The token is created from
+  GitHub's pre-filled read-only token page, pasted from the clipboard by the app (never
+  through the page) and kept in the Android Keystore. Reports open and save through
+  Android's file picker. CI builds the APK.
 - **Progress events in the library**: `Scanner::with_progress_sink` takes a callback
   that receives a `ghaudit::Progress` for each step of a scan: repositories listed,
   each repository started and finished (findings, duration, error), files discovered,
@@ -56,6 +68,22 @@ repositories) with 0.3.0.
 - **`agent/auto-approve`** also reports, at low severity, Claude Code allow rules that
   install or run any package (`Bash(npm install:*)`, `Bash(npx:*)`, `Bash(pip install *)`,
   ...): install scripts run without asking.
+- **Scanning without git**: with `fetch = "archive"` under `[github]` (the default on
+  Android), remote repositories are downloaded as GitHub's archive of the default
+  branch's commit instead of cloned. Since `.gitattributes` can leave files out of an
+  archive or change them, every file is checked against the commit's tree, and missing
+  or changed files are fetched one by one (up to 300 files, 20 MiB); when that is not
+  enough, or the tree is truncated, the file analyzers (and dependency checks) fail
+  with "could not confirm the download is complete". The archive is extracted by
+  ghaudit's own extractor: no symlinks, hard links or special files, nothing outside
+  its folder, and capped sizes. A file is never written through a name the file system
+  would take for another one (another case on Windows and macOS, a Windows short name
+  such as `TERRAF~1`), so it cannot land unlisted in a skipped folder; such files, and
+  names that are not UTF-8, are listed as skipped.
+  The history search is skipped in this mode. For front ends, `scanner::Tools` says
+  whether git and osv-scanner are installed, `sca.unavailable` gives the reason shown
+  for dependency checks that cannot run, and `git::remove_stale_work_dirs` cleans up
+  temporary folders a killed scan left behind.
 
 ### Changed
 
@@ -65,6 +93,8 @@ repositories) with 0.3.0.
   public.
 - On Windows, git and osv-scanner run without a console window, so a GUI front end
   doesn't flash one per repository.
+- The unused `serde_yaml_ng` dependency is gone, and with it `unsafe-libyaml`, which
+  RustSec now lists as unmaintained (RUSTSEC-2024-0449).
 
 ## 0.3.0
 

@@ -109,13 +109,8 @@ pub fn scan_history(
     cancel: &AtomicBool,
 ) -> Result<HistoryOutcome, String> {
     let mut outcome = HistoryOutcome::default();
-    match is_shallow(root) {
-        None => return Err("not a git repository".into()),
-        Some(true) => {
-            outcome.incomplete =
-                Some("shallow clone: only the fetched commits were searched".into());
-        }
-        Some(false) => {}
+    if is_shallow(root)? {
+        outcome.incomplete = Some("shallow clone: only the fetched commits were searched".into());
     }
     let mut child = git(root)
         .args([
@@ -339,14 +334,20 @@ fn value_on_line(values: &[String], line: &str) -> Option<String> {
 }
 
 /// Whether `root` is a shallow clone; `None` when it is not a git repository.
-fn is_shallow(root: &Path) -> Option<bool> {
+/// Whether `root` is a shallow clone; an error when it is not a git repository or git
+/// cannot run.
+fn is_shallow(root: &Path) -> Result<bool, String> {
     let out = git(root)
         .args(["rev-parse", "--is-shallow-repository"])
         .output()
-        .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).trim() == "true")
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => "git is not installed".to_string(),
+            _ => format!("could not run git: {e}"),
+        })?;
+    if !out.status.success() {
+        return Err("not a git repository".into());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim() == "true")
 }
 
 #[cfg(test)]

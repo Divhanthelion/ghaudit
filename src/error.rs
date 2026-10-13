@@ -16,6 +16,10 @@ pub enum Error {
     #[error("git: {0}")]
     Git(String),
 
+    /// A repository archive could not be read or checked (`snapshot.rs`).
+    #[error("archive: {0}")]
+    Archive(String),
+
     #[error("configuration: {0}")]
     Config(String),
 

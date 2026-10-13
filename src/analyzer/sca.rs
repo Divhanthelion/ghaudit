@@ -65,7 +65,7 @@ impl OsvScanner {
         let empty_config = if trusted {
             None
         } else {
-            let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+            let dir = crate::git::work_dir().map_err(|e| e.to_string())?;
             let path = dir.path().join("osv-scanner.toml");
             std::fs::write(&path, "").map_err(|e| e.to_string())?;
             Some((dir, path))

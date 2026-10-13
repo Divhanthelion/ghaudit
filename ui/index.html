@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="color-scheme" content="light dark">
   <title>ghaudit</title>
   <link rel="stylesheet" href="styles.css">
@@ -11,13 +11,17 @@
 <body>
   <div class="app" id="app">
     <header class="topbar">
+      <button class="icon-btn nav-back" id="nav-back" type="button" aria-label="Back" hidden></button>
       <div class="brand" id="brand">ghaudit</div>
+      <h1 class="page-title" id="page-title"></h1>
       <nav class="tabs" id="tabs" role="tablist" aria-label="Report" hidden></nav>
       <div class="topbar-spacer"></div>
       <div class="topbar-actions" id="topbar-actions"></div>
+      <button class="icon-btn more-btn" id="more" type="button" aria-label="More actions" aria-haspopup="dialog" hidden></button>
     </header>
     <div class="reportbar" id="reportbar" hidden></div>
     <main id="main" tabindex="-1"></main>
+    <nav class="tabbar" id="tabbar" aria-label="Report" hidden></nav>
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
   </div>
 </body>

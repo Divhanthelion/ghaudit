@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 11 and earlier. The GitHub token is encrypted with a Keystore key that never
+     leaves this device, so a backup of it could never be read elsewhere: leave it out. -->
+<full-backup-content>
+    <exclude domain="sharedpref" path="." />
+</full-backup-content>

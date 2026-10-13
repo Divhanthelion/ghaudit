@@ -24,7 +24,7 @@ use crate::analyzer::sca::OsvScanner;
 use crate::analyzer::secrets::{self, Masker, SecretDetector};
 use crate::analyzer::settings::{self, Audit};
 use crate::analyzer::{agents, history, unicode, workflows};
-use crate::config::Config;
+use crate::config::{Config, FetchMethod};
 use crate::discovery::{self, DiscoveryOptions, FileText, PathFilter, SourceFile};
 use crate::error::{Error, Result};
 use crate::git;
@@ -35,6 +35,7 @@ use crate::model::{
 };
 use crate::progress::{self, Progress, ProgressSink};
 use crate::report::terminal_safe;
+use crate::snapshot;
 use crate::target::{self, Target};
 use futures::StreamExt;
 use rayon::prelude::*;
@@ -65,7 +66,73 @@ struct LocalEngines {
     secrets: Option<SecretDetector>,
     workflows: bool,
     agents: bool,
-    history: bool,
+}
+
+/// Why the history search does not run on a device without git.
+pub const HISTORY_NEEDS_GIT: &str = "needs git, which this device doesn't have";
+
+/// Why the history search does not run on a repository fetched as an archive.
+pub const HISTORY_NEEDS_CLONE: &str =
+    "needs the full git history; a downloaded archive has only the latest files";
+
+/// Where a scanned directory's files came from, as far as the analyzers care.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source<'a> {
+    /// A local directory or a git clone.
+    Tree,
+    /// GitHub's archive of a commit. `unconfirmed` says why its files could not all be
+    /// checked against the commit: the file analyzers then fail with it.
+    Archive { unconfirmed: Option<&'a str> },
+}
+
+impl Source<'_> {
+    fn is_archive(self) -> bool {
+        matches!(self, Source::Archive { .. })
+    }
+
+    /// `status`, failed instead of completed when the files are unconfirmed: results
+    /// over files that may be incomplete must not pass for a full scan.
+    fn vouch(self, status: AnalyzerStatus) -> AnalyzerStatus {
+        match self {
+            Source::Archive {
+                unconfirmed: Some(why),
+            } if status.state == AnalyzerState::Completed => {
+                AnalyzerStatus::failed(&status.analyzer, why)
+            }
+            _ => status,
+        }
+    }
+}
+
+/// A remote repository's files on disk, deleted when this is dropped.
+enum Fetched {
+    Clone(git::Checkout),
+    Archive(snapshot::Snapshot),
+}
+
+impl Fetched {
+    fn path(&self) -> &Path {
+        match self {
+            Fetched::Clone(c) => &c.path,
+            Fetched::Archive(s) => &s.path,
+        }
+    }
+
+    fn commit(&self) -> Option<String> {
+        match self {
+            Fetched::Clone(c) => c.commit.clone(),
+            Fetched::Archive(s) => s.commit.clone(),
+        }
+    }
+
+    fn source(&self) -> Source<'_> {
+        match self {
+            Fetched::Clone(_) => Source::Tree,
+            Fetched::Archive(s) => Source::Archive {
+                unconfirmed: s.incomplete.as_deref(),
+            },
+        }
+    }
 }
 
 pub struct Scanner {
@@ -74,11 +141,64 @@ pub struct Scanner {
     sca: Option<OsvScanner>,
     ai: Option<AiAnalyzer>,
     github: GitHub,
+    tools: Tools,
     progress: Option<ProgressSink>,
 }
 
-/// A cloned repository's HEAD commit and scan results.
-type RemoteScan = Result<(Option<String>, DirScan)>;
+/// The external programs a scan can use, found once when the scanner is built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tools {
+    /// `git`, for clones, local repositories' commit and remote, and the history search.
+    pub git: bool,
+    /// The configured osv-scanner (`sca.osv_scanner`).
+    pub osv_scanner: bool,
+}
+
+impl Tools {
+    /// Look the programs up on `PATH` without running them. Always `false` on Android,
+    /// where apps cannot run either.
+    pub fn detect(osv_scanner: &str) -> Self {
+        if cfg!(target_os = "android") {
+            return Self {
+                git: false,
+                osv_scanner: false,
+            };
+        }
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        Self {
+            git: find_program("git", &path),
+            osv_scanner: find_program(osv_scanner, &path),
+        }
+    }
+}
+
+/// Whether `Command::new(name)` would find a program: a path is checked as given, a
+/// bare name in each `PATH` directory (with `.exe` added on Windows, as `Command` does).
+fn find_program(name: &str, path: &std::ffi::OsStr) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let program = Path::new(name);
+    let file = if cfg!(windows) && program.extension().is_none() {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    };
+    if program.components().count() > 1 {
+        return Path::new(&file).is_file();
+    }
+    std::env::split_paths(path).any(|dir| dir.join(&file).is_file())
+}
+
+/// One repository of a remote scan: its commit and results. When the repository could
+/// not be downloaded or scanned, `error` says why, and `dir` still holds the settings
+/// audit and a failed status for each file analyzer, so the report keeps what could be
+/// checked and shows what could not.
+struct RemoteScan {
+    commit: Option<String>,
+    dir: DirScan,
+    error: Option<Error>,
+}
 
 /// Results of scanning one directory.
 #[derive(Debug, Default)]
@@ -149,11 +269,11 @@ impl Scanner {
                 secrets,
                 workflows: a.workflows,
                 agents: a.agents,
-                history: a.history,
             }),
             sca,
             ai,
             github,
+            tools: Tools::detect(&config.sca.osv_scanner),
             config,
             progress: None,
         })
@@ -197,17 +317,24 @@ impl Scanner {
         &self.github
     }
 
+    /// The external programs this scanner found.
+    pub fn tools(&self) -> Tools {
+        self.tools
+    }
+
     pub async fn scan(&self, target: &Target) -> Result<ScanReport> {
         let started = Instant::now();
         let mut report = ScanReport::new(target.label());
 
         match target {
             Target::Local(path) => {
-                report.commit = git::head_commit(path).await;
+                if self.tools.git {
+                    report.commit = git::head_commit(path).await;
+                }
                 let trusted = self.config.analysis.trust_repo.resolve(true);
                 let repo = self.github_repo_of(path).await;
                 let (dir, (status, audit)) = tokio::join!(
-                    self.scan_dir(path, trusted, None),
+                    self.scan_dir(path, trusted, None, Source::Tree),
                     self.audit_settings(
                         repo.as_deref(),
                         "this directory has no origin remote on the configured GitHub host",
@@ -220,9 +347,12 @@ impl Scanner {
             }
             Target::Repo { owner, name } => {
                 let url = self.github.clone_url(owner, name);
-                let (commit, dir) = self.scan_remote(&url, &format!("{owner}/{name}")).await?;
-                report.commit = commit;
-                apply(&mut report, dir);
+                let scan = self.scan_remote(owner, name, &url, None).await;
+                if let Some(e) = scan.error {
+                    return Err(e);
+                }
+                report.commit = scan.commit;
+                apply(&mut report, scan.dir);
             }
             Target::Org(org) => {
                 let repos = self
@@ -309,21 +439,24 @@ impl Scanner {
                         name: repo.full_name.clone(),
                     });
                     let started = Instant::now();
-                    let result = self.scan_remote(&repo.clone_url, &repo.full_name).await;
+                    let (owner, name) = repo.full_name.split_once('/').unwrap_or_default();
+                    let result = self
+                        .scan_remote(owner, name, &repo.clone_url, repo.default_branch.as_deref())
+                        .await;
                     let n = done.fetch_add(1, Ordering::Relaxed) + 1;
                     self.emit(|| Progress::RepositoryFinished {
                         index: i,
                         done: n,
                         total: count,
                         name: repo.full_name.clone(),
-                        findings: result.as_ref().map_or(0, |(_, dir)| {
-                            dir.findings
-                                .iter()
-                                .filter(|f| f.severity.at_least(min))
-                                .count()
-                        }),
+                        findings: result
+                            .dir
+                            .findings
+                            .iter()
+                            .filter(|f| f.severity.at_least(min))
+                            .count(),
                         duration_ms: started.elapsed().as_millis() as u64,
-                        error: result.as_ref().err().map(|e| e.to_string()),
+                        error: result.error.as_ref().map(|e| e.to_string()),
                     });
                     (i, repo, result)
                 })
@@ -333,53 +466,51 @@ impl Scanner {
         results.sort_by_key(|(i, _, _)| *i);
 
         for (_, repo, result) in results {
-            match result {
-                Ok((commit, mut dir)) => {
-                    for f in &mut dir.findings {
-                        f.repository = Some(repo.full_name.clone());
-                    }
-                    for s in &mut dir.skipped {
-                        s.repository = Some(repo.full_name.clone());
-                    }
-                    for o in &mut dir.omitted {
-                        o.repository = Some(repo.full_name.clone());
-                    }
-                    report.stats.files_scanned += dir.files;
-                    report.stats.lines_scanned += dir.lines;
-                    report.stats.dependencies_scanned += dir.packages;
-                    report.stats.findings_suppressed += dir.suppressed;
-                    report.repositories.push(RepositorySummary {
-                        name: repo.full_name.clone(),
-                        commit,
-                        findings: 0, // filled in below, after severity filtering
-                        error: None,
-                        analyzers: dir.analyzers,
-                    });
-                    report.findings.extend(dir.findings);
-                    report.skipped.extend(dir.skipped);
-                    report.omitted.extend(dir.omitted);
-                    report.settings.extend(dir.settings);
-                }
-                Err(e) => {
-                    warn!(
-                        "{}: {}",
-                        terminal_safe(&repo.full_name),
-                        terminal_safe(&e.to_string())
-                    );
-                    report.repositories.push(RepositorySummary {
-                        name: repo.full_name,
-                        commit: None,
-                        findings: 0,
-                        error: Some(e.to_string()),
-                        analyzers: Vec::new(),
-                    });
-                }
+            // A repository that could not be downloaded still has its settings audit.
+            let RemoteScan {
+                commit,
+                mut dir,
+                error,
+            } = result;
+            if let Some(e) = &error {
+                warn!(
+                    "{}: {}",
+                    terminal_safe(&repo.full_name),
+                    terminal_safe(&e.to_string())
+                );
             }
+            for f in &mut dir.findings {
+                f.repository = Some(repo.full_name.clone());
+            }
+            for s in &mut dir.skipped {
+                s.repository = Some(repo.full_name.clone());
+            }
+            for o in &mut dir.omitted {
+                o.repository = Some(repo.full_name.clone());
+            }
+            report.stats.files_scanned += dir.files;
+            report.stats.lines_scanned += dir.lines;
+            report.stats.dependencies_scanned += dir.packages;
+            report.stats.findings_suppressed += dir.suppressed;
+            report.repositories.push(RepositorySummary {
+                name: repo.full_name.clone(),
+                commit,
+                findings: 0, // filled in below, after severity filtering
+                error: error.map(|e| e.to_string()),
+                analyzers: dir.analyzers,
+            });
+            report.findings.extend(dir.findings);
+            report.skipped.extend(dir.skipped);
+            report.omitted.extend(dir.omitted);
+            report.settings.extend(dir.settings);
         }
 
         report.analyzers = ANALYZERS
             .iter()
-            .map(|name| summarize_analyzer(name, &report.repositories, self.enabled(name)))
+            .map(|name| {
+                let off = (!self.enabled(name)).then(|| self.disabled_reason(name));
+                summarize_analyzer(name, &report.repositories, off)
+            })
             .collect();
         for summary in &mut report.repositories {
             summary.findings = report
@@ -392,38 +523,161 @@ impl Scanner {
         }
     }
 
-    /// Clone, scan and audit the settings of one repository (`full_name` is
-    /// `owner/name`), within `github.repo_timeout_secs`.
-    async fn scan_remote(&self, clone_url: &str, full_name: &str) -> RemoteScan {
+    /// Fetch (clone or download, per `github.fetch`), scan and audit the settings of
+    /// one repository, within `github.repo_timeout_secs`. `branch` is its default
+    /// branch, when a listing gave it.
+    async fn scan_remote(
+        &self,
+        owner: &str,
+        name: &str,
+        clone_url: &str,
+        branch: Option<&str>,
+    ) -> RemoteScan {
+        let full_name = &format!("{owner}/{name}");
         let limit = Duration::from_secs(self.config.github.repo_timeout_secs);
         let trusted = self.config.analysis.trust_repo.resolve(false);
         let work = async {
             let scan = async {
-                let checkout = git::clone(
-                    clone_url,
-                    self.config.github.token.as_deref(),
-                    self.config.analysis.history,
-                )
-                .await?;
-                let dir = self
-                    .scan_dir(&checkout.path, trusted, Some(full_name))
-                    .await?;
-                Ok::<_, Error>((checkout.commit.clone(), dir))
+                let fetched = self
+                    .fetch(owner, name, clone_url, branch)
+                    .await
+                    .map_err(|e| (format!("could not download the repository: {e}"), e))?;
+                let mut dir = self
+                    .scan_dir(fetched.path(), trusted, Some(full_name), fetched.source())
+                    .await
+                    .map_err(|e| (e.to_string(), e))?;
+                if let Fetched::Archive(snapshot) = &fetched {
+                    self.add_unwritten(&mut dir, snapshot);
+                }
+                Ok::<_, (String, Error)>((fetched.commit(), dir))
             };
             let (scan, (status, audit)) = tokio::join!(
                 scan,
                 self.audit_settings(Some(full_name), "", Some(full_name))
             );
-            let (commit, mut dir) = scan?;
-            dir.add_settings(status, audit);
-            Ok((commit, dir))
+            let mut result = match scan {
+                Ok((commit, dir)) => RemoteScan {
+                    commit,
+                    dir,
+                    error: None,
+                },
+                Err((why, e)) => RemoteScan {
+                    commit: None,
+                    dir: self.unscanned(&why, Some(full_name)),
+                    error: Some(e),
+                },
+            };
+            result.dir.add_settings(status, audit);
+            result
         };
-        tokio::time::timeout(limit, work).await.unwrap_or_else(|_| {
-            Err(Error::Timeout(format!(
-                "gave up after {}s (github.repo_timeout_secs)",
-                limit.as_secs()
-            )))
-        })
+        // On a timeout nothing of the repository is kept: some analyzers may have
+        // reported already, and each reports once. The roll-up counts it as failed.
+        tokio::time::timeout(limit, work)
+            .await
+            .unwrap_or_else(|_| RemoteScan {
+                commit: None,
+                dir: DirScan::default(),
+                error: Some(Error::Timeout(format!(
+                    "gave up after {}s (github.repo_timeout_secs)",
+                    limit.as_secs()
+                ))),
+            })
+    }
+
+    /// Get a repository's files the configured way.
+    async fn fetch(
+        &self,
+        owner: &str,
+        name: &str,
+        clone_url: &str,
+        branch: Option<&str>,
+    ) -> Result<Fetched> {
+        match self.config.github.fetch {
+            FetchMethod::Git => git::clone(
+                clone_url,
+                self.config.github.token.as_deref(),
+                self.config.analysis.history,
+            )
+            .await
+            .map(Fetched::Clone),
+            FetchMethod::Archive => {
+                let a = &self.config.analysis;
+                let opts = snapshot::FetchOptions {
+                    limits: snapshot::Limits::default(),
+                    max_file_size: a.max_file_size,
+                    exclude: a.exclude.clone(),
+                    // osv-scanner reads lockfiles of any size, in any directory.
+                    write_all: self.sca.is_some(),
+                };
+                snapshot::fetch(&self.github, owner, name, branch, &opts)
+                    .await
+                    .map(Fetched::Archive)
+            }
+        }
+    }
+
+    /// List the files of a downloaded commit that are not on disk, as discovery lists
+    /// the files it does not read.
+    fn add_unwritten(&self, dir: &mut DirScan, snapshot: &snapshot::Snapshot) {
+        let max_file_size = self.config.analysis.max_file_size;
+        let skipped = snapshot.skipped.iter().map(|(path, why)| SkippedFile {
+            repository: None,
+            path: path.clone(),
+            reason: why.clone(),
+        });
+        let too_large = snapshot.too_large.iter().map(|(path, size)| SkippedFile {
+            repository: None,
+            path: path.clone(),
+            reason: format!("{size} bytes, over max_file_size ({max_file_size})"),
+        });
+        dir.skipped.extend(skipped.chain(too_large));
+        dir.skipped.sort_by(|a, b| a.path.cmp(&b.path));
+    }
+
+    /// Results for a repository whose files could not be scanned: every file analyzer
+    /// that would have run failed with `why`; the others are skipped as usual. Each
+    /// status is reported as progress, as `scan_dir` would have.
+    fn unscanned(&self, why: &str, label: Option<&str>) -> DirScan {
+        let archive = self.config.github.fetch == FetchMethod::Archive;
+        let analyzers = ANALYZERS
+            .iter()
+            .filter(|name| **name != "settings")
+            .map(|name| {
+                self.off_status(name, archive)
+                    .unwrap_or_else(|| AnalyzerStatus::failed(name, why))
+            })
+            .collect::<Vec<_>>();
+        for status in &analyzers {
+            self.analyzer_finished(label, status);
+        }
+        DirScan {
+            analyzers,
+            ..Default::default()
+        }
+    }
+
+    /// The status of an analyzer that does not run in this scan, with the reason; `None`
+    /// for one that runs. `archive`: the files are a downloaded archive.
+    fn off_status(&self, analyzer: &str, archive: bool) -> Option<AnalyzerStatus> {
+        let a = &self.config.analysis;
+        let off = |why: &str| Some(AnalyzerStatus::skipped(analyzer, why));
+        match analyzer {
+            "history" if !a.history => off("disabled (enable with --history)"),
+            "history" if archive => off(HISTORY_NEEDS_CLONE),
+            "history" if !self.tools.git => off(HISTORY_NEEDS_GIT),
+            "ai" if !a.ai => off("disabled (enable with --ai)"),
+            _ if !self.enabled(analyzer) => off(self.disabled_reason(analyzer)),
+            _ => None,
+        }
+    }
+
+    /// Why a turned-off analyzer is off: "disabled", or the reason a front end gave
+    /// for dependency checks being unavailable.
+    fn disabled_reason(&self, analyzer: &str) -> &str {
+        match (analyzer, &self.config.sca.unavailable) {
+            ("sca", Some(why)) if !self.config.analysis.sca => why,
+            _ => "disabled",
+        }
     }
 
     fn enabled(&self, analyzer: &str) -> bool {
@@ -443,6 +697,9 @@ impl Scanner {
 
     /// `owner/name` of the GitHub repository a local directory was cloned from.
     async fn github_repo_of(&self, path: &Path) -> Option<String> {
+        if !self.tools.git {
+            return None;
+        }
         let url = git::origin_url(path).await?;
         let host = crate::github::web_host(&self.config.github.api_url);
         match target::parse_scan_target(&url, &host) {
@@ -505,8 +762,15 @@ impl Scanner {
 
     /// Scan one directory with every enabled analyzer. `trusted` decides whether the
     /// tree's own ignore files, suppressions and osv-scanner config are honored;
-    /// `label` names the scanned repository in progress events.
-    async fn scan_dir(&self, root: &Path, trusted: bool, label: Option<&str>) -> Result<DirScan> {
+    /// `label` names the scanned repository in progress events; `source` says where
+    /// the files came from.
+    async fn scan_dir(
+        &self,
+        root: &Path,
+        trusted: bool,
+        label: Option<&str>,
+        source: Source<'_>,
+    ) -> Result<DirScan> {
         let cancel = Arc::new(AtomicBool::new(false));
         let _cancel_on_drop = CancelOnDrop(Arc::clone(&cancel));
         let max_file_size = self.config.analysis.max_file_size;
@@ -536,13 +800,26 @@ impl Scanner {
                 analyze_files(&engines, &files, trusted, &cancel)
             });
             async move {
-                let local = task.await;
-                if local.is_ok() {
-                    for status in self.local_statuses() {
-                        self.analyzer_finished(label, &status);
+                // A crash of the per-file pass fails its analyzers but keeps what the
+                // others found, and every analyzer still reports exactly once.
+                let (local, statuses) = match task.await {
+                    Ok(local) => (local, self.local_statuses(source)),
+                    Err(e) => {
+                        let why = format!("analysis crashed: {e}");
+                        let failed = self.local_statuses(source).map(|s| {
+                            if s.state == AnalyzerState::Completed {
+                                AnalyzerStatus::failed(&s.analyzer, &why)
+                            } else {
+                                s
+                            }
+                        });
+                        (LocalResults::default(), failed)
                     }
+                };
+                for status in &statuses {
+                    self.analyzer_finished(label, status);
                 }
-                local
+                (local, statuses)
             }
         };
         let sca = async {
@@ -551,7 +828,7 @@ impl Scanner {
                 None => None,
             };
             let status = match &result {
-                None => AnalyzerStatus::skipped("sca", "disabled"),
+                None => AnalyzerStatus::skipped("sca", self.disabled_reason("sca")),
                 Some(Ok(outcome)) => {
                     let detail = (!outcome.warnings.is_empty())
                         .then(|| format!("osv-scanner warnings: {}", outcome.warnings.join("; ")));
@@ -559,6 +836,7 @@ impl Scanner {
                 }
                 Some(Err(e)) => AnalyzerStatus::failed("sca", e.clone()),
             };
+            let status = source.vouch(status);
             self.analyzer_finished(label, &status);
             (result, status)
         };
@@ -567,40 +845,41 @@ impl Scanner {
             let cancel = Arc::clone(&cancel);
             let root = root.to_path_buf();
             let exclude = self.config.analysis.exclude.clone();
+            let off = self.off_status("history", source.is_archive());
             async move {
-                let result = if engines.history {
-                    let task = tokio::task::spawn_blocking(move || {
-                        let detector = engines
-                            .secrets
-                            .as_ref()
-                            .ok_or("needs the secrets analyzer")?;
-                        let filter = PathFilter::new(&root, &exclude).map_err(|e| e.to_string())?;
-                        history::scan_history(
-                            &root,
-                            detector,
-                            &filter,
-                            history::Limits::default(),
-                            &cancel,
-                        )
-                    });
-                    Some(task.await.unwrap_or_else(|e| Err(format!("crashed: {e}"))))
-                } else {
-                    None
-                };
-                let status = match &result {
-                    None => AnalyzerStatus::skipped("history", "disabled (enable with --history)"),
-                    Some(Ok(outcome)) => {
-                        AnalyzerStatus::completed("history").with_detail(Some(outcome.summary()))
+                let (result, status) = match off {
+                    Some(off) => (None, off),
+                    None => {
+                        let task = tokio::task::spawn_blocking(move || {
+                            let detector = engines
+                                .secrets
+                                .as_ref()
+                                .ok_or("needs the secrets analyzer")?;
+                            let filter =
+                                PathFilter::new(&root, &exclude).map_err(|e| e.to_string())?;
+                            history::scan_history(
+                                &root,
+                                detector,
+                                &filter,
+                                history::Limits::default(),
+                                &cancel,
+                            )
+                        });
+                        let result = task.await.unwrap_or_else(|e| Err(format!("crashed: {e}")));
+                        let status = match &result {
+                            Ok(outcome) => AnalyzerStatus::completed("history")
+                                .with_detail(Some(outcome.summary())),
+                            Err(e) => AnalyzerStatus::failed("history", e.clone()),
+                        };
+                        (Some(result), status)
                     }
-                    Some(Err(e)) => AnalyzerStatus::failed("history", e.clone()),
                 };
                 self.analyzer_finished(label, &status);
                 (result, status)
             }
         };
-        let (local, (sca, sca_status), (history, history_status)) =
+        let ((local, local_statuses), (sca, sca_status), (history, history_status)) =
             tokio::join!(local, sca, history);
-        let local = local.map_err(|e| Error::Config(format!("analysis crashed: {e}")))?;
 
         let mut dir = DirScan {
             findings: local.findings,
@@ -622,7 +901,7 @@ impl Scanner {
                 }),
         );
         dir.skipped.sort_by(|a, b| a.path.cmp(&b.path));
-        let [sast, secrets, workflows, agents] = self.local_statuses();
+        let [sast, secrets, workflows, agents] = local_statuses;
         dir.analyzers.push(sast);
         dir.analyzers.push(secrets);
         match history {
@@ -649,7 +928,7 @@ impl Scanner {
         dir.analyzers.push(agents);
         let ai = match &self.ai {
             None => AnalyzerStatus::skipped("ai", "disabled (enable with --ai)"),
-            Some(ai) => self.run_ai(ai, &files, trusted, &mut dir).await,
+            Some(ai) => source.vouch(self.run_ai(ai, &files, trusted, &mut dir).await),
         };
         self.analyzer_finished(label, &ai);
         dir.analyzers.push(ai);
@@ -658,13 +937,14 @@ impl Scanner {
     }
 
     /// Statuses of the analyzers that run in the per-file pass.
-    fn local_statuses(&self) -> [AnalyzerStatus; 4] {
+    fn local_statuses(&self, source: Source) -> [AnalyzerStatus; 4] {
         [
             status("sast", self.local.sast.is_some()),
             status("secrets", self.local.secrets.is_some()),
             status("workflows", self.local.workflows),
             status("agents", self.local.agents),
         ]
+        .map(|s| source.vouch(s))
     }
 
     async fn run_ai(
@@ -749,17 +1029,22 @@ fn apply(report: &mut ScanReport, dir: DirScan) {
     report.settings = dir.settings;
 }
 
-/// Roll per-repository statuses up into one status per analyzer.
-fn summarize_analyzer(name: &str, repos: &[RepositorySummary], enabled: bool) -> AnalyzerStatus {
-    if !enabled {
-        return AnalyzerStatus::skipped(name, "disabled");
+/// Roll per-repository statuses up into one status per analyzer. A repository that
+/// failed without a status for the analyzer (it timed out) counts as a failure.
+/// `disabled` is the reason for an analyzer this scan turned off.
+fn summarize_analyzer(
+    name: &str,
+    repos: &[RepositorySummary],
+    disabled: Option<&str>,
+) -> AnalyzerStatus {
+    if let Some(why) = disabled {
+        return AnalyzerStatus::skipped(name, why);
     }
     let failed = repos
         .iter()
-        .filter(|r| {
-            r.analyzers
-                .iter()
-                .any(|a| a.analyzer == name && a.state == AnalyzerState::Failed)
+        .filter(|r| match r.analyzers.iter().find(|a| a.analyzer == name) {
+            Some(a) => a.state == AnalyzerState::Failed,
+            None => r.error.is_some(),
         })
         .count();
     if failed > 0 {
@@ -1296,6 +1581,7 @@ mod tests {
             archived: false,
             fork,
             private: false,
+            default_branch: None,
         };
         let repos = vec![
             repo("acme/good", &good, false),
@@ -1362,6 +1648,280 @@ mod tests {
             )),
             "a repository that could not be cloned has no files: {events:?}"
         );
+
+        // It still reports every analyzer: the file analyzers failed, the settings
+        // audit ran (skipped here: no token), and the roll-up shows the failure.
+        let missing = &report.repositories[1].analyzers;
+        assert_eq!(reported_statuses(&events, Some("acme/missing")), *missing);
+        assert_eq!(missing.len(), ANALYZERS.len(), "{missing:?}");
+        let state = |name: &str| {
+            let s = missing.iter().find(|a| a.analyzer == name).unwrap();
+            (s.state, s.detail.clone().unwrap_or_default())
+        };
+        let (sast, why) = state("sast");
+        assert_eq!(sast, AnalyzerState::Failed);
+        assert!(
+            why.starts_with("could not download the repository: "),
+            "{why}"
+        );
+        assert_eq!(state("sca").0, AnalyzerState::Skipped, "turned off");
+        assert_eq!(state("settings").0, AnalyzerState::Skipped);
+        let sast = report.analyzers.iter().find(|a| a.analyzer == "sast");
+        assert_eq!(
+            sast,
+            Some(&AnalyzerStatus::failed(
+                "sast",
+                "failed in 1 of 2 repositories"
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repository_that_cannot_be_cloned_keeps_its_settings_audit() {
+        let missing = tempfile::tempdir().unwrap();
+        let url = |p: &Path| {
+            let p = p.to_string_lossy().replace('\\', "/");
+            format!("file:///{}", p.trim_start_matches('/'))
+        };
+        let (api, _) = crate::github::mock::serve(|line| {
+            if line == "GET /repos/acme/gone" {
+                let repo = r#"{"full_name":"acme/gone","clone_url":"x","default_branch":"main","permissions":{"admin":true},"security_and_analysis":{"secret_scanning":{"status":"disabled"}}}"#;
+                (200, vec![], repo.into())
+            } else {
+                (404, vec![], r#"{"message":"Not Found"}"#.into())
+            }
+        })
+        .await;
+        let mut config = Config::default();
+        config.github.api_url = api;
+        config.github.token = Some("t0ken".into());
+        config.analysis.sca = false;
+        let scanner = Scanner::new(config).unwrap();
+        let mut report = ScanReport::new("user:acme");
+        let repo = RepoInfo {
+            full_name: "acme/gone".into(),
+            clone_url: url(&missing.path().join("nothing-here")),
+            archived: false,
+            fork: false,
+            private: false,
+            default_branch: None,
+        };
+        scanner.scan_many(&mut report, vec![repo]).await;
+
+        let summary = &report.repositories[0];
+        assert!(summary.error.is_some());
+        assert!(
+            !report.settings.is_empty(),
+            "settings checks are kept: {report:?}"
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.category == Category::Settings),
+            "{:?}",
+            report.findings
+        );
+        let state = |name: &str| {
+            report
+                .analyzers
+                .iter()
+                .find(|a| a.analyzer == name)
+                .map(|a| a.state)
+        };
+        assert_eq!(state("settings"), Some(AnalyzerState::Completed));
+        assert_eq!(state("secrets"), Some(AnalyzerState::Failed));
+        assert!(!report.is_complete());
+    }
+
+    /// The promise that a repository cannot hide files: a workflow its `.gitattributes`
+    /// leaves out of GitHub's archive is still audited.
+    #[tokio::test]
+    async fn archive_scans_see_files_left_out_of_the_archive() {
+        use crate::snapshot::tests::{SHA, github_archive, serve_repo, tree_json};
+        let workflow: &[u8] = b"on: pull_request_target\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n        with:\n          ref: ${{ github.event.pull_request.head.sha }}\n      - run: make test\n";
+        let attributes: &[u8] = b"/.github/ export-ignore\n";
+        let commit: Vec<(&str, &[u8])> = vec![
+            (".gitattributes", attributes),
+            (".github/workflows/ci.yml", workflow),
+            ("app.py", b"import os\nos.system(cmd)\n"),
+        ];
+        let archived: Vec<(&str, &[u8])> = vec![
+            (".gitattributes", attributes),
+            ("app.py", b"import os\nos.system(cmd)\n"),
+        ];
+        let archive = github_archive(SHA, &archived);
+        let config = |api: String| {
+            let mut config = Config::default();
+            config.github.api_url = api;
+            config.github.fetch = FetchMethod::Archive;
+            config.analysis.history = true;
+            config.analysis.sca = false;
+            config
+        };
+        let target = Target::Repo {
+            owner: "acme".into(),
+            name: "app".into(),
+        };
+        let (api, _) = serve_repo(
+            Some(archive.clone()),
+            tree_json(&commit, false),
+            vec![workflow.to_vec()],
+        )
+        .await;
+        let report = Scanner::new(config(api.clone()))
+            .unwrap()
+            .scan(&target)
+            .await
+            .unwrap();
+        assert_eq!(report.commit.as_deref(), Some(SHA));
+        let found = |report: &ScanReport, rule: &str, path: &str| {
+            report
+                .findings
+                .iter()
+                .any(|f| f.rule_id == rule && f.location.path == path)
+        };
+        assert!(
+            found(
+                &report,
+                "gha/untrusted-checkout",
+                ".github/workflows/ci.yml"
+            ),
+            "{:#?}",
+            report.findings
+        );
+        assert!(report.findings.iter().any(|f| f.location.path == "app.py"));
+        let history = report.analyzers.iter().find(|a| a.analyzer == "history");
+        assert_eq!(
+            history,
+            Some(&AnalyzerStatus::skipped("history", HISTORY_NEEDS_CLONE))
+        );
+        assert!(report.is_complete(), "{:?}", report.failures());
+
+        // A multi-repository scan uses the listing's default branch.
+        let (api, log) = serve_repo(
+            Some(archive.clone()),
+            tree_json(&commit, false),
+            vec![workflow.to_vec()],
+        )
+        .await;
+        let scanner = Scanner::new(config(api)).unwrap();
+        let mut report = ScanReport::new("user:acme");
+        let repo = RepoInfo {
+            full_name: "acme/app".into(),
+            clone_url: "unused".into(),
+            archived: false,
+            fork: false,
+            private: false,
+            default_branch: Some("main".into()),
+        };
+        scanner.scan_many(&mut report, vec![repo]).await;
+        assert_eq!(report.repositories[0].commit.as_deref(), Some(SHA));
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "gha/untrusted-checkout")
+        );
+        let log = log.lock().unwrap().clone();
+        assert!(
+            !log.iter().any(|l| l.starts_with("GET /repos/acme/app ")),
+            "{log:?}"
+        );
+
+        // Files that cannot all be checked: what was found is kept, but the file
+        // analyzers fail, so the report does not pass for a complete scan.
+        let (api, _) = serve_repo(
+            Some(archive),
+            tree_json(&commit, true),
+            vec![workflow.to_vec()],
+        )
+        .await;
+        let report = Scanner::new(config(api))
+            .unwrap()
+            .scan(&target)
+            .await
+            .unwrap();
+        assert!(found(
+            &report,
+            "gha/untrusted-checkout",
+            ".github/workflows/ci.yml"
+        ));
+        for name in ["sast", "secrets", "workflows", "agents"] {
+            let status = report
+                .analyzers
+                .iter()
+                .find(|a| a.analyzer == name)
+                .unwrap();
+            assert_eq!(status.state, AnalyzerState::Failed, "{status:?}");
+            let detail = status.detail.as_deref().unwrap_or_default();
+            assert!(detail.starts_with(snapshot::UNCONFIRMED), "{detail}");
+        }
+        assert!(!report.is_complete());
+    }
+
+    #[test]
+    fn programs_are_found_on_path_without_running_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = if cfg!(windows) { ".exe" } else { "" };
+        std::fs::write(dir.path().join(format!("fake-tool{exe}")), "").unwrap();
+        std::fs::create_dir(dir.path().join(format!("a-directory{exe}"))).unwrap();
+        let path = std::env::join_paths([Path::new("/nowhere"), dir.path()]).unwrap();
+        assert!(find_program("fake-tool", &path));
+        assert!(!find_program("missing-tool", &path));
+        assert!(
+            !find_program("a-directory", &path),
+            "directories are not programs"
+        );
+        assert!(!find_program("fake-tool", std::ffi::OsStr::new("")));
+        assert!(!find_program("", &path));
+        // A path is checked as given, not on PATH.
+        let full = dir.path().join("fake-tool");
+        assert!(find_program(
+            full.to_str().unwrap(),
+            std::ffi::OsStr::new("")
+        ));
+        assert!(!find_program(
+            dir.path().join("missing-tool").to_str().unwrap(),
+            &path
+        ));
+    }
+
+    #[tokio::test]
+    async fn analyzers_that_cannot_run_here_say_why() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("app.py"), "import os\nos.system(cmd)\n").unwrap();
+        let why = "not available on phones: dependency checks need osv-scanner";
+        let mut config = Config::default();
+        config.analysis.history = true;
+        config.analysis.sca = false;
+        config.sca.unavailable = Some(why.into());
+        let mut scanner = Scanner::new(config).unwrap();
+        scanner.tools.git = false;
+        let report = scanner
+            .scan(&Target::Local(dir.path().to_path_buf()))
+            .await
+            .unwrap();
+        let status = |name: &str| report.analyzers.iter().find(|a| a.analyzer == name);
+        assert_eq!(
+            status("history"),
+            Some(&AnalyzerStatus::skipped("history", HISTORY_NEEDS_GIT))
+        );
+        assert_eq!(status("sca"), Some(&AnalyzerStatus::skipped("sca", why)));
+        assert!(report.commit.is_none());
+        assert!(report.is_complete(), "{:?}", report.failures());
+
+        // The reason survives the roll-up of a multi-repository scan, and is only used
+        // while dependency checks are off.
+        assert_eq!(scanner.disabled_reason("sca"), why);
+        assert_eq!(scanner.disabled_reason("sast"), "disabled");
+        let mut on = Config::default();
+        on.sca.unavailable = Some(why.into());
+        assert_eq!(Scanner::new(on).unwrap().off_status("sca", false), None);
+        let mut report = ScanReport::new("user:acme");
+        scanner.scan_many(&mut report, Vec::new()).await;
+        let sca = report.analyzers.iter().find(|a| a.analyzer == "sca");
+        assert_eq!(sca, Some(&AnalyzerStatus::skipped("sca", why)));
     }
 
     #[test]
@@ -1379,16 +1939,31 @@ mod tests {
         };
         let repos = vec![repo(AnalyzerState::Completed), repo(AnalyzerState::Failed)];
         assert_eq!(
-            summarize_analyzer("sca", &repos, true).state,
+            summarize_analyzer("sca", &repos, None).state,
             AnalyzerState::Failed
         );
         assert_eq!(
-            summarize_analyzer("sca", &repos, false).state,
+            summarize_analyzer("sca", &repos, Some("disabled")).state,
             AnalyzerState::Skipped
         );
         assert_eq!(
-            summarize_analyzer("sast", &repos, true).state,
+            summarize_analyzer("sast", &repos, None).state,
             AnalyzerState::Completed
+        );
+        // A repository that timed out has no statuses: it failed for every analyzer.
+        let timed_out = RepositorySummary {
+            error: Some("gave up after 1800s".into()),
+            analyzers: Vec::new(),
+            ..repo(AnalyzerState::Completed)
+        };
+        let repos = vec![repo(AnalyzerState::Completed), timed_out];
+        assert_eq!(
+            summarize_analyzer("sast", &repos, None),
+            AnalyzerStatus::failed("sast", "failed in 1 of 2 repositories")
+        );
+        assert_eq!(
+            summarize_analyzer("sca", &repos, None).state,
+            AnalyzerState::Failed
         );
     }
 }

@@ -73,7 +73,15 @@ fn platform_store() -> Option<Arc<CredentialStore>> {
     Some(apple_native_keyring_store::keychain::Store::new().ok()?)
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(target_os = "android")]
+fn platform_store() -> Option<Arc<CredentialStore>> {
+    Some(android_native_keyring_store::Store::new().ok()?)
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+))]
 fn platform_store() -> Option<Arc<CredentialStore>> {
     let store: Arc<CredentialStore> = zbus_secret_service_keyring_store::Store::new().ok()?;
     // A Secret Service that exists but can't store anything (locked, or blocked by a

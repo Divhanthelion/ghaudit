@@ -2,7 +2,7 @@
 //! the CLI turns its flags into them (src/main.rs), so a scan here finds what
 //! `ghaudit scan|user|org|search` with the same options finds.
 
-use ghaudit::config::Config;
+use ghaudit::config::{Config, FetchMethod};
 use ghaudit::target::{self, Target};
 use ghaudit::{ProgressSink, ScanReport, Scanner, Severity};
 use serde::Deserialize;
@@ -61,7 +61,13 @@ pub struct Context<'a> {
     pub login: Option<&'a str>,
     pub osv_scanner: Option<&'a Path>,
     pub folder: Option<&'a Path>,
+    /// Scanning on a phone: no git, no osv-scanner (see [`prepare`]).
+    pub phone: bool,
 }
+
+/// Why a phone report has no dependency checks (shown as the analyzer's reason).
+pub const PHONE_SCA: &str =
+    "not available on phones: dependency checks need osv-scanner, which runs only on a computer";
 
 pub const NO_OSV_SCANNER: &str = "Dependency checks need osv-scanner, which isn't installed. Install it (on Windows: winget install --id Google.OSVScanner), or scan without dependency checks.";
 
@@ -78,6 +84,18 @@ pub fn prepare(options: &ScanOptions, cx: &Context) -> Result<(Config, Target), 
     a.settings = options.settings;
     a.history = options.history;
     a.ai = false;
+    if cx.phone {
+        // A phone has neither osv-scanner nor git. Repositories are downloaded as
+        // archives, which have no history; asking for history (whenever secrets are
+        // searched) makes the report say exactly that, instead of "disabled".
+        a.sca = false;
+        a.history = a.secrets;
+        config.sca.unavailable = Some(PHONE_SCA.into());
+        config.github.fetch = FetchMethod::Archive;
+        // Fewer downloads at once: phone networks, memory and heat.
+        config.github.concurrency = 2;
+    }
+    let a = &config.analysis;
     if !(a.sast || a.secrets || a.sca || a.workflows || a.agents || a.settings) {
         return Err("Turn on at least one check.".into());
     }
@@ -198,7 +216,33 @@ mod tests {
             login: Some("octocat"),
             osv_scanner: Some(osv),
             folder: None,
+            phone: false,
         }
+    }
+
+    /// On a phone: no dependency checks (with the reason), history asked for so the
+    /// report says why it can't run, archives instead of git, two repositories at once.
+    #[test]
+    fn phones_scan_without_git_or_osv_scanner() {
+        let cx = Context {
+            osv_scanner: None,
+            phone: true,
+            ..context(Path::new("unused"))
+        };
+        let mut opts = options(TargetSpec::Mine);
+        opts.history = false;
+        let (config, _) = prepare(&opts, &cx).unwrap();
+        assert!(!config.analysis.sca);
+        assert_eq!(config.sca.unavailable.as_deref(), Some(PHONE_SCA));
+        assert!(config.analysis.history);
+        assert_eq!(config.github.fetch, FetchMethod::Archive);
+        assert_eq!(config.github.concurrency, 2);
+        opts.secrets = false;
+        let (config, _) = prepare(&opts, &cx).unwrap();
+        assert!(
+            !config.analysis.history,
+            "history needs the secrets analyzer"
+        );
     }
 
     /// The same configuration as `ghaudit user octocat --history --include-archived`.

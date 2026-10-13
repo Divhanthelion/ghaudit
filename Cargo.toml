@@ -25,7 +25,8 @@ rayon = "1.11"
 
 # HTTP: GitHub REST API and the optional local LLM endpoint.
 # rustls with the `ring` provider keeps the build free of CMake/NASM on Windows.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots", "rustls-tls-native-roots"] }
+# Bundled webpki roots everywhere, plus the system's roots except on Android (below).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
 
 # Static analysis
 tree-sitter = "0.26"
@@ -49,6 +50,13 @@ regex = "1.11"
 sha2 = "0.11"
 base64 = "0.23"
 
+# Repository archives, for scans without git (snapshot.rs): reading a .tar.gz, and the
+# git blob ids its files are checked against. tar 0.4.46 fixes 2026's PAX parsing
+# advisories; ghaudit never calls its unpack functions.
+tar = { version = "0.4.46", default-features = false }
+flate2 = "1.1"
+sha1 = "0.11"
+
 # CLI, errors, logging
 clap = { version = "4.5", features = ["derive", "env"] }
 thiserror = "2.0"
@@ -60,10 +68,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 tempfile = "3.20"
 futures = "0.3"
-# GitHub Actions workflow parsing (maintained fork of serde_yaml)
-serde_yaml_ng = "0.10"
 anstream = "1.0"
 saphyr-parser = "0.1"
+
+# The system's certificate store, so a root certificate the user installed (a company
+# proxy's, for example) is trusted. rustls-native-certs does not read Android's store,
+# so there it would only add code.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
 
 [dev-dependencies]
 assert_cmd = "2"

@@ -1,10 +1,11 @@
 // The Findings tab: a filterable, sortable table of findings and the selected one in
 // detail. Every string from the report is inserted as text (see dom.js).
 
-import { h, replace, icon, plural } from "./dom.js";
+import { h, replace, icon, plural, phone, shortRepo, reportOwner } from "./dom.js";
 import { SEVERITIES, SEVERITY, CATEGORIES, CONFIDENCE, categoryLabel } from "./explain.js";
 import { filterFindings, sortFindings, githubLinks, repositoryOf, repositoryRows } from "./report.js";
 import * as backend from "./backend.js";
+import * as nav from "./nav.js";
 
 /** Rows rendered at a time; "Show more" adds another page. */
 const PAGE = 300;
@@ -16,7 +17,18 @@ const COLUMNS = [
   { key: "location", label: "Where", col: "c-loc", defaultDir: "asc" },
 ];
 
+/** The phone's sort choices (wider screens sort by the column headings). */
+const SORT_LABELS = {
+  severity: "Most severe first",
+  rule: "Problem, A to Z",
+  repository: "Repository, A to Z",
+  location: "File, A to Z",
+};
+
 const ALLOWED_LINK = /^https:\/\/(github\.com|osv\.dev)\//;
+
+/** Where the details cover the list instead of sitting beside it (as in styles.css). */
+const DETAIL_OVERLAY = window.matchMedia("(max-width: 1040px)");
 
 /**
  * prepared: from report.prepare(). onError(message) shows a failure.
@@ -41,6 +53,7 @@ export function createFindingsView(prepared, { onError }) {
   };
   let visible = [];
   const byId = new Map(prepared.findings.map((f) => [f.id, f]));
+  const owner = reportOwner(prepared.raw.target);
 
   // ---------------------------------------------------------------- toolbar
 
@@ -50,6 +63,9 @@ export function createFindingsView(prepared, { onError }) {
     placeholder: "Search title, file, package, CVE…",
     "aria-label": "Search findings",
     spellcheck: "false",
+    autocapitalize: "off",
+    autocorrect: "off",
+    enterkeyhint: "search",
   });
   let searchTimer;
   search.addEventListener("input", () => {
@@ -58,6 +74,10 @@ export function createFindingsView(prepared, { onError }) {
       state.text = search.value;
       update({ resetLimit: true });
     }, 120);
+  });
+  search.addEventListener("keydown", (e) => {
+    // Phones: the keyboard's search key hides the keyboard, so the results show.
+    if (e.key === "Enter" && phone.matches) search.blur();
   });
 
   const sevChips = SEVERITIES.filter((s) => prepared.bySeverity[s.id]).map((s) => {
@@ -118,14 +138,38 @@ export function createFindingsView(prepared, { onError }) {
     });
   }
 
+  // Phones sort in the Filters sheet: their list has no column headings.
+  const sortSelect = h(
+    "select",
+    { class: "select", "aria-label": "Sort by" },
+    allColumns.map((c) => h("option", { value: c.key }, SORT_LABELS[c.key])),
+  );
+  sortSelect.addEventListener("change", () => {
+    const column = allColumns.find((c) => c.key === sortSelect.value);
+    if (column) state.sort = { key: column.key, dir: column.defaultDir };
+    update({});
+  });
+
+  const chipBox = h("div", { class: "toggle-chips", role: "group", "aria-label": "Severity" }, sevChips);
+  const groupLabel = groupBox ? h("label", { class: "check" }, groupBox, "Group by repository") : null;
+  /** The controls a phone shows in the Filters sheet, and wider screens in the bar. */
+  const controlNodes = [chipBox, categorySelect, repoSelect, groupLabel].filter(Boolean);
+  const controls = h("div", { class: "filter-controls" }, controlNodes);
+  const filterBadge = h("span", { class: "filter-count" });
+  const filtersButton = h(
+    "button",
+    { type: "button", class: "btn filters-button phone-only", "aria-haspopup": "dialog", onclick: () => openFilters() },
+    icon("filter"),
+    "Filters",
+    filterBadge,
+  );
+
   const filters = h(
     "div",
     { class: "filters", role: "search" },
     h("div", { class: "search" }, icon("search"), search),
-    h("div", { class: "toggle-chips", role: "group", "aria-label": "Severity" }, sevChips),
-    categorySelect,
-    repoSelect,
-    groupBox ? h("label", { class: "check" }, groupBox, "Group by repository") : null,
+    filtersButton,
+    controls,
   );
 
   const countLine = h("div", { class: "result-count", role: "status", "aria-live": "polite" });
@@ -142,8 +186,14 @@ export function createFindingsView(prepared, { onError }) {
   const headRow = h("tr", {});
   const tbody = h("tbody", {});
   const table = h("table", { class: "findings-table", "aria-label": "Findings" }, colgroup, h("thead", {}, headRow), tbody);
+  const cards = h("ul", { class: "finding-cards", "aria-label": "Findings", hidden: true });
   const more = h("div", { class: "more" });
-  const listScroll = h("div", { class: "list-scroll" }, table, more);
+  const listScroll = h("div", { class: "list-scroll" }, table, cards, more);
+
+  cards.addEventListener("click", (e) => {
+    const card = e.target.closest("button.finding-card");
+    if (card) select(Number(card.dataset.id), { open: true });
+  });
 
   tbody.addEventListener("click", (e) => {
     const row = e.target.closest("tr.finding");
@@ -176,10 +226,63 @@ export function createFindingsView(prepared, { onError }) {
   // Escape closes the details where they cover the list (narrow windows).
   element.addEventListener("keydown", (e) => {
     if (e.key !== "Escape" || !state.detailOpen) return;
+    closeDetail();
+  });
+
+  /** In the mobile app, where the details cover the list, Back closes them. */
+  let detailLayer = null;
+
+  function openDetail() {
+    state.detailOpen = true;
+    if (!detailLayer && DETAIL_OVERLAY.matches && nav.systemBackEnabled()) {
+      detailLayer = nav.openLayer(() => {
+        detailLayer = null;
+        hideDetail();
+      });
+    }
+  }
+
+  function closeDetail() {
+    if (detailLayer) nav.closeLayer(detailLayer);
+    detailLayer = null;
+    hideDetail();
+  }
+
+  function hideDetail() {
     state.detailOpen = false;
     detail.classList.add("closed");
-    tbody.querySelector('tr.finding[aria-selected="true"]')?.focus();
-  });
+    const current = phone.matches
+      ? cards.querySelector(`button.finding-card[data-id="${state.selected}"]`)
+      : tbody.querySelector('tr.finding[aria-selected="true"]');
+    for (const c of cards.querySelectorAll('button.finding-card[aria-current="true"]')) c.removeAttribute("aria-current");
+    current?.focus({ preventScroll: phone.matches });
+  }
+
+  // ---------------------------------------------------------------- filters sheet
+
+  function openFilters() {
+    const field = (label, control) => h("div", { class: "sheet-field" }, h("span", { class: "sheet-label" }, label), control);
+    let close = () => {};
+    const content = [
+      field("Severity", chipBox),
+      field("Kind of problem", categorySelect),
+      repoSelect ? field("Repository", repoSelect) : null,
+      field("Sort by", sortSelect),
+      groupLabel ? h("div", { class: "sheet-field" }, groupLabel) : null,
+      h(
+        "div",
+        { class: "sheet-actions" },
+        h("button", { type: "button", class: "btn", onclick: clearFilters }, "Clear filters"),
+        h("button", { type: "button", class: "btn primary", onclick: () => close() }, "Show results"),
+      ),
+    ];
+    close = nav.openSheet({ title: "Filter and sort", content, className: "filters-sheet", onClose: restoreControls });
+  }
+
+  /** Put the controls back in the bar when the sheet closes. */
+  function restoreControls() {
+    controls.replaceChildren(...controlNodes);
+  }
 
   // ---------------------------------------------------------------- behaviour
 
@@ -220,6 +323,11 @@ export function createFindingsView(prepared, { onError }) {
     categorySelect.value = state.category;
     if (repoSelect) repoSelect.value = state.repository;
     if (groupBox) groupBox.checked = state.group;
+    const sortColumn = allColumns.find((c) => c.key === state.sort.key);
+    sortSelect.value = sortColumn && state.sort.dir === sortColumn.defaultDir ? sortColumn.key : "";
+    const active = state.severities.size + Number(Boolean(state.category)) + Number(Boolean(state.repository));
+    filterBadge.textContent = active ? String(active) : "";
+    filtersButton.setAttribute("aria-label", active ? `Filters, ${active} on` : "Filters");
     const shown = columns();
     colgroup.replaceChildren(...shown.map((c) => h("col", { class: c.col })));
     headRow.replaceChildren(...headCells.filter((c) => shown.includes(c.column)).map((c) => c.th));
@@ -237,6 +345,88 @@ export function createFindingsView(prepared, { onError }) {
   }
 
   function renderRows() {
+    const onPhone = phone.matches;
+    table.hidden = onPhone;
+    cards.hidden = !onPhone;
+    if (onPhone) renderCards();
+    else renderTable();
+    replace(
+      more,
+      visible.length > state.limit
+        ? h(
+            "button",
+            {
+              type: "button",
+              class: "btn",
+              onclick: () => {
+                state.limit += PAGE;
+                renderRows();
+              },
+            },
+            `Show ${Math.min(PAGE, visible.length - state.limit).toLocaleString()} more`,
+          )
+        : null,
+    );
+  }
+
+  function emptyState() {
+    return prepared.findings.length
+      ? h(
+          "div",
+          { class: "empty" },
+          icon("filter"),
+          h("h3", {}, "No findings match these filters"),
+          h("button", { type: "button", class: "btn", onclick: clearFilters }, "Clear filters"),
+        )
+      : h("div", { class: "empty" }, icon("shieldCheck"), h("h3", {}, "Nothing was found"), h("p", {}, "See the Overview for what was checked."));
+  }
+
+  /** Phones: a card per finding, under a heading per repository when grouped. */
+  function renderCards() {
+    tbody.replaceChildren();
+    const items = [];
+    const perGroup = new Map();
+    if (state.group) for (const f of visible) perGroup.set(f.repository, (perGroup.get(f.repository) ?? 0) + 1);
+    let group = undefined;
+    for (const f of visible.slice(0, state.limit)) {
+      if (state.group && f.repository !== group) {
+        group = f.repository;
+        items.push(
+          h("li", { class: "group" }, group ? shortRepo(group, owner) : "Organization", h("span", { class: "n" }, plural(perGroup.get(group), "finding"))),
+        );
+      }
+      items.push(h("li", {}, card(f)));
+    }
+    cards.replaceChildren(...items);
+    if (!visible.length) cards.append(h("li", {}, emptyState()));
+  }
+
+  function card(f) {
+    const sev = SEVERITY[f.severity];
+    const repo = !state.group && f.repository ? shortRepo(f.repository, owner) : null;
+    return h(
+      "button",
+      {
+        type: "button",
+        class: "finding-card",
+        "aria-current": f.id === state.selected && state.detailOpen ? "true" : null,
+        dataset: { id: f.id },
+      },
+      h(
+        "span",
+        { class: "fc-top" },
+        h("span", { class: `badge sev-${f.severity}` }, sev?.label ?? f.severity),
+        h("span", { class: "chip" }, categoryLabel(f.category)),
+        f.commit ? h("span", { class: "chip" }, "In git history") : null,
+      ),
+      h("span", { class: "fc-title" }, f.title),
+      // The category chip already says "Repository settings".
+      h("span", { class: "fc-where" }, repo ? h("span", { class: "fc-repo" }, repo) : null, f.category === "settings" ? null : whereShort(f)),
+    );
+  }
+
+  function renderTable() {
+    cards.replaceChildren();
     const shown = visible.slice(0, state.limit);
     const rows = [];
     const span = columns().length;
@@ -257,44 +447,7 @@ export function createFindingsView(prepared, { onError }) {
       rows.push(row(f));
     }
     tbody.replaceChildren(...rows);
-    if (!visible.length) {
-      tbody.append(
-        h(
-          "tr",
-          {},
-          h(
-            "td",
-            { colspan: span },
-            prepared.findings.length
-              ? h(
-                  "div",
-                  { class: "empty" },
-                  icon("filter"),
-                  h("h3", {}, "No findings match these filters"),
-                  h("button", { type: "button", class: "btn", onclick: clearFilters }, "Clear filters"),
-                )
-              : h("div", { class: "empty" }, icon("shieldCheck"), h("h3", {}, "Nothing was found"), h("p", {}, "See the Overview for what was checked.")),
-          ),
-        ),
-      );
-    }
-    replace(
-      more,
-      visible.length > state.limit
-        ? h(
-            "button",
-            {
-              type: "button",
-              class: "btn",
-              onclick: () => {
-                state.limit += PAGE;
-                renderRows();
-              },
-            },
-            `Show ${Math.min(PAGE, visible.length - state.limit).toLocaleString()} more`,
-          )
-        : null,
-    );
+    if (!visible.length) tbody.append(h("tr", {}, h("td", { colspan: span }, emptyState())));
   }
 
   function row(f) {
@@ -330,7 +483,11 @@ export function createFindingsView(prepared, { onError }) {
 
   function select(id, { focus = false, open = false } = {}) {
     state.selected = id;
-    if (open) state.detailOpen = true;
+    if (open) openDetail();
+    for (const c of cards.querySelectorAll("button.finding-card")) {
+      if (Number(c.dataset.id) === id && state.detailOpen) c.setAttribute("aria-current", "true");
+      else c.removeAttribute("aria-current");
+    }
     for (const tr of tbody.querySelectorAll("tr.finding")) {
       const on = Number(tr.dataset.id) === id;
       tr.setAttribute("aria-selected", String(on));
@@ -341,6 +498,8 @@ export function createFindingsView(prepared, { onError }) {
       }
     }
     renderDetail();
+    // Phones: the details fill the screen, so focus moves into them.
+    if (open && phone.matches) detail.querySelector(".detail-bar .icon-btn")?.focus({ preventScroll: true });
   }
 
   // ---------------------------------------------------------------- detail
@@ -359,21 +518,8 @@ export function createFindingsView(prepared, { onError }) {
   function detailView(f) {
     const sev = SEVERITY[f.severity] ?? { label: f.severity, advice: "", text: "" };
     const links = githubLinks(prepared, f);
-    const close = h(
-      "button",
-      {
-        type: "button",
-        class: "btn quiet detail-close",
-        onclick: () => {
-          state.detailOpen = false;
-          detail.classList.add("closed");
-          tbody.querySelector('tr.finding[aria-selected="true"]')?.focus();
-        },
-      },
-      icon("close"),
-      "Close",
-    );
-    return h(
+    const close = h("button", { type: "button", class: "btn quiet detail-close desktop-only", onclick: closeDetail }, icon("close"), "Close");
+    const inner = h(
       "div",
       { class: `detail-inner sev-${f.severity}` },
       close,
@@ -392,6 +538,31 @@ export function createFindingsView(prepared, { onError }) {
       f.dependency ? section("The package", dependencyFacts(f.dependency)) : null,
       f.remediation ? section("How to fix it", h("div", { class: "fix" }, f.remediation)) : null,
       section("How sure", h("p", {}, CONFIDENCE[f.confidence] ?? f.confidence)),
+    );
+    return [detailBar(f), inner];
+  }
+
+  /** Phones: Back, where this finding is in the list, and the previous and next ones. */
+  function detailBar(f) {
+    const i = visible.findIndex((v) => v.id === f.id);
+    const step = (d) => {
+      const next = visible[i + d];
+      if (!next) return;
+      if (i + d >= state.limit) {
+        state.limit += PAGE;
+        renderRows();
+      }
+      select(next.id);
+      cards.querySelector(`button.finding-card[data-id="${next.id}"]`)?.scrollIntoView({ block: "nearest" });
+      detail.querySelector(d < 0 ? ".detail-prev" : ".detail-next")?.focus({ preventScroll: true });
+    };
+    return h(
+      "div",
+      { class: "detail-bar phone-only" },
+      h("button", { type: "button", class: "icon-btn", "aria-label": "Back to the list", onclick: closeDetail }, icon("arrowLeft")),
+      h("span", { class: "detail-pos" }, i >= 0 ? `${(i + 1).toLocaleString()} of ${visible.length.toLocaleString()}` : ""),
+      h("button", { type: "button", class: "icon-btn detail-prev", "aria-label": "Previous finding", disabled: i <= 0, onclick: () => step(-1) }, icon("chevronUp")),
+      h("button", { type: "button", class: "icon-btn detail-next", "aria-label": "Next finding", disabled: i < 0 || i >= visible.length - 1, onclick: () => step(1) }, icon("chevronDown")),
     );
   }
 
@@ -473,11 +644,17 @@ export function createFindingsView(prepared, { onError }) {
     state.category = filter.category ?? "";
     state.repository = filter.repository ?? "";
     state.selected = null;
-    state.detailOpen = false;
+    if (state.detailOpen) closeDetail();
     update({ resetLimit: true });
     listScroll.scrollTop = 0;
   }
 
+  /** The layout changed between phone and wider: redraw the list. */
+  function relayout() {
+    renderRows();
+    renderDetail();
+  }
+
   update({});
-  return { element, applyFilter, focusSearch: () => search.focus() };
+  return { element, applyFilter, relayout, focusSearch: () => search.focus() };
 }

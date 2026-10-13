@@ -30,7 +30,7 @@ Rust 1.88; the app needs 1.90 (Tauri's plugins). Both share one `Cargo.lock`.
 flowchart LR
     CLI["main.rs<br/>parse flags, load config"] --> T["target.rs<br/>what to scan"]
     T -->|local dir| D
-    T -->|owner/repo| G["git.rs<br/>clone to temp dir"]
+    T -->|owner/repo| G["git.rs: clone, or snapshot.rs:<br/>download and check the archive"]
     T -->|org / user / search| API["github.rs<br/>list repositories"] --> G
     T --> SET["settings.rs<br/>GitHub API settings audit"]
     G --> D["discovery.rs<br/>pick files"]
@@ -81,7 +81,7 @@ are put into any URL. A URL must be on the configured GitHub host (github.com, o
 GitHub Enterprise host of `github.api_url`): `gitlab.com/a/b` is an error, not a scan of
 `github.com/a/b`. `org`, `user` and `search` build their targets directly.
 
-### 3. Getting the code (`github.rs`, `git.rs`)
+### 3. Getting the code (`github.rs`, `git.rs`, `snapshot.rs`)
 
 - **Listing repositories.** `github.rs` is a small REST client (reqwest) with
   pagination. Rate-limit errors are turned into a readable message with the reset
@@ -97,12 +97,52 @@ GitHub Enterprise host of `github.api_url`): `gitlab.com/a/b` is an error, not a
   symlinks plain files, `protocol.ext.allow=never` disables the `ext::` transport, and
   the LFS filter is disabled (`filter.lfs.*`, `GIT_LFS_SKIP_SMUDGE`) so the repository's
   `.lfsconfig` cannot send git-lfs to a server of its choosing. Clone errors are cut to
-  git's one `fatal:` line.
+  git's one `fatal:` line. Temporary directories are named `ghaudit-*`;
+  `git::remove_stale_work_dirs` deletes old ones that a killed process left behind (the
+  app calls it at startup).
+- **Downloading instead** (`github.fetch = "archive"`, the default on Android, which has
+  no git; `snapshot.rs`). The default branch is resolved to a commit id
+  (`/commits/heads/{branch}`), and GitHub's tarball of that commit is downloaded to the
+  temporary directory. GitHub redirects the download to codeload, with a short-lived
+  token in the URL for private repositories, so `GitHub::download_archive` follows the
+  redirects itself: at most three, https only, to the API host, the web host or
+  `codeload.<web host>`; the GitHub token goes to the API host only, and no error
+  carries a URL. The download is capped (1 GiB) and has read timeouts rather than a
+  total one.
+  - **Extraction** (`extract_tar_gz`, on a blocking thread) never uses tar's own
+    unpacking. Every member must sit under the archive's one top-level directory, and
+    every path component is checked (no `..`, `.git`, NUL, over-long or, on Windows,
+    reserved names). Files are created with `create_new` and default permissions, so
+    nothing is written over an existing path. A symlink is written as a plain file
+    holding its target, as `core.symlinks=false` checks it out, so no link is ever
+    created and nothing can be written through one. Hard links, devices, pipes, sparse
+    files and names the file system cannot store (on Windows and macOS, also a second
+    file whose name differs only in case) are listed as skipped. Decompressed and
+    stored bytes and the member count are capped, and the gzip stream is read to its
+    end so that its CRC catches a download cut short.
+  - **The tree check.** `git archive` honors `.gitattributes`: `export-ignore` leaves
+    files out (guzzle/psr7's archive has none of its workflows), and `export-subst`,
+    `ident`, `eol` and Git LFS settings change contents. So the archive must name the
+    requested commit (its pax `comment`), each file's git blob id is computed as it is
+    written, and `reconcile` compares them with the commit's tree
+    (`/git/trees/{sha}?recursive=1`). Files that are missing or different are fetched
+    from the Blobs API, checked against their id and written the same way, up to 300
+    files and 20 MiB; files over `max_file_size` are listed instead, and files the
+    archive has but the commit does not are deleted. A truncated tree, or more files to
+    fetch than that, makes the file analyzers fail with "could not confirm the download
+    is complete"; their findings are kept.
+  - Unless dependency checks run, excluded directories and files over `max_file_size`
+    are not written at all; osv-scanner reads lockfiles discovery skips, so with it
+    everything is written. There is no history in an archive: the history search is
+    skipped with "needs the full git history; a downloaded archive has only the latest
+    files".
 - **Multi-repo scans.** These run `github.concurrency` repositories at a time
   (`buffer_unordered`, so one slow repository does not stall the others; the original
   order is restored afterwards). Each repository, clone included, has
   `github.repo_timeout_secs`. A repository that fails or times out is recorded in the
-  report with its error instead of aborting the run. Each repository's start and end
+  report with its error instead of aborting the run. When only the download failed, its
+  settings audit is kept and its file analyzers are reported as failed, so the roll-up
+  says "failed in 1 of N" rather than "completed". Each repository's start and end
   are [progress events](#7-progress-progressrs); the CLI prints a line per finished
   repository to stderr.
 
@@ -325,6 +365,9 @@ and `gpg.program` from running, and `--src-prefix`/`--dst-prefix`, `--no-renames
 `--no-color` and `core.quotePath=false` pin the output format. Limits: 1 GiB of diff,
 10 minutes, and 2 MiB of added text per file version; hitting one marks the result
 incomplete in the analyzer status. A shallow clone is reported as partial history.
+`Scanner::new` looks `git` and osv-scanner up on `PATH` once, without running them
+(`scanner::Tools`; never found on Android). Without git, the history search is
+skipped with "needs git, which this device doesn't have" rather than failing.
 
 #### Agent and editor configs (`analyzer/agents.rs`)
 
@@ -484,16 +527,19 @@ repositories, so a front end must treat them as untrusted text.
 ## The desktop app (`app/`, `ui/`)
 
 The app is a Tauri 2 window showing `ui/`, with the ghaudit library linked into the
-Rust side. The page is display code: it renders reports and calls the app's commands.
-Anything with side effects (file dialogs, reading files, opening links) happens in Rust.
+Rust side, on desktops and on Android phones. The page is display code: it renders
+reports and calls the app's commands. Anything with side effects (file dialogs, reading
+files, opening links, the clipboard) happens in Rust.
 
 | Command | What it does |
 |---|---|
 | `catalog` | App and scanner versions, and every rule's name and severity (settings checks are named only there) |
 | `open_report` | Shows the system's open-file dialog and reads the chosen report (UTF-8 or UTF-16, up to 64 MB, `tool` must be `ghaudit`); returns it with its file name, not its path |
 | `open_link` | Opens an https link to github.com or osv.dev in the browser; refuses anything else (other hosts, ports, credentials in the URL, other schemes) |
-| `environment` | What scans can use: where the GitHub token comes from and whose it is (never the token), whether a token is saved in the keychain, the GitHub CLI, osv-scanner and git with their versions |
-| `save_token`, `forget_token` | Check a pasted token with `GET /user` and keep it in the system keychain; remove it |
+| `environment` | What scans can use: where the GitHub token comes from and whose it is (never the token), whether a token is saved in the keychain, the GitHub CLI, osv-scanner and git with their versions, the platform, whether it is a phone, and `capabilities` (folders, history, dependencies, how repositories are downloaded, whether the token is pasted from the clipboard) |
+| `save_token`, `forget_token` | Check a token typed into the desktop's password field with `GET /user` and keep it in the system keychain; remove it |
+| `open_token_page` | Opens GitHub's new fine-grained token page, filled in with read-only permissions through its URL parameters (`token::NEW_TOKEN_PAGE`) |
+| `paste_token` | Phones: reads the clipboard in Rust, checks the token with GitHub, keeps it in the keystore and clears the clipboard, so the token never passes through the page |
 | `pick_folder` | Shows the folder dialog and remembers the choice: the only folder a scan can target |
 | `start_scan`, `cancel_scan` | Run a scan, streaming `Progress` events through a Tauri channel, and resolve with the report or as cancelled; stop it |
 | `compare_with`, `clear_comparison` | Ask for an earlier report and return the one on screen with `ScanReport::apply_baseline` applied (as `--baseline`), refusing the same report or a later one; forget it |
@@ -527,6 +573,31 @@ winget's install folder, since a running app keeps the `PATH` it started with; g
 the GitHub CLI on `PATH` (and the CLI's default install folders on Windows). They run
 without a console window.
 
+### On Android
+
+The same crate is the Android app: its library is also built as a `cdylib` that Android
+loads (`tauri::mobile_entry_point` on `run`), and `app/gen/android` is the Gradle project
+`cargo tauri android init` generated, with the changes KJV-Interlinear made to it: no
+Android TV entries, backup and device-transfer rules that leave out shared preferences
+(where the token lives, encrypted with a Keystore key that never leaves the phone), a
+`MainActivity` that hands the page the system-bar and keyboard insets and asks it what
+Back closes, and an adaptive launcher icon. What differs at run time:
+
+- **Files.** Android's dialogs return `content://` URIs, not paths. `picked.rs` opens them
+  through tauri-plugin-fs's Rust API (Android only, with no permission granted to the
+  page), and reports are read from and written to the open file. Folders can't be
+  picked.
+- **Token.** Only the keystore (android-native-keyring-store, which needs the NDK context
+  that Tauri 2.12's tao sets up). There is no `GITHUB_TOKEN` or GitHub CLI on a phone; the
+  user creates a token from the pre-filled page and pastes it (`paste_token`).
+- **Scans.** `scan::prepare` with `phone: true` downloads repositories as archives
+  (`github.fetch = "archive"`), two at a time, turns dependency checks off with the reason
+  `scan::PHONE_SCA`, and asks for history whenever secrets are searched, so the report
+  says the archive has no history rather than "disabled". At startup the app points
+  tempfile at its cache folder (Android before 13 has no writable temporary folder),
+  removes download folders a killed scan left there, and limits analysis to four
+  threads. A destroyed activity stops a running scan.
+
 ### Frontend
 
 The frontend is ES modules without a bundler: `app.js` (views and state), `scan.js`
@@ -537,6 +608,18 @@ The frontend is ES modules without a bundler: `app.js` (views and state), `scan.
 `dom.js` (element helpers and icons). A report is prepared once (`report.prepare`):
 each finding gets an id, and counts and failures are worked out. The findings table
 renders 300 rows at a time.
+
+Below 700 px the page switches to its phone layout (`@media (max-width: 699px)`): a
+bottom tab bar, finding cards with a full-screen detail sheet, filters and report actions
+in bottom sheets, per-repository settings cards instead of the grid, and stacked tables.
+Behavior follows `environment().mobile` and `capabilities`, never the user agent.
+`nav.js` makes Android's Back button work. It records the page below the start page or
+Overview and the overlays above it (sheets, dialogs, a finding's details), and the
+activity asks it first, through `window.ghauditBack()`, which closes the top one (during
+a scan it asks whether to stop). With nothing open, Back leaves the app as usual. It
+keeps no history entries: Chromium lets Back skip entries a page pushed without a tap,
+so a WebView's own Back could close the app with a sheet open. On the desktop the same
+bookkeeping serves the in-app back arrow.
 
 ### Security model
 
@@ -573,6 +656,7 @@ and titles reach the page. So:
 | Failures are loud | A security tool that turns "couldn't check" into "nothing found" is worse than no tool. The settings audit's "not assessable" is the same rule applied per check. |
 | History is opt-in | A full clone and a walk of every commit cost far more than a depth-1 scan; for repositories you own it is where deleted credentials still live. |
 | Cloned repositories are untrusted | Their ignore files, suppression comments and osv-scanner config are written by the party being audited. |
+| Without git, download the archive and check it against the tree | GitHub's tarball needs only a few small pure-Rust crates; gitoxide would add about a hundred and be needed only for history. But an archive is what the repository's `.gitattributes` makes it, so it is trusted only file by file, against the commit's own blob ids. |
 | Every per-file step is linear and budgeted | One crafted file must not stall an org-wide scan or exhaust memory. |
 | Logs on stderr, reports on stdout | Reports can be piped and redirected safely. |
 | Strict config | Unknown keys are errors, so a misspelled setting can't silently do nothing. |
@@ -585,7 +669,8 @@ and titles reach the page. So:
 | Progress | `progress.rs`, `scanner.rs` | the CLI's lines; every analyzer reports once with its report status; repository events of a multi-repository scan agree with the report |
 | Rules | `analyzer/sast.rs` | every rule's examples and counter-examples, on every grammar it targets |
 | osv-scanner | `analyzer/sca.rs` | conversion of recorded real osv-scanner output (`tests/fixtures/osv-scanner/`), plus fake binaries for the error paths |
-| GitHub API | `github.rs` | pagination and errors against an in-process mock HTTP server |
+| GitHub API | `github.rs` | pagination and errors against an in-process mock HTTP server; archive downloads: redirects without the token, refused hosts and schemes, the size cap, retries, no URL in any error |
+| Archives | `snapshot.rs`, `scanner.rs` | hand-built hostile tarballs (traversal, links, special files, bombs, truncation at every 7th byte); a real `git archive` with `export-ignore`, `export-subst`, `ident` and `eol` checked against `git ls-tree`; fetching against a mock API, including a scan that finds a workflow left out of the archive |
 | Settings | `analyzer/settings.rs` | each check's pass, fail and not-assessable outcomes from canned API responses |
 | Git history | `analyzer/history.rs` | real repositories built in a temp dir: deleted, renamed and still-present credentials, limits |
 | End to end | `tests/cli.rs` | the real binary: exit codes, formats, exclusions, redaction, SARIF stability, untrusted clones, org scans and settings audits against a mock API, baselines, history |

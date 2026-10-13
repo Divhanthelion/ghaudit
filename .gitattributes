@@ -1,0 +1,4 @@
+# The Android project's Gradle wrapper and build scripts break with CRLF line endings
+# on Linux (CI), and this repository is often checked out with core.autocrlf=true.
+app/gen/android/gradlew text eol=lf
+*.kts text eol=lf

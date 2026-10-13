@@ -14,6 +14,8 @@ const COMMANDS: &[&str] = &[
     "compare_with",
     "clear_comparison",
     "export_report",
+    "open_token_page",
+    "paste_token",
 ];
 
 fn main() {
