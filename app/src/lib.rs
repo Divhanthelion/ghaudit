@@ -411,26 +411,41 @@ fn open_token_page(app: AppHandle) -> Result<(), String> {
         .map_err(|e| format!("Couldn't open the browser: {e}"))
 }
 
-/// Take the token from the clipboard, check it with GitHub, keep it in the keystore
-/// and clear the clipboard. Returns its login. The token never passes through the page.
+/// Phones: take the token from the clipboard, check it with GitHub, keep it in the
+/// keystore and clear the clipboard. Returns its login. The token never passes through
+/// the page.
 #[tauri::command]
 async fn paste_token(app: AppHandle) -> Result<String, String> {
-    use tauri_plugin_clipboard_manager::ClipboardExt;
-    let copied = app.clipboard().read_text().unwrap_or_default();
-    let token = copied.trim().to_string();
-    if !token::plausible(&token) {
-        return Err("The clipboard doesn't hold a GitHub token. Copy the token on GitHub, then tap Paste token again.".into());
+    #[cfg(desktop)]
+    {
+        // Desktops take the token in a password field (`save_token`), and nothing reads
+        // their clipboard.
+        let _ = app;
+        Err("Paste the token into the token field.".into())
     }
-    if !keychain::available() {
-        return Err("This device has no keystore to keep a token in.".into());
+    #[cfg(mobile)]
+    {
+        use tauri_plugin_clipboard_manager::ClipboardExt;
+        // Fails when the clip isn't plain text, as when it was selected and copied from
+        // the page rather than with GitHub's copy button.
+        let copied = app.clipboard().read_text().map_err(|_| {
+            "Couldn't read a token from the clipboard. On GitHub, copy the token with the copy button next to it, then tap Paste token again.".to_string()
+        })?;
+        let token = copied.trim().to_string();
+        if !token::is_github_token(&token) {
+            return Err("The clipboard doesn't hold a GitHub token. Copy the token on GitHub, then tap Paste token again.".into());
+        }
+        if !keychain::available() {
+            return Err("This device has no keystore to keep a token in.".into());
+        }
+        let login = token::login(&token).await.ok_or(
+            "GitHub didn't accept this token. Check that it's complete and hasn't expired or been revoked.",
+        )?;
+        keychain::set(&token)?;
+        // A token left on the clipboard could be pasted anywhere later.
+        let _ = app.clipboard().clear();
+        Ok(login)
     }
-    let login = token::login(&token).await.ok_or(
-        "GitHub didn't accept this token. Check that it's complete and hasn't expired or been revoked.",
-    )?;
-    keychain::set(&token)?;
-    // A token left on the clipboard could be pasted anywhere later.
-    let _ = app.clipboard().clear();
-    Ok(login)
 }
 
 // ---------------------------------------------------------------- scanning

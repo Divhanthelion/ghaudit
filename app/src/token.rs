@@ -54,6 +54,17 @@ pub fn plausible(token: &str) -> bool {
     (20..=1024).contains(&token.len()) && token.bytes().all(|b| b.is_ascii_graphic())
 }
 
+/// How GitHub's tokens start: fine-grained, classic, OAuth, user-to-server,
+/// server-to-server and refresh tokens.
+const PREFIXES: [&str; 6] = ["github_pat_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_"];
+
+/// Whether `text` has the form of a GitHub token, unlike whatever else a clipboard may
+/// hold (a password, a message), which must not be sent to GitHub to try.
+#[cfg_attr(desktop, allow(dead_code))]
+pub fn is_github_token(text: &str) -> bool {
+    plausible(text) && PREFIXES.iter().any(|p| text.starts_with(p))
+}
+
 /// The token to scan with, from the first source that has one.
 pub async fn resolve() -> Option<Token> {
     #[cfg(desktop)]
@@ -121,6 +132,20 @@ mod tests {
         let shown = format!("{token:?}");
         assert!(!shown.contains(&secret), "{shown}");
         assert!(shown.contains("GithubCli"));
+    }
+
+    #[test]
+    fn only_github_tokens_are_taken_from_the_clipboard() {
+        let body = "Zq8Wn3Lk5Rt7Vb2Xy4Pm6Hd9Js1Fc0Ga";
+        for prefix in PREFIXES {
+            assert!(is_github_token(&[prefix, body].concat()), "{prefix}");
+        }
+        assert!(!is_github_token(body), "a password");
+        assert!(!is_github_token("ghp_short"));
+        assert!(!is_github_token(&["ghp_", body, " and more"].concat()));
+        assert!(!is_github_token(
+            "see you at 8, bring the github_pat_ notes"
+        ));
     }
 
     #[test]

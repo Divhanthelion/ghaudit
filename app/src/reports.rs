@@ -170,9 +170,22 @@ pub fn export_to(
     name: &str,
 ) -> Result<(), String> {
     let text = report::render(report, format, false);
-    file.write_all(text.as_bytes())
-        .and_then(|()| file.sync_all())
-        .map_err(|e| format!("Couldn't write {name}: {e}"))
+    let failed = |e: std::io::Error| format!("Couldn't write {name}: {e}");
+    file.write_all(text.as_bytes()).map_err(failed)?;
+    match file.sync_all() {
+        Ok(()) => Ok(()),
+        // A document provider may hand over a pipe or a socket, which cannot be synced;
+        // everything was written to it all the same.
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(failed(e)),
+    }
 }
 
 /// The file's name, for messages; the page never sees full paths it did not need.
