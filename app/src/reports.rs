@@ -12,27 +12,45 @@ use std::path::Path;
 pub const MAX_REPORT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Read and check a report. Errors are sentences for the page to show.
+#[cfg(not(target_os = "android"))]
 pub fn load(path: &Path) -> Result<ScanReport, String> {
     load_limited(path, MAX_REPORT_BYTES)
 }
 
+#[cfg(not(target_os = "android"))]
 fn load_limited(path: &Path, max_bytes: u64) -> Result<ScanReport, String> {
     let name = display_name(path);
-    let size = std::fs::metadata(path)
-        .map_err(|e| format!("Couldn't open {name}: {e}"))?
-        .len();
-    if size > max_bytes {
-        return Err(format!(
+    let file = std::fs::File::open(path).map_err(|e| format!("Couldn't open {name}: {e}"))?;
+    load_from(file, &name, max_bytes)
+}
+
+/// Read and check a report from a file that is already open: on Android, a file the
+/// system's content resolver opened for a content:// URI from the file dialog.
+pub fn load_from(file: std::fs::File, name: &str, max_bytes: u64) -> Result<ScanReport, String> {
+    use std::io::Read;
+    let too_large = |size: u64| {
+        format!(
             "{name} is {} MB, too large to show here ({} MB at most). Scan fewer repositories at a time, or leave out low-severity findings.",
             size / (1024 * 1024),
             max_bytes / (1024 * 1024)
-        ));
+        )
+    };
+    // Content providers may not know the size: read at most one byte past the limit.
+    if let Ok(meta) = file.metadata()
+        && meta.len() > max_bytes
+    {
+        return Err(too_large(meta.len()));
     }
-    let bytes = std::fs::read(path).map_err(|e| format!("Couldn't read {name}: {e}"))?;
+    let mut bytes = Vec::new();
+    file.take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("Couldn't read {name}: {e}"))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(too_large(bytes.len() as u64));
+    }
     let not_a_report = || {
         format!(
-            "{name} isn't a ghaudit report. Open a report saved by this app, or one made with \
-             ghaudit's -f json option."
+            "{name} isn't a ghaudit report. Open a report saved by this app, or one made with ghaudit's -f json option."
         )
     };
     let text = decode(&bytes).ok_or_else(not_a_report)?;
@@ -125,6 +143,7 @@ pub fn extension(format: Format) -> &'static str {
 
 /// Render `report` and write it to `path` through a temporary file next to it, so a
 /// failed write never leaves half a report behind.
+#[cfg(not(target_os = "android"))]
 pub fn export(report: &ScanReport, format: Format, path: &Path) -> Result<(), String> {
     let name = display_name(path);
     let text = report::render(report, format, false);
@@ -141,6 +160,21 @@ pub fn export(report: &ScanReport, format: Format, path: &Path) -> Result<(), St
     Ok(())
 }
 
+/// Render `report` into a file that is already open for writing (truncated): on Android,
+/// the content:// document the save dialog created.
+#[cfg(target_os = "android")]
+pub fn export_to(
+    report: &ScanReport,
+    format: Format,
+    mut file: std::fs::File,
+    name: &str,
+) -> Result<(), String> {
+    let text = report::render(report, format, false);
+    file.write_all(text.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|e| format!("Couldn't write {name}: {e}"))
+}
+
 /// The file's name, for messages; the page never sees full paths it did not need.
 pub fn display_name(path: &Path) -> String {
     path.file_name()
@@ -148,7 +182,8 @@ pub fn display_name(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
-#[cfg(test)]
+// The tests read and write real files through the desktop functions.
+#[cfg(all(test, not(target_os = "android")))]
 mod tests {
     use super::*;
 

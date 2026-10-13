@@ -15,6 +15,8 @@
     "allow-cancel-scan",
     "allow-compare-with",
     "allow-clear-comparison",
-    "allow-export-report"
+    "allow-export-report",
+    "allow-open-token-page",
+    "allow-paste-token"
   ]
 }

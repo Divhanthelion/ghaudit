@@ -8,6 +8,7 @@
 
 mod keychain;
 mod links;
+mod picked;
 mod reports;
 mod scan;
 mod token;
@@ -23,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager, State, WebviewWindow, WindowEvent};
-use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_dialog::{DialogExt, FilePath};
 use tauri_plugin_opener::OpenerExt;
 use token::Token;
 use tokio::sync::Notify;
@@ -118,13 +119,10 @@ async fn open_report(
     window: WebviewWindow,
     state: State<'_, AppState>,
 ) -> Result<Option<Opened>, String> {
-    let Some(path) = pick_report(&window, "Open a ghaudit report").await else {
+    let Some(file) = pick_report(&window, "Open a ghaudit report").await else {
         return Ok(None);
     };
-    let name = reports::display_name(&path);
-    let report = tauri::async_runtime::spawn_blocking(move || reports::load(&path))
-        .await
-        .map_err(|e| e.to_string())??;
+    let (name, report) = load_report(window.app_handle().clone(), file).await?;
     state.show(&report);
     Ok(Some(Opened { name, report }))
 }
@@ -149,13 +147,10 @@ async fn compare_with(
     if state.current.lock().unwrap().is_none() {
         return Err("Open or run a scan first.".into());
     }
-    let Some(path) = pick_report(&window, "Compare with an earlier report").await else {
+    let Some(file) = pick_report(&window, "Compare with an earlier report").await else {
         return Ok(None);
     };
-    let name = reports::display_name(&path);
-    let baseline = tauri::async_runtime::spawn_blocking(move || reports::load(&path))
-        .await
-        .map_err(|e| e.to_string())??;
+    let (name, baseline) = load_report(window.app_handle().clone(), file).await?;
     let mut current = state.current.lock().unwrap();
     let current = current.as_mut().ok_or("Open or run a scan first.")?;
     let report = reports::compare(&current.report, &baseline)?;
@@ -196,44 +191,102 @@ async fn export_report(
         report
     };
     let (tx, rx) = tokio::sync::oneshot::channel();
+    // Android's save dialog takes MIME types; a bare extension it doesn't know (such as
+    // "sarif") maps to none at all.
+    let android = cfg!(target_os = "android");
     let (label, ext) = match format {
-        ghaudit::report::Format::Json => ("ghaudit report (JSON)", "json"),
-        ghaudit::report::Format::Sarif => ("SARIF log", "sarif"),
-        ghaudit::report::Format::Text => ("Text", "txt"),
+        ghaudit::report::Format::Json => (
+            "ghaudit report (JSON)",
+            if android { "application/json" } else { "json" },
+        ),
+        ghaudit::report::Format::Sarif => (
+            "SARIF log",
+            if android {
+                "application/octet-stream"
+            } else {
+                "sarif"
+            },
+        ),
+        ghaudit::report::Format::Text => ("Text", if android { "text/plain" } else { "txt" }),
     };
-    window
-        .dialog()
-        .file()
-        .set_parent(&window)
+    let suggested = reports::export_name(&report, format);
+    let dialog = window.dialog().file();
+    #[cfg(desktop)]
+    let dialog = dialog.set_parent(&window);
+    dialog
         .set_title("Export the report")
-        .set_file_name(reports::export_name(&report, format))
+        .set_file_name(&suggested)
         .add_filter(label, &[ext])
         .save_file(move |file| {
             let _ = tx.send(file);
         });
-    let Some(path) = rx.await.ok().flatten().and_then(|f| f.into_path().ok()) else {
+    let Some(file) = rx.await.ok().flatten() else {
         return Ok(None);
     };
-    let name = reports::display_name(&path);
-    tauri::async_runtime::spawn_blocking(move || reports::export(&report, format, &path))
-        .await
-        .map_err(|e| e.to_string())??;
-    Ok(Some(name))
+    let app = window.app_handle().clone();
+    tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
+        let name = picked::name(&file);
+        #[cfg(target_os = "android")]
+        {
+            // Android doesn't say what the user named the file; the suggestion is the
+            // best guess when the URI doesn't show it.
+            let name = if name == picked::UNNAMED {
+                suggested
+            } else {
+                name
+            };
+            let out = picked::open(&app, file, true)?;
+            reports::export_to(&report, format, out, &name)?;
+            Ok(name)
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = (&app, suggested);
+            let path = file.into_path().map_err(|e| e.to_string())?;
+            reports::export(&report, format, &path)?;
+            Ok(name)
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map(Some)
 }
 
 /// The system's open-file dialog, for JSON reports.
-async fn pick_report(window: &WebviewWindow, title: &str) -> Option<PathBuf> {
+async fn pick_report(window: &WebviewWindow, title: &str) -> Option<FilePath> {
     let (tx, rx) = tokio::sync::oneshot::channel();
-    window
-        .dialog()
-        .file()
+    let dialog = window.dialog().file();
+    // Android: no filter. Content providers label .json files inconsistently, and the
+    // file is checked when it is read.
+    #[cfg(desktop)]
+    let dialog = dialog
         .set_parent(window)
-        .set_title(title)
-        .add_filter("ghaudit report (JSON)", &["json"])
-        .pick_file(move |file| {
-            let _ = tx.send(file);
-        });
-    rx.await.ok().flatten()?.into_path().ok()
+        .add_filter("ghaudit report (JSON)", &["json"]);
+    dialog.set_title(title).pick_file(move |file| {
+        let _ = tx.send(file);
+    });
+    rx.await.ok().flatten()
+}
+
+/// Read a report the user chose, with its name for display.
+async fn load_report(app: AppHandle, file: FilePath) -> Result<(String, ScanReport), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let name = picked::name(&file);
+        #[cfg(target_os = "android")]
+        let report = reports::load_from(
+            picked::open(&app, file, false)?,
+            &name,
+            reports::MAX_REPORT_BYTES,
+        )?;
+        #[cfg(not(target_os = "android"))]
+        let report = {
+            let _ = &app;
+            reports::load(&file.into_path().map_err(|e| e.to_string())?)?
+        };
+        Ok((name, report))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 // ---------------------------------------------------------------- what this computer has
@@ -261,7 +314,35 @@ struct Environment {
     github_cli: bool,
     osv_scanner: Option<tools::Program>,
     git: Option<tools::Program>,
+    /// `windows`, `macos`, `linux` or `android`: for install hints.
+    platform: &'static str,
+    /// A phone: the page uses its phone layout and token flow.
+    mobile: bool,
+    capabilities: Capabilities,
 }
+
+/// What this device can do, so the page offers only that.
+#[derive(Serialize)]
+struct Capabilities {
+    /// A local folder can be chosen and scanned (desktop only).
+    folders: bool,
+    /// git history can be searched (needs git, so desktop only).
+    history: bool,
+    /// Dependency checks can run here at all (osv-scanner runs only on a computer).
+    dependencies: bool,
+    /// How repositories are fetched: `git` or `archive`.
+    download: &'static str,
+    /// The token is pasted from the clipboard by the backend (phones).
+    paste_token: bool,
+}
+
+const CAPABILITIES: Capabilities = Capabilities {
+    folders: cfg!(desktop),
+    history: cfg!(desktop),
+    dependencies: cfg!(desktop),
+    download: if cfg!(desktop) { "git" } else { "archive" },
+    paste_token: cfg!(mobile),
+};
 
 async fn probe(path: Option<PathBuf>) -> Option<tools::Program> {
     tools::probe(path?).await
@@ -291,6 +372,9 @@ async fn environment() -> Environment {
         github_cli: tools::find_gh().is_some(),
         osv_scanner,
         git,
+        platform: std::env::consts::OS,
+        mobile: cfg!(mobile),
+        capabilities: CAPABILITIES,
     }
 }
 
@@ -317,6 +401,38 @@ fn forget_token() -> Result<(), String> {
     keychain::delete()
 }
 
+/// Open GitHub's page for a new fine-grained token, filled in with the read-only
+/// permissions ghaudit needs, in the browser.
+#[tauri::command]
+fn open_token_page(app: AppHandle) -> Result<(), String> {
+    let url = links::check(token::NEW_TOKEN_PAGE)?;
+    app.opener()
+        .open_url(url.as_str(), None::<&str>)
+        .map_err(|e| format!("Couldn't open the browser: {e}"))
+}
+
+/// Take the token from the clipboard, check it with GitHub, keep it in the keystore
+/// and clear the clipboard. Returns its login. The token never passes through the page.
+#[tauri::command]
+async fn paste_token(app: AppHandle) -> Result<String, String> {
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+    let copied = app.clipboard().read_text().unwrap_or_default();
+    let token = copied.trim().to_string();
+    if !token::plausible(&token) {
+        return Err("The clipboard doesn't hold a GitHub token. Copy the token on GitHub, then tap Paste token again.".into());
+    }
+    if !keychain::available() {
+        return Err("This device has no keystore to keep a token in.".into());
+    }
+    let login = token::login(&token).await.ok_or(
+        "GitHub didn't accept this token. Check that it's complete and hasn't expired or been revoked.",
+    )?;
+    keychain::set(&token)?;
+    // A token left on the clipboard could be pasted anywhere later.
+    let _ = app.clipboard().clear();
+    Ok(login)
+}
+
 // ---------------------------------------------------------------- scanning
 
 /// Ask for a folder to scan. Returns its path for display, or `None` if cancelled.
@@ -325,21 +441,31 @@ async fn pick_folder(
     window: WebviewWindow,
     state: State<'_, AppState>,
 ) -> Result<Option<String>, String> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    window
-        .dialog()
-        .file()
-        .set_parent(&window)
-        .set_title("Choose a folder to scan")
-        .pick_folder(move |folder| {
-            let _ = tx.send(folder);
-        });
-    let Some(path) = rx.await.ok().flatten().and_then(|f| f.into_path().ok()) else {
-        return Ok(None);
-    };
-    let shown = path.display().to_string();
-    *state.folder.lock().unwrap() = Some(path);
-    Ok(Some(shown))
+    #[cfg(mobile)]
+    {
+        // Android's folder picker gives a document-tree URI, not a folder the scanner
+        // can walk.
+        let _ = (window, state);
+        Err("Folders can't be scanned on this device. Scan a GitHub repository instead.".into())
+    }
+    #[cfg(desktop)]
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        window
+            .dialog()
+            .file()
+            .set_parent(&window)
+            .set_title("Choose a folder to scan")
+            .pick_folder(move |folder| {
+                let _ = tx.send(folder);
+            });
+        let Some(path) = rx.await.ok().flatten().and_then(|f| f.into_path().ok()) else {
+            return Ok(None);
+        };
+        let shown = path.display().to_string();
+        *state.folder.lock().unwrap() = Some(path);
+        Ok(Some(shown))
+    }
 }
 
 #[derive(Serialize)]
@@ -423,6 +549,13 @@ fn cancel_scan(state: State<'_, AppState>) {
 /// Closing the window during a scan stops the scan first, so its temporary clones are
 /// removed rather than left behind.
 fn on_window_event(window: &tauri::Window, event: &WindowEvent) {
+    if let WindowEvent::Destroyed = event {
+        // Android sends no CloseRequested: the activity is simply destroyed.
+        if let Some(stop) = window.state::<AppState>().scan.lock().unwrap().as_ref() {
+            stop.notify_one();
+        }
+        return;
+    }
     let WindowEvent::CloseRequested { api, .. } = event else {
         return;
     };
@@ -452,10 +585,34 @@ fn open_link(app: AppHandle, url: String) -> Result<(), String> {
         .map_err(|e| format!("Couldn't open the browser: {e}"))
 }
 
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // Rust-only use: opening the content:// files Android's dialogs return. The page
+    // has no fs permission (capabilities/default.json), so it can't call the plugin.
+    #[cfg(target_os = "android")]
+    let builder = builder.plugin(tauri_plugin_fs::init());
+    builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
+        .setup(|app| {
+            // Before Android 13 there is no per-app temporary folder (temp_dir() gives
+            // /data/local/tmp, which apps can't write): use the app's cache instead.
+            #[cfg(target_os = "android")]
+            if let Ok(dir) = app.path().app_cache_dir() {
+                let _ = std::fs::create_dir_all(&dir);
+                let _ = tempfile::env::override_temp_dir(&dir);
+            }
+            // A phone has a few fast cores and a few slow ones, and the page must stay
+            // responsive while files are analyzed: four analysis threads, not one per core.
+            #[cfg(mobile)]
+            let _ = rayon::ThreadPoolBuilder::new()
+                .num_threads(4)
+                .build_global();
+            let _ = app;
+            Ok(())
+        })
         .manage(AppState::default())
         .on_window_event(on_window_event)
         .invoke_handler(tauri::generate_handler![
@@ -470,7 +627,9 @@ pub fn run() {
             cancel_scan,
             compare_with,
             clear_comparison,
-            export_report
+            export_report,
+            open_token_page,
+            paste_token
         ])
         .run(tauri::generate_context!())
         .expect("error while running ghaudit");

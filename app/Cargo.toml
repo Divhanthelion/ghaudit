@@ -11,6 +11,8 @@ publish = false
 
 [lib]
 name = "ghaudit_desktop"
+# staticlib/cdylib: the Android (and iOS) app loads the app as a shared library.
+crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -21,12 +23,16 @@ tauri = { version = "2", features = [] }
 # Used from Rust only: the page gets no file-system, dialog or opener permissions.
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
+# Reads a pasted token from the clipboard (and clears it), so it never passes through the page.
+tauri-plugin-clipboard-manager = "2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 tempfile = "3.20"
 tokio = { version = "1.48", features = ["sync", "macros", "time", "process"] }
 keyring-core = "1"
+# Sizes the analysis thread pool on phones (the library uses rayon).
+rayon = "1.11"
 
 # A token the user enters is kept in each platform's credential store (src/keychain.rs).
 [target.'cfg(target_os = "windows")'.dependencies]
@@ -35,7 +41,12 @@ windows-native-keyring-store = "1"
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { version = "1", features = ["keychain"] }
 
-[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+[target.'cfg(target_os = "android")'.dependencies]
+android-native-keyring-store = "1"
+# Reads and writes the content:// files Android's file dialogs return (from Rust only).
+tauri-plugin-fs = "2"
+
+[target.'cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))'.dependencies]
 zbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }
 
 [dev-dependencies]
