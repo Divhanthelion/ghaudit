@@ -70,6 +70,9 @@ pub struct RateLimit {
 
 pub struct GitHub {
     client: Client,
+    /// For large API responses (trees, file contents): no total timeout, but a stalled
+    /// connection still fails within a minute.
+    bulk: Client,
     /// For archive downloads: follows no redirects itself, and has no total timeout.
     download: Client,
     api_url: String,
@@ -115,8 +118,14 @@ impl GitHub {
         const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
         let client = Client::builder()
             .user_agent(USER_AGENT)
-            .default_headers(headers)
+            .default_headers(headers.clone())
             .timeout(Duration::from_secs(30))
+            .build()?;
+        let bulk = Client::builder()
+            .user_agent(USER_AGENT)
+            .default_headers(headers)
+            .connect_timeout(Duration::from_secs(30))
+            .read_timeout(Duration::from_secs(60))
             .build()?;
         // An archive can take minutes; a stalled connection still fails within a minute.
         let download = Client::builder()
@@ -128,6 +137,7 @@ impl GitHub {
         let api_url = api_url.trim_end_matches('/').to_string();
         Ok(Self {
             client,
+            bulk,
             download,
             download_origins: download_origins(&api_url),
             api_url,
@@ -208,21 +218,26 @@ impl GitHub {
 
     /// Every file of commit `sha` (`sha` must be a commit or tree id).
     pub async fn tree(&self, owner: &str, name: &str, sha: &str) -> Result<Tree> {
-        self.get(
-            &format!("/repos/{owner}/{name}/git/trees/{sha}"),
-            &[("recursive", "1")],
-        )
-        .await?
-        .json()
-        .await
-        .map_err(http)
+        let path = format!("/repos/{owner}/{name}/git/trees/{sha}");
+        let resp = self
+            .request_on(&self.bulk, &path, &[("recursive", "1")], None)
+            .await?;
+        if !resp.status().is_success() {
+            return Err(api_error(resp).await);
+        }
+        resp.json().await.map_err(http)
     }
 
     /// The content of blob `sha`, refused when it is larger than `max` bytes.
     pub async fn blob_raw(&self, owner: &str, name: &str, sha: &str, max: u64) -> Result<Vec<u8>> {
         let path = format!("/repos/{owner}/{name}/git/blobs/{sha}");
         let mut resp = self
-            .request(&path, &[], Some("application/vnd.github.raw+json"))
+            .request_on(
+                &self.bulk,
+                &path,
+                &[],
+                Some("application/vnd.github.raw+json"),
+            )
             .await?;
         if !resp.status().is_success() {
             return Err(api_error(resp).await);
@@ -461,10 +476,18 @@ impl GitHub {
         query: &[(&str, &str)],
         accept: Option<&'static str>,
     ) -> Result<Response> {
-        let mut req = self
-            .client
-            .get(format!("{}{path}", self.api_url))
-            .query(query);
+        self.request_on(&self.client, path, query, accept).await
+    }
+
+    /// [`request`](Self::request) with one of this client's HTTP clients.
+    async fn request_on(
+        &self,
+        client: &Client,
+        path: &str,
+        query: &[(&str, &str)],
+        accept: Option<&'static str>,
+    ) -> Result<Response> {
+        let mut req = client.get(format!("{}{path}", self.api_url)).query(query);
         if let Some(accept) = accept {
             req = req.header(header::ACCEPT, accept);
         }
@@ -934,6 +957,23 @@ mod tests {
         let (gh, _, _) = redirected_download(|_| (200, vec![], vec![7u8; 4096]), true).await;
         let err = gh.download_archive("o", "r", &sha, &out, 1000).await;
         check(err.unwrap_err(), "larger than");
+
+        // codeload cannot be reached: the error from sending names no URL.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed_url = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        let target = format!("{closed_url}/o/r/legacy.tar.gz/{sha}{}", codeload_query());
+        let (api, _) =
+            mock(move |_| (302, vec![("location", target.clone())], String::new())).await;
+        let mut gh = GitHub::new(&api, Some("t0ken".into())).unwrap();
+        gh.download_origins.push(closed_url);
+        match gh.download_archive("o", "r", &sha, &out, 1 << 20).await {
+            Err(Error::Http(e)) => {
+                assert!(e.url().is_none(), "{e:?}");
+                check(Error::Http(e), "");
+            }
+            other => panic!("{other:?}"),
+        }
 
         // codeload keeps failing (it is retried first).
         let (gh, _, log) = redirected_download(|_| (503, vec![], Vec::new()), true).await;
