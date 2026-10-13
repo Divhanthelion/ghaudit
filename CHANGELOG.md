@@ -33,6 +33,12 @@ repositories) with 0.3.0.
   one. Those findings now say so and have medium confidence.
 - **`js/html-injection`**: markup read from an ALL_CAPS constant (`ICONS[name]`,
   `PATHS.home`) is no longer reported.
+- **Multi-repository scans** (`org`, `user`, `search`): when a repository could not be
+  cloned, the report's analyzer summary still said "completed" for the file analyzers,
+  and the repository's settings audit was thrown away. Its file analyzers are now
+  `failed` ("could not download the repository: ..."), the summary says "failed in 1 of
+  N repositories", and its settings checks and findings are kept. A repository that
+  times out counts as failed for every analyzer. Single-repository scans are unchanged.
 
 ### New
 

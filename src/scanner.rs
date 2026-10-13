@@ -77,8 +77,15 @@ pub struct Scanner {
     progress: Option<ProgressSink>,
 }
 
-/// A cloned repository's HEAD commit and scan results.
-type RemoteScan = Result<(Option<String>, DirScan)>;
+/// One repository of a remote scan: its commit and results. When the repository could
+/// not be downloaded or scanned, `error` says why, and `dir` still holds the settings
+/// audit and a failed status for each file analyzer, so the report keeps what could be
+/// checked and shows what could not.
+struct RemoteScan {
+    commit: Option<String>,
+    dir: DirScan,
+    error: Option<Error>,
+}
 
 /// Results of scanning one directory.
 #[derive(Debug, Default)]
@@ -220,9 +227,12 @@ impl Scanner {
             }
             Target::Repo { owner, name } => {
                 let url = self.github.clone_url(owner, name);
-                let (commit, dir) = self.scan_remote(&url, &format!("{owner}/{name}")).await?;
-                report.commit = commit;
-                apply(&mut report, dir);
+                let scan = self.scan_remote(&url, &format!("{owner}/{name}")).await;
+                if let Some(e) = scan.error {
+                    return Err(e);
+                }
+                report.commit = scan.commit;
+                apply(&mut report, scan.dir);
             }
             Target::Org(org) => {
                 let repos = self
@@ -316,14 +326,14 @@ impl Scanner {
                         done: n,
                         total: count,
                         name: repo.full_name.clone(),
-                        findings: result.as_ref().map_or(0, |(_, dir)| {
-                            dir.findings
-                                .iter()
-                                .filter(|f| f.severity.at_least(min))
-                                .count()
-                        }),
+                        findings: result
+                            .dir
+                            .findings
+                            .iter()
+                            .filter(|f| f.severity.at_least(min))
+                            .count(),
                         duration_ms: started.elapsed().as_millis() as u64,
-                        error: result.as_ref().err().map(|e| e.to_string()),
+                        error: result.error.as_ref().map(|e| e.to_string()),
                     });
                     (i, repo, result)
                 })
@@ -333,48 +343,43 @@ impl Scanner {
         results.sort_by_key(|(i, _, _)| *i);
 
         for (_, repo, result) in results {
-            match result {
-                Ok((commit, mut dir)) => {
-                    for f in &mut dir.findings {
-                        f.repository = Some(repo.full_name.clone());
-                    }
-                    for s in &mut dir.skipped {
-                        s.repository = Some(repo.full_name.clone());
-                    }
-                    for o in &mut dir.omitted {
-                        o.repository = Some(repo.full_name.clone());
-                    }
-                    report.stats.files_scanned += dir.files;
-                    report.stats.lines_scanned += dir.lines;
-                    report.stats.dependencies_scanned += dir.packages;
-                    report.stats.findings_suppressed += dir.suppressed;
-                    report.repositories.push(RepositorySummary {
-                        name: repo.full_name.clone(),
-                        commit,
-                        findings: 0, // filled in below, after severity filtering
-                        error: None,
-                        analyzers: dir.analyzers,
-                    });
-                    report.findings.extend(dir.findings);
-                    report.skipped.extend(dir.skipped);
-                    report.omitted.extend(dir.omitted);
-                    report.settings.extend(dir.settings);
-                }
-                Err(e) => {
-                    warn!(
-                        "{}: {}",
-                        terminal_safe(&repo.full_name),
-                        terminal_safe(&e.to_string())
-                    );
-                    report.repositories.push(RepositorySummary {
-                        name: repo.full_name,
-                        commit: None,
-                        findings: 0,
-                        error: Some(e.to_string()),
-                        analyzers: Vec::new(),
-                    });
-                }
+            // A repository that could not be downloaded still has its settings audit.
+            let RemoteScan {
+                commit,
+                mut dir,
+                error,
+            } = result;
+            if let Some(e) = &error {
+                warn!(
+                    "{}: {}",
+                    terminal_safe(&repo.full_name),
+                    terminal_safe(&e.to_string())
+                );
             }
+            for f in &mut dir.findings {
+                f.repository = Some(repo.full_name.clone());
+            }
+            for s in &mut dir.skipped {
+                s.repository = Some(repo.full_name.clone());
+            }
+            for o in &mut dir.omitted {
+                o.repository = Some(repo.full_name.clone());
+            }
+            report.stats.files_scanned += dir.files;
+            report.stats.lines_scanned += dir.lines;
+            report.stats.dependencies_scanned += dir.packages;
+            report.stats.findings_suppressed += dir.suppressed;
+            report.repositories.push(RepositorySummary {
+                name: repo.full_name.clone(),
+                commit,
+                findings: 0, // filled in below, after severity filtering
+                error: error.map(|e| e.to_string()),
+                analyzers: dir.analyzers,
+            });
+            report.findings.extend(dir.findings);
+            report.skipped.extend(dir.skipped);
+            report.omitted.extend(dir.omitted);
+            report.settings.extend(dir.settings);
         }
 
         report.analyzers = ANALYZERS
@@ -404,26 +409,79 @@ impl Scanner {
                     self.config.github.token.as_deref(),
                     self.config.analysis.history,
                 )
-                .await?;
+                .await
+                .map_err(|e| (format!("could not download the repository: {e}"), e))?;
                 let dir = self
                     .scan_dir(&checkout.path, trusted, Some(full_name))
-                    .await?;
-                Ok::<_, Error>((checkout.commit.clone(), dir))
+                    .await
+                    .map_err(|e| (e.to_string(), e))?;
+                Ok::<_, (String, Error)>((checkout.commit.clone(), dir))
             };
             let (scan, (status, audit)) = tokio::join!(
                 scan,
                 self.audit_settings(Some(full_name), "", Some(full_name))
             );
-            let (commit, mut dir) = scan?;
-            dir.add_settings(status, audit);
-            Ok((commit, dir))
+            let mut result = match scan {
+                Ok((commit, dir)) => RemoteScan {
+                    commit,
+                    dir,
+                    error: None,
+                },
+                Err((why, e)) => RemoteScan {
+                    commit: None,
+                    dir: self.unscanned(&why, Some(full_name)),
+                    error: Some(e),
+                },
+            };
+            result.dir.add_settings(status, audit);
+            result
         };
-        tokio::time::timeout(limit, work).await.unwrap_or_else(|_| {
-            Err(Error::Timeout(format!(
-                "gave up after {}s (github.repo_timeout_secs)",
-                limit.as_secs()
-            )))
-        })
+        // On a timeout nothing of the repository is kept: some analyzers may have
+        // reported already, and each reports once. The roll-up counts it as failed.
+        tokio::time::timeout(limit, work)
+            .await
+            .unwrap_or_else(|_| RemoteScan {
+                commit: None,
+                dir: DirScan::default(),
+                error: Some(Error::Timeout(format!(
+                    "gave up after {}s (github.repo_timeout_secs)",
+                    limit.as_secs()
+                ))),
+            })
+    }
+
+    /// Results for a repository whose files could not be scanned: every file analyzer
+    /// that would have run failed with `why`; the others are skipped as usual. Each
+    /// status is reported as progress, as `scan_dir` would have.
+    fn unscanned(&self, why: &str, label: Option<&str>) -> DirScan {
+        let analyzers = ANALYZERS
+            .iter()
+            .filter(|name| **name != "settings")
+            .map(|name| {
+                self.off_status(name)
+                    .unwrap_or_else(|| AnalyzerStatus::failed(name, why))
+            })
+            .collect::<Vec<_>>();
+        for status in &analyzers {
+            self.analyzer_finished(label, status);
+        }
+        DirScan {
+            analyzers,
+            ..Default::default()
+        }
+    }
+
+    /// The status of an analyzer that does not run in this scan, with the reason; `None`
+    /// for one that runs.
+    fn off_status(&self, analyzer: &str) -> Option<AnalyzerStatus> {
+        let a = &self.config.analysis;
+        let off = |why: &str| Some(AnalyzerStatus::skipped(analyzer, why));
+        match analyzer {
+            "history" if !a.history => off("disabled (enable with --history)"),
+            "ai" if !a.ai => off("disabled (enable with --ai)"),
+            _ if !self.enabled(analyzer) => off("disabled"),
+            _ => None,
+        }
     }
 
     fn enabled(&self, analyzer: &str) -> bool {
@@ -749,17 +807,17 @@ fn apply(report: &mut ScanReport, dir: DirScan) {
     report.settings = dir.settings;
 }
 
-/// Roll per-repository statuses up into one status per analyzer.
+/// Roll per-repository statuses up into one status per analyzer. A repository that
+/// failed without a status for the analyzer (it timed out) counts as a failure.
 fn summarize_analyzer(name: &str, repos: &[RepositorySummary], enabled: bool) -> AnalyzerStatus {
     if !enabled {
         return AnalyzerStatus::skipped(name, "disabled");
     }
     let failed = repos
         .iter()
-        .filter(|r| {
-            r.analyzers
-                .iter()
-                .any(|a| a.analyzer == name && a.state == AnalyzerState::Failed)
+        .filter(|r| match r.analyzers.iter().find(|a| a.analyzer == name) {
+            Some(a) => a.state == AnalyzerState::Failed,
+            None => r.error.is_some(),
         })
         .count();
     if failed > 0 {
@@ -1362,6 +1420,89 @@ mod tests {
             )),
             "a repository that could not be cloned has no files: {events:?}"
         );
+
+        // It still reports every analyzer: the file analyzers failed, the settings
+        // audit ran (skipped here: no token), and the roll-up shows the failure.
+        let missing = &report.repositories[1].analyzers;
+        assert_eq!(reported_statuses(&events, Some("acme/missing")), *missing);
+        assert_eq!(missing.len(), ANALYZERS.len(), "{missing:?}");
+        let state = |name: &str| {
+            let s = missing.iter().find(|a| a.analyzer == name).unwrap();
+            (s.state, s.detail.clone().unwrap_or_default())
+        };
+        let (sast, why) = state("sast");
+        assert_eq!(sast, AnalyzerState::Failed);
+        assert!(
+            why.starts_with("could not download the repository: "),
+            "{why}"
+        );
+        assert_eq!(state("sca").0, AnalyzerState::Skipped, "turned off");
+        assert_eq!(state("settings").0, AnalyzerState::Skipped);
+        let sast = report.analyzers.iter().find(|a| a.analyzer == "sast");
+        assert_eq!(
+            sast,
+            Some(&AnalyzerStatus::failed(
+                "sast",
+                "failed in 1 of 2 repositories"
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repository_that_cannot_be_cloned_keeps_its_settings_audit() {
+        let missing = tempfile::tempdir().unwrap();
+        let url = |p: &Path| {
+            let p = p.to_string_lossy().replace('\\', "/");
+            format!("file:///{}", p.trim_start_matches('/'))
+        };
+        let (api, _) = crate::github::mock::serve(|line| {
+            if line == "GET /repos/acme/gone" {
+                let repo = r#"{"full_name":"acme/gone","clone_url":"x","default_branch":"main","permissions":{"admin":true},"security_and_analysis":{"secret_scanning":{"status":"disabled"}}}"#;
+                (200, vec![], repo.into())
+            } else {
+                (404, vec![], r#"{"message":"Not Found"}"#.into())
+            }
+        })
+        .await;
+        let mut config = Config::default();
+        config.github.api_url = api;
+        config.github.token = Some("t0ken".into());
+        config.analysis.sca = false;
+        let scanner = Scanner::new(config).unwrap();
+        let mut report = ScanReport::new("user:acme");
+        let repo = RepoInfo {
+            full_name: "acme/gone".into(),
+            clone_url: url(&missing.path().join("nothing-here")),
+            archived: false,
+            fork: false,
+            private: false,
+        };
+        scanner.scan_many(&mut report, vec![repo]).await;
+
+        let summary = &report.repositories[0];
+        assert!(summary.error.is_some());
+        assert!(
+            !report.settings.is_empty(),
+            "settings checks are kept: {report:?}"
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.category == Category::Settings),
+            "{:?}",
+            report.findings
+        );
+        let state = |name: &str| {
+            report
+                .analyzers
+                .iter()
+                .find(|a| a.analyzer == name)
+                .map(|a| a.state)
+        };
+        assert_eq!(state("settings"), Some(AnalyzerState::Completed));
+        assert_eq!(state("secrets"), Some(AnalyzerState::Failed));
+        assert!(!report.is_complete());
     }
 
     #[test]
@@ -1389,6 +1530,21 @@ mod tests {
         assert_eq!(
             summarize_analyzer("sast", &repos, true).state,
             AnalyzerState::Completed
+        );
+        // A repository that timed out has no statuses: it failed for every analyzer.
+        let timed_out = RepositorySummary {
+            error: Some("gave up after 1800s".into()),
+            analyzers: Vec::new(),
+            ..repo(AnalyzerState::Completed)
+        };
+        let repos = vec![repo(AnalyzerState::Completed), timed_out];
+        assert_eq!(
+            summarize_analyzer("sast", &repos, true),
+            AnalyzerStatus::failed("sast", "failed in 1 of 2 repositories")
+        );
+        assert_eq!(
+            summarize_analyzer("sca", &repos, true).state,
+            AnalyzerState::Failed
         );
     }
 }

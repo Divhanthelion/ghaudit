@@ -102,7 +102,9 @@ GitHub Enterprise host of `github.api_url`): `gitlab.com/a/b` is an error, not a
   (`buffer_unordered`, so one slow repository does not stall the others; the original
   order is restored afterwards). Each repository, clone included, has
   `github.repo_timeout_secs`. A repository that fails or times out is recorded in the
-  report with its error instead of aborting the run. Each repository's start and end
+  report with its error instead of aborting the run. When only the download failed, its
+  settings audit is kept and its file analyzers are reported as failed, so the roll-up
+  says "failed in 1 of N" rather than "completed". Each repository's start and end
   are [progress events](#7-progress-progressrs); the CLI prints a line per finished
   repository to stderr.
 

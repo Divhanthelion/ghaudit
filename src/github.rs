@@ -322,21 +322,42 @@ pub fn web_url(api_url: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod mock {
+    //! A minimal HTTP server for tests of code that talks to the GitHub API.
+
+    use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// Minimal HTTP server: `route` maps a request line ("GET /path?query") to
+    /// Requests received, as `"GET /path?query auth=true"`.
+    pub type Log = Arc<Mutex<Vec<String>>>;
+
+    /// A response: status, extra headers and body.
+    pub type Reply = (u16, Vec<(&'static str, String)>, Vec<u8>);
+
+    /// Serve text bodies: `route` maps a request line (`"GET /path?query"`) to
     /// (status, extra headers, body). Returns the base URL and a log of requests.
-    async fn mock<F>(route: F) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>)
+    pub async fn serve<F>(route: F) -> (String, Log)
     where
         F: Fn(&str) -> (u16, Vec<(&'static str, String)>, String) + Send + Sync + 'static,
     {
+        serve_bytes(move |line| {
+            let (status, headers, body) = route(line);
+            (status, headers, body.into_bytes())
+        })
+        .await
+    }
+
+    /// Like [`serve`], with byte bodies. A `x-mock-length` header replaces the real
+    /// `content-length`, so a response can promise more bytes than it sends.
+    pub async fn serve_bytes<F>(route: F) -> (String, Log)
+    where
+        F: Fn(&str) -> Reply + Send + Sync + 'static,
+    {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let log2 = log.clone();
-        let route = std::sync::Arc::new(route);
+        let route = Arc::new(route);
         tokio::spawn(async move {
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else {
@@ -363,21 +384,31 @@ mod tests {
                         .unwrap()
                         .push(format!("{line} auth={}", auth.is_some()));
                     let (status, headers, body) = route(&line);
+                    let length = headers
+                        .iter()
+                        .find(|(k, _)| *k == "x-mock-length")
+                        .map_or(body.len().to_string(), |(_, v)| v.clone());
                     let mut resp = format!(
-                        "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n",
-                        body.len()
+                        "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {length}\r\nconnection: close\r\n"
                     );
-                    for (k, v) in headers {
+                    for (k, v) in headers.iter().filter(|(k, _)| *k != "x-mock-length") {
                         resp.push_str(&format!("{k}: {v}\r\n"));
                     }
                     resp.push_str("\r\n");
-                    resp.push_str(&body);
-                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let mut bytes = resp.into_bytes();
+                    bytes.extend_from_slice(&body);
+                    let _ = sock.write_all(&bytes).await;
                 });
             }
         });
         (format!("http://{addr}"), log)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mock::serve as mock;
+    use super::*;
 
     fn repos_json(start: usize, n: usize) -> String {
         let items: Vec<String> = (start..start + n)
