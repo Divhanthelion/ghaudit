@@ -30,7 +30,7 @@ Rust 1.88; the app needs 1.90 (Tauri's plugins). Both share one `Cargo.lock`.
 flowchart LR
     CLI["main.rs<br/>parse flags, load config"] --> T["target.rs<br/>what to scan"]
     T -->|local dir| D
-    T -->|owner/repo| G["git.rs<br/>clone to temp dir"]
+    T -->|owner/repo| G["git.rs: clone, or snapshot.rs:<br/>download and check the archive"]
     T -->|org / user / search| API["github.rs<br/>list repositories"] --> G
     T --> SET["settings.rs<br/>GitHub API settings audit"]
     G --> D["discovery.rs<br/>pick files"]
@@ -81,7 +81,7 @@ are put into any URL. A URL must be on the configured GitHub host (github.com, o
 GitHub Enterprise host of `github.api_url`): `gitlab.com/a/b` is an error, not a scan of
 `github.com/a/b`. `org`, `user` and `search` build their targets directly.
 
-### 3. Getting the code (`github.rs`, `git.rs`)
+### 3. Getting the code (`github.rs`, `git.rs`, `snapshot.rs`)
 
 - **Listing repositories.** `github.rs` is a small REST client (reqwest) with
   pagination. Rate-limit errors are turned into a readable message with the reset
@@ -97,7 +97,45 @@ GitHub Enterprise host of `github.api_url`): `gitlab.com/a/b` is an error, not a
   symlinks plain files, `protocol.ext.allow=never` disables the `ext::` transport, and
   the LFS filter is disabled (`filter.lfs.*`, `GIT_LFS_SKIP_SMUDGE`) so the repository's
   `.lfsconfig` cannot send git-lfs to a server of its choosing. Clone errors are cut to
-  git's one `fatal:` line.
+  git's one `fatal:` line. Temporary directories are named `ghaudit-*`;
+  `git::remove_stale_work_dirs` deletes old ones that a killed process left behind (the
+  app calls it at startup).
+- **Downloading instead** (`github.fetch = "archive"`, the default on Android, which has
+  no git; `snapshot.rs`). The default branch is resolved to a commit id
+  (`/commits/heads/{branch}`), and GitHub's tarball of that commit is downloaded to the
+  temporary directory. GitHub redirects the download to codeload, with a short-lived
+  token in the URL for private repositories, so `GitHub::download_archive` follows the
+  redirects itself: at most three, https only, to the API host, the web host or
+  `codeload.<web host>`; the GitHub token goes to the API host only, and no error
+  carries a URL. The download is capped (1 GiB) and has read timeouts rather than a
+  total one.
+  - **Extraction** (`extract_tar_gz`, on a blocking thread) never uses tar's own
+    unpacking. Every member must sit under the archive's one top-level directory, and
+    every path component is checked (no `..`, `.git`, NUL, over-long or, on Windows,
+    reserved names). Files are created with `create_new` and default permissions, so
+    nothing is written over an existing path. A symlink is written as a plain file
+    holding its target, as `core.symlinks=false` checks it out, so no link is ever
+    created and nothing can be written through one. Hard links, devices, pipes, sparse
+    files and names the file system cannot store (on Windows and macOS, also a second
+    file whose name differs only in case) are listed as skipped. Decompressed and
+    stored bytes and the member count are capped, and the gzip stream is read to its
+    end so that its CRC catches a download cut short.
+  - **The tree check.** `git archive` honors `.gitattributes`: `export-ignore` leaves
+    files out (guzzle/psr7's archive has none of its workflows), and `export-subst`,
+    `ident`, `eol` and Git LFS settings change contents. So the archive must name the
+    requested commit (its pax `comment`), each file's git blob id is computed as it is
+    written, and `reconcile` compares them with the commit's tree
+    (`/git/trees/{sha}?recursive=1`). Files that are missing or different are fetched
+    from the Blobs API, checked against their id and written the same way, up to 300
+    files and 20 MiB; files over `max_file_size` are listed instead, and files the
+    archive has but the commit does not are deleted. A truncated tree, or more files to
+    fetch than that, makes the file analyzers fail with "could not confirm the download
+    is complete"; their findings are kept.
+  - Unless dependency checks run, excluded directories and files over `max_file_size`
+    are not written at all; osv-scanner reads lockfiles discovery skips, so with it
+    everything is written. There is no history in an archive: the history search is
+    skipped with "needs the full git history; a downloaded archive has only the latest
+    files".
 - **Multi-repo scans.** These run `github.concurrency` repositories at a time
   (`buffer_unordered`, so one slow repository does not stall the others; the original
   order is restored afterwards). Each repository, clone included, has
@@ -578,6 +616,7 @@ and titles reach the page. So:
 | Failures are loud | A security tool that turns "couldn't check" into "nothing found" is worse than no tool. The settings audit's "not assessable" is the same rule applied per check. |
 | History is opt-in | A full clone and a walk of every commit cost far more than a depth-1 scan; for repositories you own it is where deleted credentials still live. |
 | Cloned repositories are untrusted | Their ignore files, suppression comments and osv-scanner config are written by the party being audited. |
+| Without git, download the archive and check it against the tree | GitHub's tarball needs only a few small pure-Rust crates; gitoxide would add about a hundred and be needed only for history. But an archive is what the repository's `.gitattributes` makes it, so it is trusted only file by file, against the commit's own blob ids. |
 | Every per-file step is linear and budgeted | One crafted file must not stall an org-wide scan or exhaust memory. |
 | Logs on stderr, reports on stdout | Reports can be piped and redirected safely. |
 | Strict config | Unknown keys are errors, so a misspelled setting can't silently do nothing. |
@@ -590,7 +629,8 @@ and titles reach the page. So:
 | Progress | `progress.rs`, `scanner.rs` | the CLI's lines; every analyzer reports once with its report status; repository events of a multi-repository scan agree with the report |
 | Rules | `analyzer/sast.rs` | every rule's examples and counter-examples, on every grammar it targets |
 | osv-scanner | `analyzer/sca.rs` | conversion of recorded real osv-scanner output (`tests/fixtures/osv-scanner/`), plus fake binaries for the error paths |
-| GitHub API | `github.rs` | pagination and errors against an in-process mock HTTP server |
+| GitHub API | `github.rs` | pagination and errors against an in-process mock HTTP server; archive downloads: redirects without the token, refused hosts and schemes, the size cap, retries, no URL in any error |
+| Archives | `snapshot.rs`, `scanner.rs` | hand-built hostile tarballs (traversal, links, special files, bombs, truncation at every 7th byte); a real `git archive` with `export-ignore`, `export-subst`, `ident` and `eol` checked against `git ls-tree`; fetching against a mock API, including a scan that finds a workflow left out of the archive |
 | Settings | `analyzer/settings.rs` | each check's pass, fail and not-assessable outcomes from canned API responses |
 | Git history | `analyzer/history.rs` | real repositories built in a temp dir: deleted, renamed and still-present credentials, limits |
 | End to end | `tests/cli.rs` | the real binary: exit codes, formats, exclusions, redaction, SARIF stability, untrusted clones, org scans and settings audits against a mock API, baselines, history |

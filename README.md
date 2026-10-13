@@ -37,7 +37,8 @@ Results come out as readable text, JSON, or SARIF for GitHub code scanning. The 
 codes are designed for CI gates.
 
 It is built to scan code you don't trust: a repository cannot use its own ignore files,
-suppression comments or osv-scanner config to hide from the scan, and inputs crafted to
+suppression comments, osv-scanner config or `.gitattributes` export rules to hide from
+the scan, and inputs crafted to
 exhaust a scanner (YAML alias bombs, deeply nested code, megabyte-long lines) cost
 bounded time and memory. See [Scanning repositories you don't control](#scanning-repositories-you-dont-control).
 
@@ -87,7 +88,11 @@ release workflow from the tagged source:
 gh attestation verify ghaudit-v0.3.0-x86_64-unknown-linux-gnu.tar.gz --repo Divhanthelion/ghaudit
 ```
 
-ghaudit needs `git` on your `PATH` for remote scans. Dependency scanning also needs
+ghaudit uses `git` on your `PATH` for remote scans. Without git, put `fetch = "archive"`
+under `[github]` in a [config file](ghaudit.example.toml): ghaudit then downloads
+GitHub's archive of the commit and checks it file by file (see
+[below](#scanning-repositories-you-dont-control)); only `--history` needs git then.
+Dependency scanning also needs
 [osv-scanner](https://google.github.io/osv-scanner/installation/) v2:
 
 ```bash
@@ -265,6 +270,16 @@ fool scanners:
   sent over HTTPS, to the GitHub host. The history search turns off external diff
   drivers, textconv filters and signature checks, so a repository's `.git/config` or
   `.gitattributes` cannot make it run a command either.
+- **A downloaded archive is checked file by file** (`fetch = "archive"`, the default in
+  the Android app). GitHub builds archives with `git archive`, which leaves out files
+  marked `export-ignore` in `.gitattributes` and rewrites `export-subst` files. So
+  ghaudit compares every file with the commit's own list of files and their hashes, and
+  fetches each missing or changed file from the GitHub API. Up to 300 files (20 MiB)
+  are fetched that way; if more differ, or GitHub's list of files is truncated, the file
+  analyzers are reported as failed: "could not confirm the download is complete". The
+  archive itself cannot write outside its folder: symlinks become plain files holding
+  their target, and hard links, devices and names the system cannot store are listed
+  as skipped.
 - **Costs are bounded.** Each file gets a 5-second budget for code analysis, and each
   repository gets `github.repo_timeout_secs` (default 30 minutes). Workflow YAML that
   expands beyond 100,000 nodes is refused and reported. One rule reports at most 25
@@ -526,6 +541,9 @@ medium: treat them as leads, not verdicts. Detected credentials are replaced wit
   revoked already. Git history is searched only with `--history`, and only the branches
   a clone fetches (not pull request refs or other forks).
 - Without `--history`, repositories are cloned at depth 1 from their default branch.
+  With `fetch = "archive"`, only the default branch's latest commit is downloaded, and
+  the history search is skipped. Archive downloads from GitHub Enterprise Server have
+  not been tested.
 - Workflow checks read workflow files only; they don't inspect what a referenced action
   does internally.
 - The settings audit needs a token, and admin access for most checks. Organization
