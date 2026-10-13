@@ -12,28 +12,3 @@ reason = "glib 0.18 (unsound VariantStrIter): only in Linux builds of the deskto
 id = "RUSTSEC-2024-0370"
 ignoreUntil = 2027-04-01
 reason = "proc-macro-error is unmaintained (no known flaw): a build-time macro crate of glib-macros, Linux builds of the desktop app only."
-
-[[IgnoredVulns]]
-id = "RUSTSEC-2025-0075"
-ignoreUntil = 2027-04-01
-reason = "unic-char-range is unmaintained (no known flaw): used by urlpattern in tauri-utils, the desktop app only."
-
-[[IgnoredVulns]]
-id = "RUSTSEC-2025-0080"
-ignoreUntil = 2027-04-01
-reason = "unic-common is unmaintained (no known flaw): used by urlpattern in tauri-utils, the desktop app only."
-
-[[IgnoredVulns]]
-id = "RUSTSEC-2025-0081"
-ignoreUntil = 2027-04-01
-reason = "unic-char-property is unmaintained (no known flaw): used by urlpattern in tauri-utils, the desktop app only."
-
-[[IgnoredVulns]]
-id = "RUSTSEC-2025-0098"
-ignoreUntil = 2027-04-01
-reason = "unic-ucd-version is unmaintained (no known flaw): used by urlpattern in tauri-utils, the desktop app only."
-
-[[IgnoredVulns]]
-id = "RUSTSEC-2025-0100"
-ignoreUntil = 2027-04-01
-reason = "unic-ucd-ident is unmaintained (no known flaw): used by urlpattern in tauri-utils, the desktop app only."
