@@ -14,48 +14,66 @@ const layers = [];
 let enabled = false;
 const listeners = new Set();
 
+// Every entry records its position, { ghaudit: n }: 0 for the first, and one more for
+// each page or overlay open above it. Back is then told apart from our own steps back by
+// where it lands, not by when, however slow the device.
+
+/** How many entries there should be above the first: one per page and overlay. */
+function depth() {
+  return (page ? 1 : 0) + layers.length;
+}
+
+function position(state) {
+  return Number.isInteger(state?.ghaudit) ? state.ghaudit : 0;
+}
+
 // History calls run one after another: a step back is asynchronous, and an entry pushed
 // before it lands would be the one it removes.
 let queue = Promise.resolve();
-/** Resolves our own step back when its popstate arrives. */
+/** Our own step back on its way: { target, late, done() }. */
 let ownStep = null;
 
 function run(task) {
   queue = queue.then(task).catch(() => {});
 }
 
-function pushEntry() {
-  if (enabled) run(() => history.pushState({ ghaudit: true }, ""));
+/** Bring history to depth(), as it is when this runs: push entries or step back. */
+function sync() {
+  if (!enabled) return;
+  run(() => {
+    const at = position(history.state);
+    const want = depth();
+    for (let n = at + 1; n <= want; n++) history.pushState({ ghaudit: n }, "");
+    if (at > want) return stepBack(at - want, want);
+  });
 }
 
-function stepBack(count) {
-  if (!enabled || count < 1) return;
-  run(
-    () =>
-      new Promise((resolve) => {
-        const done = () => {
-          clearTimeout(timer);
-          ownStep = null;
-          resolve();
-        };
-        // A step back that has nothing to undo never fires popstate.
-        const timer = setTimeout(done, 400);
-        ownStep = done;
-        history.go(-count);
-      }),
-  );
+function stepBack(count, target) {
+  return new Promise((resolve) => {
+    const step = {
+      target,
+      late: false,
+      done() {
+        clearTimeout(timer);
+        resolve();
+      },
+    };
+    // The queue moves on after a while; the step stays ours if it lands later.
+    const timer = setTimeout(() => {
+      step.late = true;
+      resolve();
+    }, 1000);
+    ownStep = step;
+    history.go(-count);
+  });
 }
 
 function changed() {
   for (const listener of listeners) listener();
 }
 
-window.addEventListener("popstate", () => {
-  if (ownStep) {
-    ownStep();
-    return;
-  }
-  // Back was pressed: its entry is already gone, so drop ours before acting on it.
+/** Close the top overlay, or else the page. */
+function closeTop() {
   const top = layers.pop();
   if (top) {
     top.back();
@@ -65,6 +83,25 @@ window.addEventListener("popstate", () => {
     changed();
     p.back();
   }
+}
+
+window.addEventListener("popstate", (event) => {
+  if (!enabled) return;
+  const at = position(event.state);
+  const step = ownStep;
+  if (step && at === step.target) {
+    ownStep = null;
+    step.done();
+    // Anything opened while a late step was on its way gets its entries back.
+    if (step.late) sync();
+    return;
+  }
+  if (step?.late) ownStep = null;
+  // Back was pressed: its entry is already gone, so drop ours before acting on it.
+  // Landing at or above depth() is no Back of ours to act on (a step of ours that came
+  // late, or a step forward).
+  for (let n = depth() - at; n > 0; n--) closeTop();
+  sync();
 });
 
 /**
@@ -75,8 +112,8 @@ export function enableHistory(on) {
   if (on === enabled) return;
   enabled = on;
   if (on) {
-    history.replaceState({ ghaudit: true }, "");
-    for (let i = 0; i < (page ? 1 : 0) + layers.length; i++) pushEntry();
+    history.replaceState({ ghaudit: 0 }, "");
+    sync();
   }
 }
 
@@ -88,17 +125,13 @@ export function setPage(back) {
   const closed = layers.splice(0);
   for (const layer of closed.reverse()) layer.back();
   if (back) {
-    stepBack(closed.length);
     if (page) page.back = back;
-    else {
-      page = { back };
-      pushEntry();
-    }
+    else page = { back };
   } else {
-    stepBack(closed.length + (page ? 1 : 0));
     page = null;
   }
   changed();
+  sync();
 }
 
 /** Whether Back goes through history entries. */
@@ -113,18 +146,8 @@ export function canGoBack() {
 
 /** Go back, as the system Back button does: the in-app back arrow. */
 export function back() {
-  if (enabled) {
-    history.back();
-    return;
-  }
-  const top = layers.pop();
-  if (top) top.back();
-  else if (page) {
-    const p = page;
-    page = null;
-    changed();
-    p.back();
-  }
+  if (enabled) history.back();
+  else closeTop();
 }
 
 /** Call `listener` when the page changes (to show or hide the back arrow). */
@@ -139,7 +162,7 @@ export function onChange(listener) {
 export function openLayer(back) {
   const layer = { back };
   layers.push(layer);
-  pushEntry();
+  sync();
   return layer;
 }
 
@@ -148,7 +171,7 @@ export function closeLayer(layer) {
   const i = layers.indexOf(layer);
   if (i === -1) return;
   layers.splice(i, 1);
-  stepBack(1);
+  sync();
 }
 
 /**
