@@ -19,7 +19,7 @@
 use crate::discovery::PathFilter;
 use crate::error::Error;
 use crate::github::{GitHub, TreeEntry};
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 // Git names blobs by their SHA-1, so the check against the commit's tree has to use it.
 // GitHub rejects objects that carry a SHA-1 collision attack, and an archive's file
 // would have to collide with the committed blob it was made from.
@@ -74,7 +74,8 @@ impl Default for Limits {
 #[derive(Debug, Clone)]
 pub struct FetchOptions {
     pub limits: Limits,
-    /// Files larger than this are listed in `too_large`, and never fetched one by one.
+    /// Unless `write_all`, files larger than this are listed in `too_large` instead of
+    /// written.
     pub max_file_size: u64,
     /// `--exclude` patterns.
     pub exclude: Vec<String>,
@@ -119,7 +120,8 @@ impl Drop for CancelOnDrop {
 /// 4. require the archive's pax comment to name that commit;
 /// 5. fetch the commit's tree and [`reconcile`] the files with it;
 /// 6. fetch files that are missing or different one by one, within
-///    `max_backfill_files` and `max_backfill_bytes`, and remove unexpected ones.
+///    `max_backfill_files` and `max_backfill_bytes`, and remove unexpected ones (unless
+///    the tree is truncated, when they may be the commit's).
 ///
 /// Every file of the commit that is not written is listed with a reason. A truncated
 /// tree, or more files to fetch than the limits allow, sets `incomplete`.
@@ -189,10 +191,15 @@ pub async fn fetch(
     let filter = filter(&snapshot.path, opts)?;
     let check = reconcile(&extracted.files, &tree.entries, filter.as_ref());
     let mut incomplete = Vec::new();
-    if tree.truncated {
+    // A truncated list leaves out files of the commit: what it lacks is not unexpected,
+    // and stays (the snapshot is unconfirmed anyway).
+    let unexpected: &[String] = if tree.truncated {
         incomplete.push("GitHub's list of the commit's files is truncated".to_string());
-    }
-    for path in &check.unexpected {
+        &[]
+    } else {
+        &check.unexpected
+    };
+    for path in unexpected {
         // Not part of the commit: the scan must not report on it.
         fs::remove_file(snapshot.path.join(path))?;
         snapshot.skipped.push((
@@ -213,8 +220,10 @@ pub async fn fetch(
         if unwritable.contains(entry.path.as_str()) {
             continue;
         }
+        // With `write_all`, osv-scanner reads files of any size: a large lockfile is
+        // fetched like any other, within the limits below.
         let size = entry.size.unwrap_or(0);
-        if size > opts.max_file_size {
+        if !opts.write_all && size > opts.max_file_size {
             snapshot.too_large.push((entry.path.clone(), size));
         } else {
             wanted.push(entry.clone());
@@ -246,26 +255,18 @@ pub async fn fetch(
             limits.max_backfill_bytes >> 20
         ));
     }
-    // Names still on disk, for the writer's same-name check.
-    let removed: HashSet<&str> = check
-        .changed
-        .iter()
-        .map(|e| e.path.as_str())
-        .chain(check.unexpected.iter().map(String::as_str))
-        .collect();
-    let kept: Vec<String> = extracted
-        .files
-        .keys()
-        .filter(|p| !removed.contains(p.as_str()))
-        .cloned()
-        .collect();
     let stored_bytes = extracted.stored_bytes;
+    let dirs = extracted.dirs;
+    let max_blob = if opts.write_all {
+        limits.max_backfill_bytes
+    } else {
+        opts.max_file_size
+    };
 
+    // The first failure ends the fetch, and drops the requests still running.
     let contents: Vec<(TreeEntry, Vec<u8>)> = futures::stream::iter(fetch_now)
         .map(|entry| async move {
-            let content = gh
-                .blob_raw(owner, name, &entry.sha, opts.max_file_size)
-                .await?;
+            let content = gh.blob_raw(owner, name, &entry.sha, max_blob).await?;
             if !git_blob_sha1(&content).eq_ignore_ascii_case(&entry.sha) {
                 return Err(Error::Archive(format!(
                     "{UNCONFIRMED}: {} does not match its id",
@@ -275,10 +276,8 @@ pub async fn fetch(
             Ok((entry, content))
         })
         .buffer_unordered(4)
-        .collect::<Vec<crate::Result<_>>>()
-        .await
-        .into_iter()
-        .collect::<crate::Result<_>>()?;
+        .try_collect()
+        .await?;
     debug!(
         "fetched {} files of {owner}/{name} one by one",
         contents.len()
@@ -288,12 +287,11 @@ pub async fn fetch(
         let max_stored = limits.max_stored_bytes;
         let cancel = Arc::clone(&cancel);
         tokio::task::spawn_blocking(move || {
-            let mut writer = Writer::resume(&snapshot.path, max_stored, stored_bytes, &kept);
+            let mut writer = Writer::resume(&snapshot.path, max_stored, stored_bytes, dirs);
             let mut skipped = Vec::new();
             for (entry, content) in contents {
                 let result = writer.write(
                     entry.path.as_bytes(),
-                    &entry.path,
                     &mut &content[..],
                     content.len() as u64,
                     &cancel,
@@ -388,6 +386,8 @@ pub struct Extracted {
     /// `(path, reason)` of members that were not written for any other reason.
     pub skipped: Vec<(String, String)>,
     pub stored_bytes: u64,
+    /// The directories created, for a [`Writer`] that goes on writing there.
+    pub(crate) dirs: HashSet<String>,
 }
 
 #[derive(Debug)]
@@ -508,11 +508,11 @@ pub fn extract_tar_gz<R: Read>(
         }
 
         // `path_bytes` applies GNU long names and pax `path` records.
-        let raw = entry.path_bytes().into_owned();
+        let raw = entry.path_bytes();
         let Some(rel) = strip_prefix(&raw, &mut prefix, kind.is_dir()) else {
             return Err(ExtractError::Malformed(format!(
                 "member outside the top-level directory: {:?}",
-                String::from_utf8_lossy(&raw)
+                shown(&raw)
             )));
         };
         if rel.is_empty() || kind.is_dir() {
@@ -520,6 +520,10 @@ pub fn extract_tar_gz<R: Read>(
         }
         let rel_text = String::from_utf8_lossy(&rel).into_owned();
         if opts.filter.is_some_and(|f| !f.keeps(&rel_text)) {
+            continue;
+        }
+        if rel.len() > MAX_PATH_BYTES {
+            out.skipped.push((shown(&rel), PATH_TOO_LONG.into()));
             continue;
         }
 
@@ -547,8 +551,8 @@ pub fn extract_tar_gz<R: Read>(
             continue; // tar skips the unread data
         }
         let written = match link_target {
-            Some(target) => writer.write(&rel, &rel_text, &mut &target[..], size, cancel)?,
-            None => writer.write(&rel, &rel_text, &mut entry, size, cancel)?,
+            Some(target) => writer.write(&rel, &mut &target[..], size, cancel)?,
+            None => writer.write(&rel, &mut entry, size, cancel)?,
         };
         match written {
             Ok(id) => {
@@ -562,7 +566,18 @@ pub fn extract_tar_gz<R: Read>(
     // boundary would otherwise look like a smaller, valid archive.
     io::copy(&mut archive.into_inner(), &mut io::sink())?;
     out.stored_bytes = writer.stored_bytes;
+    out.dirs = writer.dirs;
     Ok(out)
+}
+
+/// A name for messages: lossy UTF-8, at most 200 characters.
+fn shown(name: &[u8]) -> String {
+    // 800 bytes hold at least 200 characters, even lossily decoded.
+    let text = String::from_utf8_lossy(&name[..name.len().min(800)]);
+    match text.char_indices().nth(200) {
+        Some((i, _)) => format!("{}…", &text[..i]),
+        None => text.into_owned(),
+    }
 }
 
 fn member_kind(kind: tar::EntryType) -> &'static str {
@@ -576,13 +591,14 @@ fn member_kind(kind: tar::EntryType) -> &'static str {
     }
 }
 
-/// Writes files under `dest`, never over an existing path, and counts what it stored.
-/// Shared by extraction and by the files fetched afterwards, so both follow one set of
-/// rules (and one set of names, for case-insensitive file systems).
+/// Writes files under `dest`, never over or through an existing path, and counts what
+/// it stored. Shared by extraction and by the files fetched afterwards, so both follow
+/// one set of rules.
 pub(crate) struct Writer<'a> {
     dest: &'a Path,
-    /// Names written so far, lower-cased where the file system ignores case.
-    taken: HashSet<String>,
+    /// The directories this writer created, relative and `/`-separated, exactly as
+    /// spelled.
+    dirs: HashSet<String>,
     stored_bytes: u64,
     max_stored_bytes: u64,
 }
@@ -591,33 +607,40 @@ impl<'a> Writer<'a> {
     pub(crate) fn new(dest: &'a Path, max_stored_bytes: u64) -> Self {
         Self {
             dest,
-            taken: HashSet::new(),
+            dirs: HashSet::new(),
             stored_bytes: 0,
             max_stored_bytes,
         }
     }
 
-    /// Go on writing into a directory that holds `names`, `stored_bytes` in all.
-    fn resume(dest: &'a Path, max_stored_bytes: u64, stored_bytes: u64, names: &[String]) -> Self {
-        let mut writer = Self::new(dest, max_stored_bytes);
-        writer.stored_bytes = stored_bytes;
-        writer.taken = names.iter().map(|p| name_key(p)).collect();
-        writer
+    /// Go on writing into a directory where `dirs` were created and `stored_bytes`
+    /// stored.
+    fn resume(
+        dest: &'a Path,
+        max_stored_bytes: u64,
+        stored_bytes: u64,
+        dirs: HashSet<String>,
+    ) -> Self {
+        Self {
+            dest,
+            dirs,
+            stored_bytes,
+            max_stored_bytes,
+        }
     }
 
-    /// Write `size` bytes from `src` to `rel` (relative, `/`-separated, as raw bytes;
-    /// `text` is it for messages). Returns the git blob id of what was written, or why
-    /// the file cannot be written here. `Err` only for failures that end the extraction.
+    /// Write `size` bytes from `src` to `rel` (relative, `/`-separated, as raw bytes).
+    /// Returns the git blob id of what was written, or why the file cannot be written
+    /// here. `Err` only for failures that end the extraction.
     pub(crate) fn write(
         &mut self,
         rel: &[u8],
-        text: &str,
         src: &mut dyn Read,
         size: u64,
         cancel: &AtomicBool,
     ) -> Result<Result<String, String>, ExtractError> {
-        let rel_path = match validate(rel) {
-            Ok(p) => p,
+        let rel = match validate(rel) {
+            Ok(rel) => rel,
             Err(why) => return Ok(Err(why)),
         };
         if self.stored_bytes + size > self.max_stored_bytes {
@@ -626,20 +649,34 @@ impl<'a> Writer<'a> {
                 self.max_stored_bytes >> 20
             )));
         }
-        let key = name_key(text);
-        if self.taken.contains(&key) {
-            return Ok(Err(SAME_NAME.into()));
-        }
-        let target = self.dest.join(&rel_path);
-        if let Some(parent) = target.parent()
-            && let Err(e) = fs::create_dir_all(parent)
-        {
-            // A link stored as the file "a", then "a/b": a parent is a file.
-            if is_name_conflict(&e) {
-                return Ok(Err(format!("cannot be written: {e}")));
+        // Directories are created one at a time, and one this writer did not create must
+        // not exist already. On Windows and macOS a name can lead to another entry
+        // (`Docs` to `docs`, the 8.3 alias `TERRAF~1` to `.terraform`): a file written
+        // through it would land in a directory the scan may skip, under a name nothing
+        // lists. So every file is on disk exactly as it is recorded.
+        let mut target = self.dest.to_path_buf();
+        if let Some((parent, _)) = rel.rsplit_once('/') {
+            let mut end = 0;
+            for name in parent.split('/') {
+                end += name.len();
+                target.push(name);
+                let dir = &rel[..end];
+                end += 1; // the '/'
+                if self.dirs.contains(dir) {
+                    continue;
+                }
+                match fs::create_dir(&target) {
+                    Ok(()) => {
+                        self.dirs.insert(dir.to_string());
+                    }
+                    Err(e) if is_name_conflict(&e) || fs::symlink_metadata(&target).is_ok() => {
+                        return Ok(Err(DIR_TAKEN.into()));
+                    }
+                    Err(e) => return Err(e.into()),
+                }
             }
-            return Err(e.into());
         }
+        target.push(rel.rsplit('/').next().unwrap_or(rel));
         // Safe from links: nothing under `dest` is one, because none is ever created.
         // `create_new` never reuses an existing path either.
         let mut file = match OpenOptions::new()
@@ -648,7 +685,12 @@ impl<'a> Writer<'a> {
             .open(&target)
         {
             Ok(f) => f,
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            // Windows refuses a file over a directory (`docs` over `Docs/`) as access
+            // denied, not as an existing name.
+            Err(e)
+                if e.kind() == io::ErrorKind::AlreadyExists
+                    || fs::symlink_metadata(&target).is_ok() =>
+            {
                 return Ok(Err(SAME_NAME.into()));
             }
             Err(e) if is_name_conflict(&e) => {
@@ -656,7 +698,6 @@ impl<'a> Writer<'a> {
             }
             Err(e) => return Err(e.into()),
         };
-        self.taken.insert(key);
         let mut hasher = Sha1::new();
         hasher.update(format!("blob {size}\0").as_bytes());
         let mut src = src.take(size);
@@ -676,7 +717,7 @@ impl<'a> Writer<'a> {
         }
         if written != size {
             return Err(ExtractError::Malformed(format!(
-                "{text}: {written} of {size} bytes"
+                "{rel}: {written} of {size} bytes"
             )));
         }
         self.stored_bytes += written;
@@ -685,15 +726,10 @@ impl<'a> Writer<'a> {
 }
 
 const SAME_NAME: &str = "another file has the same name on this file system";
-
-/// A path as this system compares names: Windows and macOS ignore case.
-fn name_key(path: &str) -> String {
-    if cfg!(any(windows, target_os = "macos")) {
-        path.to_lowercase()
-    } else {
-        path.to_string()
-    }
-}
+const DIR_TAKEN: &str =
+    "cannot be written: a directory on its path has the name of another file on this file system";
+const MAX_PATH_BYTES: usize = 4096;
+const PATH_TOO_LONG: &str = "path longer than 4096 bytes";
 
 fn is_name_conflict(e: &io::Error) -> bool {
     matches!(
@@ -726,54 +762,39 @@ fn strip_prefix(raw: &[u8], prefix: &mut Option<Vec<u8>>, is_dir: bool) -> Optio
     }
 }
 
-/// Turn a path relative to the top-level directory into a relative path on this
-/// system, or say why it cannot be one.
-fn validate(rel: &[u8]) -> Result<PathBuf, String> {
-    if rel.len() > 4096 {
-        return Err("path longer than 4096 bytes".into());
+/// Check that a path relative to the top-level directory can be stored here as it is,
+/// and return it as text, or say why it cannot be.
+fn validate(rel: &[u8]) -> Result<&str, String> {
+    if rel.len() > MAX_PATH_BYTES {
+        return Err(PATH_TOO_LONG.into());
     }
-    let mut out = PathBuf::new();
-    for comp in rel.split(|&b| b == b'/') {
+    // A name that is not UTF-8 would be listed under a lossy name, which finds no file
+    // (and two such names could share one).
+    let rel = std::str::from_utf8(rel).map_err(|_| "name is not UTF-8".to_string())?;
+    for comp in rel.split('/') {
         if comp.is_empty() {
             return Err("empty path component".into());
         }
-        if comp == b"." || comp == b".." {
+        if comp == "." || comp == ".." {
             return Err("path contains . or ..".into());
         }
-        if comp.eq_ignore_ascii_case(b".git") {
+        if comp.eq_ignore_ascii_case(".git") {
             return Err("git does not allow a .git directory in a repository".into());
         }
-        if comp.contains(&0) {
+        if comp.contains('\0') {
             return Err("path contains a NUL byte".into());
         }
         if comp.len() > 255 {
             return Err("file name longer than 255 bytes".into());
         }
-        out.push(component(comp)?);
+        if cfg!(windows) {
+            windows_name(comp)?;
+        }
     }
-    if out.as_os_str().is_empty() {
-        return Err("empty path".into());
-    }
-    Ok(out)
-}
-
-#[cfg(unix)]
-fn component(comp: &[u8]) -> Result<std::ffi::OsString, String> {
-    use std::os::unix::ffi::OsStrExt;
-    Ok(std::ffi::OsStr::from_bytes(comp).to_os_string())
-}
-
-#[cfg(not(unix))]
-fn component(comp: &[u8]) -> Result<std::ffi::OsString, String> {
-    let s = std::str::from_utf8(comp).map_err(|_| "name is not UTF-8".to_string())?;
-    if cfg!(windows) {
-        windows_name(s)?;
-    }
-    Ok(s.into())
+    Ok(rel)
 }
 
 /// Names Windows cannot store, or would store as another name.
-#[cfg(not(unix))]
 fn windows_name(s: &str) -> Result<(), String> {
     if s.chars()
         .any(|c| c < ' ' || matches!(c, '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))

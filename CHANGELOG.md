@@ -73,9 +73,13 @@ repositories) with 0.3.0.
   branch's commit instead of cloned. Since `.gitattributes` can leave files out of an
   archive or change them, every file is checked against the commit's tree, and missing
   or changed files are fetched one by one (up to 300 files, 20 MiB); when that is not
-  enough, or the tree is truncated, the file analyzers fail with "could not confirm the
-  download is complete". The archive is extracted by ghaudit's own extractor: no
-  symlinks, hard links or special files, nothing outside its folder, and capped sizes.
+  enough, or the tree is truncated, the file analyzers (and dependency checks) fail
+  with "could not confirm the download is complete". The archive is extracted by
+  ghaudit's own extractor: no symlinks, hard links or special files, nothing outside
+  its folder, and capped sizes. A file is never written through a name the file system
+  would take for another one (another case on Windows and macOS, a Windows short name
+  such as `TERRAF~1`), so it cannot land unlisted in a skipped folder; such files, and
+  names that are not UTF-8, are listed as skipped.
   The history search is skipped in this mode. For front ends, `scanner::Tools` says
   whether git and osv-scanner are installed, `sca.unavailable` gives the reason shown
   for dependency checks that cannot run, and `git::remove_stale_work_dirs` cleans up

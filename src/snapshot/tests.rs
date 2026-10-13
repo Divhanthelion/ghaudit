@@ -380,15 +380,25 @@ fn names_this_system_cannot_store_are_listed() {
         skipped.iter().any(|p| p.len() == 256),
         "long name: {skipped:?}"
     );
+    // A long path is listed, shortened.
+    let (long, why) = x
+        .skipped
+        .iter()
+        .find(|(_, why)| why.starts_with("path longer"))
+        .expect("long path listed");
+    assert_eq!(long.chars().count(), 201, "{why}");
+    assert!(long.starts_with("d/d/") && long.ends_with('…'), "{long}");
+    // A name that is not UTF-8 could only be listed under another name.
     assert!(
-        skipped.iter().any(|p| p.len() > 4096),
-        "long path: {skipped:?}"
+        x.skipped
+            .iter()
+            .any(|(p, why)| p.starts_with("caf") && why.contains("UTF-8")),
+        "{skipped:?}"
     );
     if cfg!(windows) {
         for name in ["CON", "aux.txt", "a\\b.txt", "col:on", "trail. ", "Readme"] {
             assert!(skipped.contains(&name), "{name} not listed: {skipped:?}");
         }
-        assert!(skipped.iter().any(|p| p.starts_with("caf")), "not UTF-8");
         assert_eq!(
             fs::read(outer.path().join("tree/README")).unwrap(),
             b"README"
@@ -396,10 +406,75 @@ fn names_this_system_cannot_store_are_listed() {
     } else if cfg!(target_os = "macos") {
         assert!(skipped.contains(&"Readme"), "{skipped:?}");
     } else {
-        // Linux and Android keep every name git allows.
-        assert_eq!(skipped.len(), 4, "{:#?}", reasons(&x));
-        assert_eq!(x.files.len(), 8);
+        // Linux and Android keep every other name git allows.
+        assert_eq!(skipped.len(), 5, "{:#?}", reasons(&x));
+        assert_eq!(x.files.len(), 7);
     }
+}
+
+/// On Windows and macOS a name can lead to another entry: another case, or on Windows
+/// an 8.3 alias (`TERRAF~1` for `.terraform`). Nothing is written through one, so a
+/// file never lands, unlisted, in a directory the scan skips: what is on disk is
+/// exactly what is recorded, and everything else is listed.
+#[test]
+fn names_that_lead_to_another_entry_are_listed() {
+    let members = [
+        (".terraform/main.tf", "a"),
+        ("TERRAF~1/hidden.tf", "b"),
+        ("node_modules/p/i.js", "c"),
+        ("Node_Modules/p/evil.js", "d"),
+        ("docs/guide.md", "e"),
+        ("DOCS", "f"),
+        ("readme.md", "g"),
+        ("README.MD/x", "h"),
+    ];
+    let mut b = builder();
+    for (name, data) in members {
+        raw(
+            &mut b,
+            tar::EntryType::Regular,
+            format!("o-r-abc/{name}").as_bytes(),
+            data.as_bytes(),
+        );
+    }
+    let (outer, x) = run(b);
+    let recorded: Vec<String> = x.files.keys().cloned().collect();
+    assert_eq!(listing(&outer.path().join("tree")), recorded);
+    assert_eq!(
+        x.files.len() + x.skipped.len(),
+        members.len(),
+        "{:#?}",
+        reasons(&x)
+    );
+    if cfg!(any(windows, target_os = "macos")) {
+        let skipped: Vec<&str> = x.skipped.iter().map(|(p, _)| p.as_str()).collect();
+        for name in ["Node_Modules/p/evil.js", "DOCS", "README.MD/x"] {
+            assert!(skipped.contains(&name), "{name}: {:#?}", reasons(&x));
+        }
+    }
+
+    // A file fetched afterwards follows the same rules, in the directories the
+    // extraction created.
+    let tree = outer.path().join("tree");
+    let mut writer = Writer::resume(&tree, 1 << 20, x.stored_bytes, x.dirs);
+    let cancel = AtomicBool::new(false);
+    let mut write = |rel: &str| writer.write(rel.as_bytes(), &mut &b"z"[..], 1, &cancel);
+    assert!(
+        write("docs/new.md").unwrap().is_ok(),
+        "an existing directory"
+    );
+    let again = write("Node_Modules/p/later.js").unwrap();
+    if cfg!(any(windows, target_os = "macos")) {
+        assert!(again.is_err(), "{again:?}");
+    }
+    let recorded: Vec<String> = x.files.keys().cloned().collect();
+    let on_disk = listing(&tree);
+    assert!(
+        on_disk
+            .iter()
+            .all(|p| recorded.contains(p) || p == "docs/new.md" || p == "Node_Modules/p/later.js"),
+        "{on_disk:?}"
+    );
 }
 
 #[test]
@@ -937,14 +1012,21 @@ async fn what_cannot_be_confirmed_is_reported() {
     let files: Vec<(&str, &[u8])> = vec![("a.txt", b"a\n"), ("b.txt", b"b\n"), ("c.txt", b"c\n")];
     let archive = github_archive(SHA, &files[..1]);
 
-    // A truncated tree.
-    let (api, _) = serve_repo(Some(archive.clone()), tree_json(&files[..1], true), vec![]).await;
+    // A truncated tree. The files it does not list stay: they may be the commit's.
+    let (api, _) = serve_repo(
+        Some(github_archive(SHA, &files)),
+        tree_json(&files[..1], true),
+        vec![],
+    )
+    .await;
     let snapshot = fetch_app(&api, &fetch_options()).await.unwrap();
-    let why = snapshot.incomplete.unwrap();
+    let why = snapshot.incomplete.clone().unwrap();
     assert!(
         why.starts_with(UNCONFIRMED) && why.contains("truncated"),
         "{why}"
     );
+    assert_eq!(listing(&snapshot.path), vec!["a.txt", "b.txt", "c.txt"]);
+    assert!(snapshot.skipped.is_empty(), "{:?}", snapshot.skipped);
 
     // More files left out of the archive than are fetched one by one.
     let blobs = vec![b"b\n".to_vec(), b"c\n".to_vec()];
@@ -1008,6 +1090,49 @@ async fn what_cannot_be_confirmed_is_reported() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("does not match its id"), "{err}");
+}
+
+/// Dependency checks need every file, whatever its size: a large lockfile the archive
+/// leaves out is fetched, and one over the limits leaves the snapshot unconfirmed
+/// rather than quietly missing.
+#[tokio::test]
+async fn dependency_checks_get_large_files_too() {
+    let lock = vec![b'l'; 2000]; // over max_file_size
+    let commit: Vec<(&str, &[u8])> = vec![
+        (".gitattributes", b"Cargo.lock export-ignore\n"),
+        ("Cargo.lock", &lock),
+    ];
+    let (api, _) = serve_repo(
+        Some(github_archive(SHA, &commit[..1])),
+        tree_json(&commit, false),
+        vec![lock.clone()],
+    )
+    .await;
+    let all = FetchOptions {
+        write_all: true,
+        ..fetch_options()
+    };
+    let snapshot = fetch_app(&api, &all).await.unwrap();
+    assert_eq!(snapshot.incomplete, None);
+    assert_eq!(fs::read(snapshot.path.join("Cargo.lock")).unwrap(), lock);
+    assert!(snapshot.too_large.is_empty());
+
+    // Without dependency checks it is too large, as discovery would say.
+    let snapshot = fetch_app(&api, &fetch_options()).await.unwrap();
+    assert_eq!(snapshot.too_large, vec![("Cargo.lock".to_string(), 2000)]);
+    assert!(!snapshot.path.join("Cargo.lock").exists());
+
+    // Over the bytes fetched one by one.
+    let mut tight = all.clone();
+    tight.limits.max_backfill_bytes = 1000;
+    let snapshot = fetch_app(&api, &tight).await.unwrap();
+    let why = snapshot.incomplete.unwrap();
+    assert!(why.starts_with(UNCONFIRMED), "{why}");
+    assert!(
+        snapshot.skipped.iter().any(|(p, _)| p == "Cargo.lock"),
+        "{:?}",
+        snapshot.skipped
+    );
 }
 
 #[tokio::test]
