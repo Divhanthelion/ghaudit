@@ -234,7 +234,7 @@ export function createFindingsView(prepared, { onError }) {
 
   function openDetail() {
     state.detailOpen = true;
-    if (!detailLayer && DETAIL_OVERLAY.matches && nav.historyEnabled()) {
+    if (!detailLayer && DETAIL_OVERLAY.matches && nav.systemBackEnabled()) {
       detailLayer = nav.openLayer(() => {
         detailLayer = null;
         hideDetail();

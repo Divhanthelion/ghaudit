@@ -682,8 +682,8 @@ async function refreshEnvironment() {
   try {
     state.env = await backend.environment();
     document.documentElement.dataset.platform = state.env.platform ?? "";
-    // Android's Back button steps back through the page's history.
-    nav.enableHistory(Boolean(state.env.mobile));
+    // Android's Back button closes what the page has open first (see nav.js).
+    nav.useSystemBack(state.env.mobile);
   } catch (e) {
     showError(e.message);
   }

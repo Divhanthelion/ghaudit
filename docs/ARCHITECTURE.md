@@ -580,8 +580,8 @@ loads (`tauri::mobile_entry_point` on `run`), and `app/gen/android` is the Gradl
 `cargo tauri android init` generated, with the changes KJV-Interlinear made to it: no
 Android TV entries, backup and device-transfer rules that leave out shared preferences
 (where the token lives, encrypted with a Keystore key that never leaves the phone), a
-`MainActivity` that hands the page the system-bar and keyboard insets, and an adaptive
-launcher icon. What differs at run time:
+`MainActivity` that hands the page the system-bar and keyboard insets and asks it what
+Back closes, and an adaptive launcher icon. What differs at run time:
 
 - **Files.** Android's dialogs return `content://` URIs, not paths. `picked.rs` opens them
   through tauri-plugin-fs's Rust API (Android only, with no permission granted to the
@@ -613,9 +613,13 @@ Below 700 px the page switches to its phone layout (`@media (max-width: 699px)`)
 bottom tab bar, finding cards with a full-screen detail sheet, filters and report actions
 in bottom sheets, per-repository settings cards instead of the grid, and stacked tables.
 Behavior follows `environment().mobile` and `capabilities`, never the user agent.
-`nav.js` makes Android's Back button work: Back in a WebView goes back in history, so
-every sheet, dialog and page pushes a history entry and Back pops it (during a scan it
-asks whether to stop). On the desktop it does nothing.
+`nav.js` makes Android's Back button work. It records the page below the start page or
+Overview and the overlays above it (sheets, dialogs, a finding's details), and the
+activity asks it first, through `window.ghauditBack()`, which closes the top one (during
+a scan it asks whether to stop). With nothing open, Back leaves the app as usual. It
+keeps no history entries: Chromium lets Back skip entries a page pushed without a tap,
+so a WebView's own Back could close the app with a sheet open. On the desktop the same
+bookkeeping serves the in-app back arrow.
 
 ### Security model
 

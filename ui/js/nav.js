@@ -1,8 +1,10 @@
-// The Back button on phones. Android's WebView turns the system Back button and gesture
-// into a step back in the page's history, and closes the app when there is none. So
-// every view below the start page or the report's Overview (the "page") and every
-// overlay above it (sheets, dialogs, a finding's details) gets a history entry, and Back
-// closes the top one. On the desktop the same bookkeeping runs without history entries.
+// The Back button on phones. The Android app's activity asks the page first, through
+// window.ghauditBack(): every view below the start page or the report's Overview (the
+// "page") and every overlay above it (sheets, dialogs, a finding's details) is recorded
+// here, and Back closes the top one. With nothing open, Back leaves the app as usual.
+// History entries are not used for this: Chromium lets Back skip entries a page pushed
+// without a tap, and would close the app with a sheet still open. On the desktop the
+// same bookkeeping serves the in-app back arrow.
 
 import { h, icon } from "./dom.js";
 
@@ -10,63 +12,9 @@ import { h, icon } from "./dom.js";
 let page = null;
 /** Overlays above the page, bottom to top: { back() }. */
 const layers = [];
-/** Whether Back goes through history entries (true in the mobile app). */
-let enabled = false;
+/** Whether the system Back button comes to the page (the mobile app). */
+let systemBack = false;
 const listeners = new Set();
-
-// Every entry records its position, { ghaudit: n }: 0 for the first, and one more for
-// each page or overlay open above it. Back is then told apart from our own steps back by
-// where it lands, not by when, however slow the device.
-
-/** How many entries there should be above the first: one per page and overlay. */
-function depth() {
-  return (page ? 1 : 0) + layers.length;
-}
-
-function position(state) {
-  return Number.isInteger(state?.ghaudit) ? state.ghaudit : 0;
-}
-
-// History calls run one after another: a step back is asynchronous, and an entry pushed
-// before it lands would be the one it removes.
-let queue = Promise.resolve();
-/** Our own step back on its way: { target, late, done() }. */
-let ownStep = null;
-
-function run(task) {
-  queue = queue.then(task).catch(() => {});
-}
-
-/** Bring history to depth(), as it is when this runs: push entries or step back. */
-function sync() {
-  if (!enabled) return;
-  run(() => {
-    const at = position(history.state);
-    const want = depth();
-    for (let n = at + 1; n <= want; n++) history.pushState({ ghaudit: n }, "");
-    if (at > want) return stepBack(at - want, want);
-  });
-}
-
-function stepBack(count, target) {
-  return new Promise((resolve) => {
-    const step = {
-      target,
-      late: false,
-      done() {
-        clearTimeout(timer);
-        resolve();
-      },
-    };
-    // The queue moves on after a while; the step stays ours if it lands later.
-    const timer = setTimeout(() => {
-      step.late = true;
-      resolve();
-    }, 1000);
-    ownStep = step;
-    history.go(-count);
-  });
-}
 
 function changed() {
   for (const listener of listeners) listener();
@@ -85,36 +33,16 @@ function closeTop() {
   }
 }
 
-window.addEventListener("popstate", (event) => {
-  if (!enabled) return;
-  const at = position(event.state);
-  const step = ownStep;
-  if (step && at === step.target) {
-    ownStep = null;
-    step.done();
-    // Anything opened while a late step was on its way gets its entries back.
-    if (step.late) sync();
-    return;
-  }
-  if (step?.late) ownStep = null;
-  // Back was pressed: its entry is already gone, so drop ours before acting on it.
-  // Landing at or above depth() is no Back of ours to act on (a step of ours that came
-  // late, or a step forward).
-  for (let n = depth() - at; n > 0; n--) closeTop();
-  sync();
-});
+/** For the Android activity: close what is on top. False when nothing is open. */
+window.ghauditBack = () => {
+  if (!canGoBack()) return false;
+  closeTop();
+  return true;
+};
 
-/**
- * Use history entries (in the mobile app). Entries for anything already open are
- * added now.
- */
-export function enableHistory(on) {
-  if (on === enabled) return;
-  enabled = on;
-  if (on) {
-    history.replaceState({ ghaudit: 0 }, "");
-    sync();
-  }
+/** Say whether the system Back button comes to the page (the mobile app). */
+export function useSystemBack(on) {
+  systemBack = Boolean(on);
 }
 
 /**
@@ -131,12 +59,11 @@ export function setPage(back) {
     page = null;
   }
   changed();
-  sync();
 }
 
-/** Whether Back goes through history entries. */
-export function historyEnabled() {
-  return enabled;
+/** Whether the system Back button comes to the page. */
+export function systemBackEnabled() {
+  return systemBack;
 }
 
 /** Whether Back stays in the app (a page or an overlay is open). */
@@ -146,8 +73,7 @@ export function canGoBack() {
 
 /** Go back, as the system Back button does: the in-app back arrow. */
 export function back() {
-  if (enabled) history.back();
-  else closeTop();
+  closeTop();
 }
 
 /** Call `listener` when the page changes (to show or hide the back arrow). */
@@ -162,16 +88,13 @@ export function onChange(listener) {
 export function openLayer(back) {
   const layer = { back };
   layers.push(layer);
-  sync();
   return layer;
 }
 
-/** The page closed an overlay itself: drop its history entry. */
+/** The page closed an overlay itself. */
 export function closeLayer(layer) {
   const i = layers.indexOf(layer);
-  if (i === -1) return;
-  layers.splice(i, 1);
-  sync();
+  if (i !== -1) layers.splice(i, 1);
 }
 
 /**
