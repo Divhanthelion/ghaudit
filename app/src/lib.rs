@@ -520,6 +520,7 @@ async fn start_scan(
                 login: login.as_deref(),
                 osv_scanner: osv_scanner.as_deref(),
                 folder: folder.as_deref(),
+                phone: cfg!(mobile),
             },
         )?;
         let sink: ProgressSink = Arc::new(move |event| {
@@ -603,6 +604,9 @@ pub fn run() {
             if let Ok(dir) = app.path().app_cache_dir() {
                 let _ = std::fs::create_dir_all(&dir);
                 let _ = tempfile::env::override_temp_dir(&dir);
+                // Android may kill the app mid-scan, before its downloads are deleted;
+                // nothing is scanning yet, so every leftover can go.
+                ghaudit::git::remove_stale_work_dirs(&dir, Duration::ZERO);
             }
             // A phone has a few fast cores and a few slow ones, and the page must stay
             // responsive while files are analyzed: four analysis threads, not one per core.
