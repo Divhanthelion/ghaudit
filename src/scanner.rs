@@ -65,8 +65,10 @@ struct LocalEngines {
     secrets: Option<SecretDetector>,
     workflows: bool,
     agents: bool,
-    history: bool,
 }
+
+/// Why the history search does not run on a device without git.
+pub const HISTORY_NEEDS_GIT: &str = "needs git, which this device doesn't have";
 
 pub struct Scanner {
     config: Config,
@@ -74,7 +76,53 @@ pub struct Scanner {
     sca: Option<OsvScanner>,
     ai: Option<AiAnalyzer>,
     github: GitHub,
+    tools: Tools,
     progress: Option<ProgressSink>,
+}
+
+/// The external programs a scan can use, found once when the scanner is built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tools {
+    /// `git`, for clones, local repositories' commit and remote, and the history search.
+    pub git: bool,
+    /// The configured osv-scanner (`sca.osv_scanner`).
+    pub osv_scanner: bool,
+}
+
+impl Tools {
+    /// Look the programs up on `PATH` without running them. Always `false` on Android,
+    /// where apps cannot run either.
+    pub fn detect(osv_scanner: &str) -> Self {
+        if cfg!(target_os = "android") {
+            return Self {
+                git: false,
+                osv_scanner: false,
+            };
+        }
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        Self {
+            git: find_program("git", &path),
+            osv_scanner: find_program(osv_scanner, &path),
+        }
+    }
+}
+
+/// Whether `Command::new(name)` would find a program: a path is checked as given, a
+/// bare name in each `PATH` directory (with `.exe` added on Windows, as `Command` does).
+fn find_program(name: &str, path: &std::ffi::OsStr) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let program = Path::new(name);
+    let file = if cfg!(windows) && program.extension().is_none() {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    };
+    if program.components().count() > 1 {
+        return Path::new(&file).is_file();
+    }
+    std::env::split_paths(path).any(|dir| dir.join(&file).is_file())
 }
 
 /// One repository of a remote scan: its commit and results. When the repository could
@@ -156,11 +204,11 @@ impl Scanner {
                 secrets,
                 workflows: a.workflows,
                 agents: a.agents,
-                history: a.history,
             }),
             sca,
             ai,
             github,
+            tools: Tools::detect(&config.sca.osv_scanner),
             config,
             progress: None,
         })
@@ -204,13 +252,20 @@ impl Scanner {
         &self.github
     }
 
+    /// The external programs this scanner found.
+    pub fn tools(&self) -> Tools {
+        self.tools
+    }
+
     pub async fn scan(&self, target: &Target) -> Result<ScanReport> {
         let started = Instant::now();
         let mut report = ScanReport::new(target.label());
 
         match target {
             Target::Local(path) => {
-                report.commit = git::head_commit(path).await;
+                if self.tools.git {
+                    report.commit = git::head_commit(path).await;
+                }
                 let trusted = self.config.analysis.trust_repo.resolve(true);
                 let repo = self.github_repo_of(path).await;
                 let (dir, (status, audit)) = tokio::join!(
@@ -384,7 +439,10 @@ impl Scanner {
 
         report.analyzers = ANALYZERS
             .iter()
-            .map(|name| summarize_analyzer(name, &report.repositories, self.enabled(name)))
+            .map(|name| {
+                let off = (!self.enabled(name)).then(|| self.disabled_reason(name));
+                summarize_analyzer(name, &report.repositories, off)
+            })
             .collect();
         for summary in &mut report.repositories {
             summary.findings = report
@@ -478,9 +536,19 @@ impl Scanner {
         let off = |why: &str| Some(AnalyzerStatus::skipped(analyzer, why));
         match analyzer {
             "history" if !a.history => off("disabled (enable with --history)"),
+            "history" if !self.tools.git => off(HISTORY_NEEDS_GIT),
             "ai" if !a.ai => off("disabled (enable with --ai)"),
-            _ if !self.enabled(analyzer) => off("disabled"),
+            _ if !self.enabled(analyzer) => off(self.disabled_reason(analyzer)),
             _ => None,
+        }
+    }
+
+    /// Why a turned-off analyzer is off: "disabled", or the reason a front end gave
+    /// for dependency checks being unavailable.
+    fn disabled_reason(&self, analyzer: &str) -> &str {
+        match (analyzer, &self.config.sca.unavailable) {
+            ("sca", Some(why)) if !self.config.analysis.sca => why,
+            _ => "disabled",
         }
     }
 
@@ -501,6 +569,9 @@ impl Scanner {
 
     /// `owner/name` of the GitHub repository a local directory was cloned from.
     async fn github_repo_of(&self, path: &Path) -> Option<String> {
+        if !self.tools.git {
+            return None;
+        }
         let url = git::origin_url(path).await?;
         let host = crate::github::web_host(&self.config.github.api_url);
         match target::parse_scan_target(&url, &host) {
@@ -609,7 +680,7 @@ impl Scanner {
                 None => None,
             };
             let status = match &result {
-                None => AnalyzerStatus::skipped("sca", "disabled"),
+                None => AnalyzerStatus::skipped("sca", self.disabled_reason("sca")),
                 Some(Ok(outcome)) => {
                     let detail = (!outcome.warnings.is_empty())
                         .then(|| format!("osv-scanner warnings: {}", outcome.warnings.join("; ")));
@@ -625,32 +696,34 @@ impl Scanner {
             let cancel = Arc::clone(&cancel);
             let root = root.to_path_buf();
             let exclude = self.config.analysis.exclude.clone();
+            let off = self.off_status("history");
             async move {
-                let result = if engines.history {
-                    let task = tokio::task::spawn_blocking(move || {
-                        let detector = engines
-                            .secrets
-                            .as_ref()
-                            .ok_or("needs the secrets analyzer")?;
-                        let filter = PathFilter::new(&root, &exclude).map_err(|e| e.to_string())?;
-                        history::scan_history(
-                            &root,
-                            detector,
-                            &filter,
-                            history::Limits::default(),
-                            &cancel,
-                        )
-                    });
-                    Some(task.await.unwrap_or_else(|e| Err(format!("crashed: {e}"))))
-                } else {
-                    None
-                };
-                let status = match &result {
-                    None => AnalyzerStatus::skipped("history", "disabled (enable with --history)"),
-                    Some(Ok(outcome)) => {
-                        AnalyzerStatus::completed("history").with_detail(Some(outcome.summary()))
+                let (result, status) = match off {
+                    Some(off) => (None, off),
+                    None => {
+                        let task = tokio::task::spawn_blocking(move || {
+                            let detector = engines
+                                .secrets
+                                .as_ref()
+                                .ok_or("needs the secrets analyzer")?;
+                            let filter =
+                                PathFilter::new(&root, &exclude).map_err(|e| e.to_string())?;
+                            history::scan_history(
+                                &root,
+                                detector,
+                                &filter,
+                                history::Limits::default(),
+                                &cancel,
+                            )
+                        });
+                        let result = task.await.unwrap_or_else(|e| Err(format!("crashed: {e}")));
+                        let status = match &result {
+                            Ok(outcome) => AnalyzerStatus::completed("history")
+                                .with_detail(Some(outcome.summary())),
+                            Err(e) => AnalyzerStatus::failed("history", e.clone()),
+                        };
+                        (Some(result), status)
                     }
-                    Some(Err(e)) => AnalyzerStatus::failed("history", e.clone()),
                 };
                 self.analyzer_finished(label, &status);
                 (result, status)
@@ -809,9 +882,14 @@ fn apply(report: &mut ScanReport, dir: DirScan) {
 
 /// Roll per-repository statuses up into one status per analyzer. A repository that
 /// failed without a status for the analyzer (it timed out) counts as a failure.
-fn summarize_analyzer(name: &str, repos: &[RepositorySummary], enabled: bool) -> AnalyzerStatus {
-    if !enabled {
-        return AnalyzerStatus::skipped(name, "disabled");
+/// `disabled` is the reason for an analyzer this scan turned off.
+fn summarize_analyzer(
+    name: &str,
+    repos: &[RepositorySummary],
+    disabled: Option<&str>,
+) -> AnalyzerStatus {
+    if let Some(why) = disabled {
+        return AnalyzerStatus::skipped(name, why);
     }
     let failed = repos
         .iter()
@@ -1506,6 +1584,70 @@ mod tests {
     }
 
     #[test]
+    fn programs_are_found_on_path_without_running_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = if cfg!(windows) { ".exe" } else { "" };
+        std::fs::write(dir.path().join(format!("fake-tool{exe}")), "").unwrap();
+        std::fs::create_dir(dir.path().join(format!("a-directory{exe}"))).unwrap();
+        let path = std::env::join_paths([Path::new("/nowhere"), dir.path()]).unwrap();
+        assert!(find_program("fake-tool", &path));
+        assert!(!find_program("missing-tool", &path));
+        assert!(
+            !find_program("a-directory", &path),
+            "directories are not programs"
+        );
+        assert!(!find_program("fake-tool", std::ffi::OsStr::new("")));
+        assert!(!find_program("", &path));
+        // A path is checked as given, not on PATH.
+        let full = dir.path().join("fake-tool");
+        assert!(find_program(
+            full.to_str().unwrap(),
+            std::ffi::OsStr::new("")
+        ));
+        assert!(!find_program(
+            dir.path().join("missing-tool").to_str().unwrap(),
+            &path
+        ));
+    }
+
+    #[tokio::test]
+    async fn analyzers_that_cannot_run_here_say_why() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("app.py"), "import os\nos.system(cmd)\n").unwrap();
+        let why = "not available on phones: dependency checks need osv-scanner";
+        let mut config = Config::default();
+        config.analysis.history = true;
+        config.analysis.sca = false;
+        config.sca.unavailable = Some(why.into());
+        let mut scanner = Scanner::new(config).unwrap();
+        scanner.tools.git = false;
+        let report = scanner
+            .scan(&Target::Local(dir.path().to_path_buf()))
+            .await
+            .unwrap();
+        let status = |name: &str| report.analyzers.iter().find(|a| a.analyzer == name);
+        assert_eq!(
+            status("history"),
+            Some(&AnalyzerStatus::skipped("history", HISTORY_NEEDS_GIT))
+        );
+        assert_eq!(status("sca"), Some(&AnalyzerStatus::skipped("sca", why)));
+        assert!(report.commit.is_none());
+        assert!(report.is_complete(), "{:?}", report.failures());
+
+        // The reason survives the roll-up of a multi-repository scan, and is only used
+        // while dependency checks are off.
+        assert_eq!(scanner.disabled_reason("sca"), why);
+        assert_eq!(scanner.disabled_reason("sast"), "disabled");
+        let mut on = Config::default();
+        on.sca.unavailable = Some(why.into());
+        assert_eq!(Scanner::new(on).unwrap().off_status("sca"), None);
+        let mut report = ScanReport::new("user:acme");
+        scanner.scan_many(&mut report, Vec::new()).await;
+        let sca = report.analyzers.iter().find(|a| a.analyzer == "sca");
+        assert_eq!(sca, Some(&AnalyzerStatus::skipped("sca", why)));
+    }
+
+    #[test]
     fn rollup_reports_failures() {
         let repo = |state| RepositorySummary {
             name: "o/r".into(),
@@ -1520,15 +1662,15 @@ mod tests {
         };
         let repos = vec![repo(AnalyzerState::Completed), repo(AnalyzerState::Failed)];
         assert_eq!(
-            summarize_analyzer("sca", &repos, true).state,
+            summarize_analyzer("sca", &repos, None).state,
             AnalyzerState::Failed
         );
         assert_eq!(
-            summarize_analyzer("sca", &repos, false).state,
+            summarize_analyzer("sca", &repos, Some("disabled")).state,
             AnalyzerState::Skipped
         );
         assert_eq!(
-            summarize_analyzer("sast", &repos, true).state,
+            summarize_analyzer("sast", &repos, None).state,
             AnalyzerState::Completed
         );
         // A repository that timed out has no statuses: it failed for every analyzer.
@@ -1539,11 +1681,11 @@ mod tests {
         };
         let repos = vec![repo(AnalyzerState::Completed), timed_out];
         assert_eq!(
-            summarize_analyzer("sast", &repos, true),
+            summarize_analyzer("sast", &repos, None),
             AnalyzerStatus::failed("sast", "failed in 1 of 2 repositories")
         );
         assert_eq!(
-            summarize_analyzer("sca", &repos, true).state,
+            summarize_analyzer("sca", &repos, None).state,
             AnalyzerState::Failed
         );
     }

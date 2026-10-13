@@ -327,6 +327,9 @@ and `gpg.program` from running, and `--src-prefix`/`--dst-prefix`, `--no-renames
 `--no-color` and `core.quotePath=false` pin the output format. Limits: 1 GiB of diff,
 10 minutes, and 2 MiB of added text per file version; hitting one marks the result
 incomplete in the analyzer status. A shallow clone is reported as partial history.
+`Scanner::new` looks `git` and osv-scanner up on `PATH` once, without running them
+(`scanner::Tools`; never found on Android). Without git, the history search is
+skipped with "needs git, which this device doesn't have" rather than failing.
 
 #### Agent and editor configs (`analyzer/agents.rs`)
 

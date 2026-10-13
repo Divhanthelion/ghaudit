@@ -131,6 +131,11 @@ pub struct ScaConfig {
     /// e.g. `["--offline-vulnerabilities", "--download-offline-databases"]`.
     pub extra_args: Vec<String>,
     pub timeout_secs: u64,
+    /// Why dependency checks cannot run here, for a front end that turns them off on a
+    /// device without osv-scanner. With `analysis.sca = false`, the report gives this
+    /// reason instead of "disabled".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable: Option<String>,
 }
 
 impl Default for ScaConfig {
@@ -139,6 +144,7 @@ impl Default for ScaConfig {
             osv_scanner: "osv-scanner".into(),
             extra_args: Vec::new(),
             timeout_secs: 600,
+            unavailable: None,
         }
     }
 }
