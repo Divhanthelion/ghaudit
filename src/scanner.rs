@@ -1432,6 +1432,7 @@ mod tests {
             archived: false,
             fork,
             private: false,
+            default_branch: None,
         };
         let repos = vec![
             repo("acme/good", &good, false),
@@ -1554,6 +1555,7 @@ mod tests {
             archived: false,
             fork: false,
             private: false,
+            default_branch: None,
         };
         scanner.scan_many(&mut report, vec![repo]).await;
 

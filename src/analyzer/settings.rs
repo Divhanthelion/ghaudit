@@ -10,7 +10,7 @@
 //! also answers 404 to tokens that may not look.
 
 use crate::error::{Error, Result};
-use crate::github::{GitHub, Probe};
+use crate::github::{GitHub, Probe, path_segment};
 use crate::model::{Category, CheckStatus, Confidence, Finding, Location, SettingsCheck, Severity};
 use serde_json::Value;
 
@@ -358,19 +358,6 @@ fn bool_at(v: &Value, path: &[&str]) -> Option<bool> {
 
 fn str_at<'a>(v: &'a Value, path: &[&str]) -> Option<&'a str> {
     path.iter().try_fold(v, |v, k| v.get(k))?.as_str()
-}
-
-/// Escape characters a branch name may contain that are special in a URL path.
-fn path_segment(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            '%' => "%25".into(),
-            '#' => "%23".into(),
-            '?' => "%3F".into(),
-            ' ' => "%20".into(),
-            c => c.to_string(),
-        })
-        .collect()
 }
 
 /// Audit one repository's settings.
