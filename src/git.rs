@@ -15,6 +15,60 @@ use tracing::debug;
 
 const CLONE_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// Name prefix of every temporary directory a scan creates (clones, downloads,
+/// osv-scanner's empty config), so that [`remove_stale_work_dirs`] can find them.
+pub const WORK_DIR_PREFIX: &str = "ghaudit-";
+
+/// A new temporary directory named `ghaudit-*` in the system's temporary directory
+/// (which a front end can move with `tempfile::env::override_temp_dir`).
+pub(crate) fn work_dir() -> std::io::Result<TempDir> {
+    tempfile::Builder::new().prefix(WORK_DIR_PREFIX).tempdir()
+}
+
+/// Delete the `ghaudit-*` directories directly in `dir` that were last modified at
+/// least `older_than` ago, and return how many were removed.
+///
+/// A scan deletes its temporary directories when it ends or is cancelled; this cleans
+/// up after one that was killed first, for example an app closed by the system. Only
+/// real directories are removed: symbolic links (and Windows junctions) are neither
+/// followed nor deleted, and neither are links inside a removed directory. A
+/// directory's modification time changes only when entries are added to it directly,
+/// so while other scans may be running, `older_than` must be longer than a scan.
+pub fn remove_stale_work_dirs(dir: &Path, older_than: Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let now = std::time::SystemTime::now();
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let named = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with(WORK_DIR_PREFIX));
+        if !named {
+            continue;
+        }
+        let path = entry.path();
+        // symlink_metadata: a link is described as a link, not as what it points to.
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            continue;
+        }
+        let old = meta
+            .modified()
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|age| age >= older_than);
+        // remove_dir_all deletes links inside the directory without following them.
+        if old && std::fs::remove_dir_all(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 /// A shallow clone in a temporary directory, deleted when this value is dropped.
 #[derive(Debug)]
 pub struct Checkout {
@@ -35,7 +89,7 @@ pub struct Checkout {
 /// submodules (a plain clone fetches neither), no symlinks, no `ext::` transport, and
 /// no Git LFS downloads (the repository's `.lfsconfig` could point them anywhere).
 pub async fn clone(url: &str, token: Option<&str>, full_history: bool) -> Result<Checkout> {
-    let dir = tempfile::Builder::new().prefix("ghaudit-").tempdir()?;
+    let dir = work_dir()?;
     let path = dir.path().join("repo");
 
     let mut cmd = git_command();
@@ -274,6 +328,46 @@ mod tests {
         let dir = checkout.path.clone();
         drop(checkout);
         assert!(!dir.exists(), "temporary clone should be removed on drop");
+    }
+
+    #[test]
+    fn stale_work_dirs_are_removed_and_nothing_else() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("keep.txt"), "x").unwrap();
+        let dir = root.path().join("ghaudit-old");
+        std::fs::create_dir_all(dir.join("repo/src")).unwrap();
+        std::fs::write(dir.join("repo/src/a.rs"), "x").unwrap();
+        std::fs::write(root.path().join("ghaudit-file"), "x").unwrap();
+        std::fs::create_dir(root.path().join("other")).unwrap();
+        // Links, where this system lets us make them: neither followed nor removed.
+        let link = root.path().join("ghaudit-link");
+        let inner = dir.join("repo/link");
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(outside.path(), &link).is_ok()
+            && std::os::unix::fs::symlink(outside.path(), &inner).is_ok();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_dir(outside.path(), &link).is_ok()
+            && std::os::windows::fs::symlink_dir(outside.path(), &inner).is_ok();
+
+        assert_eq!(
+            remove_stale_work_dirs(root.path(), Duration::from_secs(3600)),
+            0,
+            "too recent"
+        );
+        assert!(dir.exists());
+        assert_eq!(remove_stale_work_dirs(root.path(), Duration::ZERO), 1);
+        assert!(!dir.exists());
+        assert!(root.path().join("ghaudit-file").exists());
+        assert!(root.path().join("other").exists());
+        assert!(outside.path().join("keep.txt").exists());
+        if linked {
+            assert!(std::fs::symlink_metadata(&link).is_ok(), "the link is kept");
+        }
+        assert_eq!(
+            remove_stale_work_dirs(&root.path().join("missing"), Duration::ZERO),
+            0
+        );
     }
 
     #[tokio::test]

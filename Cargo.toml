@@ -25,7 +25,8 @@ rayon = "1.11"
 
 # HTTP: GitHub REST API and the optional local LLM endpoint.
 # rustls with the `ring` provider keeps the build free of CMake/NASM on Windows.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots", "rustls-tls-native-roots"] }
+# Bundled webpki roots everywhere, plus the system's roots except on Android (below).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
 
 # Static analysis
 tree-sitter = "0.26"
@@ -64,6 +65,12 @@ futures = "0.3"
 serde_yaml_ng = "0.10"
 anstream = "1.0"
 saphyr-parser = "0.1"
+
+# The system's certificate store, so a root certificate the user installed (a company
+# proxy's, for example) is trusted. rustls-native-certs does not read Android's store,
+# so there it would only add code.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
 
 [dev-dependencies]
 assert_cmd = "2"
