@@ -746,3 +746,278 @@ fn a_git_archive_is_checked_against_the_commit() {
     );
     assert!(r.unexpected.is_empty(), "{r:?}");
 }
+
+// Fetching through the GitHub API, against a mock server.
+
+/// A commit id for the tests.
+pub(crate) const SHA: &str = "5e7a1c0de5e7a1c0de5e7a1c0de5e7a1c0de5e7a";
+
+/// GitHub's archive of a commit with these files: the commit in a pax global header,
+/// then everything under `acme-app-5e7a1c0/`.
+pub(crate) fn github_archive(commit: &str, files: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut b = tar::Builder::new(Vec::new());
+    let comment = pax_record("comment", commit.as_bytes());
+    raw(
+        &mut b,
+        tar::EntryType::XGlobalHeader,
+        b"pax_global_header",
+        &comment,
+    );
+    raw(&mut b, tar::EntryType::Directory, b"acme-app-5e7a1c0/", b"");
+    for (path, data) in files {
+        let name = format!("acme-app-5e7a1c0/{path}");
+        raw(&mut b, tar::EntryType::Regular, name.as_bytes(), data);
+    }
+    gz(&b.into_inner().unwrap())
+}
+
+/// The tree GitHub lists for a commit with these files.
+pub(crate) fn tree_json(files: &[(&str, &[u8])], truncated: bool) -> String {
+    let entries: Vec<serde_json::Value> = files
+        .iter()
+        .map(|(path, data)| {
+            serde_json::json!({
+                "path": path, "mode": "100644", "type": "blob",
+                "sha": git_blob_sha1(data), "size": data.len(),
+            })
+        })
+        .collect();
+    serde_json::json!({ "sha": SHA, "tree": entries, "truncated": truncated }).to_string()
+}
+
+/// Serve `acme/app` at [`SHA`]: its archive (through a redirect, as GitHub does), its
+/// tree and the given blobs. `None` for the archive: an empty repository.
+pub(crate) async fn serve_repo(
+    archive: Option<Vec<u8>>,
+    tree: String,
+    blobs: Vec<Vec<u8>>,
+) -> (String, crate::github::mock::Log) {
+    let blobs = blobs
+        .into_iter()
+        .map(|data| (git_blob_sha1(&data), data))
+        .collect();
+    serve_repo_with(archive, tree, blobs).await
+}
+
+/// [`serve_repo`], with blobs by the id they are served under.
+async fn serve_repo_with(
+    archive: Option<Vec<u8>>,
+    tree: String,
+    blobs: BTreeMap<String, Vec<u8>>,
+) -> (String, crate::github::mock::Log) {
+    crate::github::mock::serve_bytes(move |line| {
+        let json = |status, body: &str| (status, vec![], body.as_bytes().to_vec());
+        let path = line.trim_start_matches("GET ");
+        if path == "/repos/acme/app" {
+            json(
+                200,
+                r#"{"full_name":"acme/app","clone_url":"x","default_branch":"main"}"#,
+            )
+        } else if path == "/repos/acme/app/commits/heads/main" {
+            match archive {
+                Some(_) => json(200, SHA),
+                None => json(409, r#"{"message":"Git Repository is empty."}"#),
+            }
+        } else if path.starts_with("/repos/acme/app/tarball/") {
+            let to = format!("/codeload/acme/app/legacy.tar.gz/{SHA}");
+            (302, vec![("location", to)], Vec::new())
+        } else if path.starts_with("/codeload/") {
+            (200, vec![], archive.clone().unwrap_or_default())
+        } else if path.starts_with(&format!("/repos/acme/app/git/trees/{SHA}")) {
+            json(200, &tree)
+        } else if let Some(blob) = path.strip_prefix("/repos/acme/app/git/blobs/")
+            && let Some(data) = blobs.get(blob)
+        {
+            (200, vec![], data.clone())
+        } else {
+            json(404, r#"{"message":"Not Found"}"#)
+        }
+    })
+    .await
+}
+
+fn fetch_options() -> FetchOptions {
+    FetchOptions {
+        limits: Limits::default(),
+        max_file_size: 1000,
+        exclude: Vec::new(),
+        write_all: false,
+    }
+}
+
+async fn fetch_app(api: &str, opts: &FetchOptions) -> crate::Result<Snapshot> {
+    let gh = GitHub::new(api, None).unwrap();
+    fetch(&gh, "acme", "app", None, opts).await
+}
+
+#[tokio::test]
+async fn fetching_checks_every_file_against_the_commit() {
+    let workflow: &[u8] = b"on: pull_request_target\n";
+    let big = vec![b'x'; 2000];
+    // The commit's files...
+    let commit: Vec<(&str, &[u8])> = vec![
+        (
+            ".gitattributes",
+            b"/.github/ export-ignore\nsubst.txt export-subst\n",
+        ),
+        (".github/workflows/ci.yml", workflow),
+        ("subst.txt", b"$Format:%H$\n"),
+        ("app.py", b"print(1)\n"),
+        ("big.bin", &big),
+        ("node_modules/x/index.js", b"x\n"),
+    ];
+    // ...and the archive GitHub makes of them: .github left out, subst.txt changed,
+    // plus a file that is not in the commit.
+    let archived: Vec<(&str, &[u8])> = vec![
+        (".gitattributes", commit[0].1),
+        ("subst.txt", b"5e7a1c0de\n"),
+        ("app.py", b"print(1)\n"),
+        ("big.bin", &big),
+        ("node_modules/x/index.js", b"x\n"),
+        ("extra.txt", b"not in the commit\n"),
+    ];
+    let (api, log) = serve_repo(
+        Some(github_archive(SHA, &archived)),
+        tree_json(&commit, false),
+        vec![workflow.to_vec(), commit[2].1.to_vec()],
+    )
+    .await;
+    let snapshot = fetch_app(&api, &fetch_options()).await.unwrap();
+    assert_eq!(snapshot.commit.as_deref(), Some(SHA));
+    assert_eq!(snapshot.incomplete, None);
+    let root = snapshot.path.clone();
+    assert_eq!(
+        listing(&root),
+        vec![
+            ".gitattributes",
+            ".github/workflows/ci.yml",
+            "app.py",
+            "subst.txt"
+        ],
+        "node_modules is excluded, big.bin too large, extra.txt removed"
+    );
+    assert_eq!(
+        fs::read(root.join(".github/workflows/ci.yml")).unwrap(),
+        workflow
+    );
+    assert_eq!(fs::read(root.join("subst.txt")).unwrap(), b"$Format:%H$\n");
+    assert_eq!(snapshot.too_large, vec![("big.bin".to_string(), 2000)]);
+    assert_eq!(snapshot.skipped.len(), 1, "{:?}", snapshot.skipped);
+    assert_eq!(snapshot.skipped[0].0, "extra.txt");
+    assert!(
+        !snapshot._dir.path().join("archive.tar.gz").exists(),
+        "the archive is deleted"
+    );
+    let log = log.lock().unwrap().clone();
+    assert_eq!(
+        log.iter().filter(|l| l.contains("/git/blobs/")).count(),
+        2,
+        "one request per file to fetch: {log:?}"
+    );
+
+    // Everything is deleted with the snapshot.
+    let dir = snapshot._dir.path().to_path_buf();
+    drop(snapshot);
+    assert!(!dir.exists());
+
+    // With dependency checks, every file is written: osv-scanner reads lockfiles of any
+    // size, anywhere.
+    let all = FetchOptions {
+        write_all: true,
+        ..fetch_options()
+    };
+    let snapshot = fetch_app(&api, &all).await.unwrap();
+    assert!(snapshot.path.join("node_modules/x/index.js").exists());
+    assert!(snapshot.path.join("big.bin").exists());
+    assert!(snapshot.too_large.is_empty());
+}
+
+#[tokio::test]
+async fn what_cannot_be_confirmed_is_reported() {
+    let files: Vec<(&str, &[u8])> = vec![("a.txt", b"a\n"), ("b.txt", b"b\n"), ("c.txt", b"c\n")];
+    let archive = github_archive(SHA, &files[..1]);
+
+    // A truncated tree.
+    let (api, _) = serve_repo(Some(archive.clone()), tree_json(&files[..1], true), vec![]).await;
+    let snapshot = fetch_app(&api, &fetch_options()).await.unwrap();
+    let why = snapshot.incomplete.unwrap();
+    assert!(
+        why.starts_with(UNCONFIRMED) && why.contains("truncated"),
+        "{why}"
+    );
+
+    // More files left out of the archive than are fetched one by one.
+    let blobs = vec![b"b\n".to_vec(), b"c\n".to_vec()];
+    let (api, log) = serve_repo(Some(archive.clone()), tree_json(&files, false), blobs).await;
+    let mut opts = fetch_options();
+    opts.limits.max_backfill_files = 1;
+    let snapshot = fetch_app(&api, &opts).await.unwrap();
+    let why = snapshot.incomplete.unwrap();
+    assert!(
+        why.starts_with(UNCONFIRMED) && why.contains("1 more files"),
+        "{why}"
+    );
+    assert_eq!(snapshot.skipped.len(), 1, "the file not fetched is listed");
+    let fetched = log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|l| l.contains("/git/blobs/"))
+        .count();
+    assert_eq!(fetched, 1);
+
+    // An archive of another commit, or of no named commit.
+    let other = github_archive(&"0".repeat(40), &files[..1]);
+    let (api, _) = serve_repo(Some(other), tree_json(&files[..1], false), vec![]).await;
+    let err = fetch_app(&api, &fetch_options())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains(UNCONFIRMED) && err.contains("not 5e7a"),
+        "{err}"
+    );
+    let unnamed = github_archive("not a commit id", &files[..1]);
+    let (api, _) = serve_repo(Some(unnamed), tree_json(&files[..1], false), vec![]).await;
+    let err = fetch_app(&api, &fetch_options())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("does not name its commit"), "{err}");
+
+    // A download cut short.
+    let mut cut = archive.clone();
+    cut.truncate(cut.len() - 10);
+    let (api, _) = serve_repo(Some(cut), tree_json(&files[..1], false), vec![]).await;
+    let err = fetch_app(&api, &fetch_options())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains(UNCONFIRMED), "{err}");
+
+    // A file whose content does not match the id it was fetched by.
+    let tampered = BTreeMap::from([(git_blob_sha1(b"b\n"), b"tampered\n".to_vec())]);
+    let (api, _) = serve_repo_with(
+        Some(archive.clone()),
+        tree_json(&files[..2], false),
+        tampered,
+    )
+    .await;
+    let err = fetch_app(&api, &fetch_options())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("does not match its id"), "{err}");
+}
+
+#[tokio::test]
+async fn an_empty_repository_has_no_files_and_no_commit() {
+    let (api, log) = serve_repo(None, tree_json(&[], false), vec![]).await;
+    let snapshot = fetch_app(&api, &fetch_options()).await.unwrap();
+    assert_eq!(snapshot.commit, None);
+    assert!(listing(&snapshot.path).is_empty());
+    assert!(
+        !log.lock().unwrap().iter().any(|l| l.contains("tarball")),
+        "nothing to download"
+    );
+}

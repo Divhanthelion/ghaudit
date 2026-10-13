@@ -37,6 +37,8 @@ pub struct GitHubConfig {
     pub concurrency: usize,
     /// Give up on one repository (clone and analysis) after this many seconds.
     pub repo_timeout_secs: u64,
+    /// How repositories are fetched for `owner/repo`, org, user and search scans.
+    pub fetch: FetchMethod,
 }
 
 impl Default for GitHubConfig {
@@ -49,6 +51,29 @@ impl Default for GitHubConfig {
             include_archived: false,
             concurrency: 4,
             repo_timeout_secs: 1800,
+            fetch: FetchMethod::default(),
+        }
+    }
+}
+
+/// How a remote repository's files are fetched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FetchMethod {
+    /// `git clone`: depth 1, or every commit for the history search. Needs git.
+    Git,
+    /// GitHub's archive of the default branch's commit, checked file by file against
+    /// the commit's tree (see [`crate::snapshot`]). Needs no git, but has no history.
+    /// The default on Android, which has no git.
+    Archive,
+}
+
+impl Default for FetchMethod {
+    fn default() -> Self {
+        if cfg!(target_os = "android") {
+            FetchMethod::Archive
+        } else {
+            FetchMethod::Git
         }
     }
 }
@@ -322,6 +347,21 @@ mod tests {
             serde_json::to_value(Config::default()).unwrap(),
             "ghaudit.example.toml must show the real defaults"
         );
+    }
+
+    #[test]
+    fn fetch_methods_parse_from_toml() {
+        let c: Config = toml::from_str("[github]\nfetch = \"archive\"\n").unwrap();
+        assert_eq!(c.github.fetch, FetchMethod::Archive);
+        let c: Config = toml::from_str("[github]\nfetch = \"git\"\n").unwrap();
+        assert_eq!(c.github.fetch, FetchMethod::Git);
+        assert!(toml::from_str::<Config>("[github]\nfetch = \"zip\"\n").is_err());
+        let expected = if cfg!(target_os = "android") {
+            FetchMethod::Archive
+        } else {
+            FetchMethod::Git
+        };
+        assert_eq!(Config::default().github.fetch, expected);
     }
 
     #[test]

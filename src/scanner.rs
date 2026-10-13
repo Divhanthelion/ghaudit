@@ -24,7 +24,7 @@ use crate::analyzer::sca::OsvScanner;
 use crate::analyzer::secrets::{self, Masker, SecretDetector};
 use crate::analyzer::settings::{self, Audit};
 use crate::analyzer::{agents, history, unicode, workflows};
-use crate::config::Config;
+use crate::config::{Config, FetchMethod};
 use crate::discovery::{self, DiscoveryOptions, FileText, PathFilter, SourceFile};
 use crate::error::{Error, Result};
 use crate::git;
@@ -35,6 +35,7 @@ use crate::model::{
 };
 use crate::progress::{self, Progress, ProgressSink};
 use crate::report::terminal_safe;
+use crate::snapshot;
 use crate::target::{self, Target};
 use futures::StreamExt;
 use rayon::prelude::*;
@@ -69,6 +70,70 @@ struct LocalEngines {
 
 /// Why the history search does not run on a device without git.
 pub const HISTORY_NEEDS_GIT: &str = "needs git, which this device doesn't have";
+
+/// Why the history search does not run on a repository fetched as an archive.
+pub const HISTORY_NEEDS_CLONE: &str =
+    "needs the full git history; a downloaded archive has only the latest files";
+
+/// Where a scanned directory's files came from, as far as the analyzers care.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source<'a> {
+    /// A local directory or a git clone.
+    Tree,
+    /// GitHub's archive of a commit. `unconfirmed` says why its files could not all be
+    /// checked against the commit: the file analyzers then fail with it.
+    Archive { unconfirmed: Option<&'a str> },
+}
+
+impl Source<'_> {
+    fn is_archive(self) -> bool {
+        matches!(self, Source::Archive { .. })
+    }
+
+    /// `status`, failed instead of completed when the files are unconfirmed: results
+    /// over files that may be incomplete must not pass for a full scan.
+    fn vouch(self, status: AnalyzerStatus) -> AnalyzerStatus {
+        match self {
+            Source::Archive {
+                unconfirmed: Some(why),
+            } if status.state == AnalyzerState::Completed => {
+                AnalyzerStatus::failed(&status.analyzer, why)
+            }
+            _ => status,
+        }
+    }
+}
+
+/// A remote repository's files on disk, deleted when this is dropped.
+enum Fetched {
+    Clone(git::Checkout),
+    Archive(snapshot::Snapshot),
+}
+
+impl Fetched {
+    fn path(&self) -> &Path {
+        match self {
+            Fetched::Clone(c) => &c.path,
+            Fetched::Archive(s) => &s.path,
+        }
+    }
+
+    fn commit(&self) -> Option<String> {
+        match self {
+            Fetched::Clone(c) => c.commit.clone(),
+            Fetched::Archive(s) => s.commit.clone(),
+        }
+    }
+
+    fn source(&self) -> Source<'_> {
+        match self {
+            Fetched::Clone(_) => Source::Tree,
+            Fetched::Archive(s) => Source::Archive {
+                unconfirmed: s.incomplete.as_deref(),
+            },
+        }
+    }
+}
 
 pub struct Scanner {
     config: Config,
@@ -269,7 +334,7 @@ impl Scanner {
                 let trusted = self.config.analysis.trust_repo.resolve(true);
                 let repo = self.github_repo_of(path).await;
                 let (dir, (status, audit)) = tokio::join!(
-                    self.scan_dir(path, trusted, None),
+                    self.scan_dir(path, trusted, None, Source::Tree),
                     self.audit_settings(
                         repo.as_deref(),
                         "this directory has no origin remote on the configured GitHub host",
@@ -282,7 +347,7 @@ impl Scanner {
             }
             Target::Repo { owner, name } => {
                 let url = self.github.clone_url(owner, name);
-                let scan = self.scan_remote(&url, &format!("{owner}/{name}")).await;
+                let scan = self.scan_remote(owner, name, &url, None).await;
                 if let Some(e) = scan.error {
                     return Err(e);
                 }
@@ -374,7 +439,10 @@ impl Scanner {
                         name: repo.full_name.clone(),
                     });
                     let started = Instant::now();
-                    let result = self.scan_remote(&repo.clone_url, &repo.full_name).await;
+                    let (owner, name) = repo.full_name.split_once('/').unwrap_or_default();
+                    let result = self
+                        .scan_remote(owner, name, &repo.clone_url, repo.default_branch.as_deref())
+                        .await;
                     let n = done.fetch_add(1, Ordering::Relaxed) + 1;
                     self.emit(|| Progress::RepositoryFinished {
                         index: i,
@@ -455,25 +523,33 @@ impl Scanner {
         }
     }
 
-    /// Clone, scan and audit the settings of one repository (`full_name` is
-    /// `owner/name`), within `github.repo_timeout_secs`.
-    async fn scan_remote(&self, clone_url: &str, full_name: &str) -> RemoteScan {
+    /// Fetch (clone or download, per `github.fetch`), scan and audit the settings of
+    /// one repository, within `github.repo_timeout_secs`. `branch` is its default
+    /// branch, when a listing gave it.
+    async fn scan_remote(
+        &self,
+        owner: &str,
+        name: &str,
+        clone_url: &str,
+        branch: Option<&str>,
+    ) -> RemoteScan {
+        let full_name = &format!("{owner}/{name}");
         let limit = Duration::from_secs(self.config.github.repo_timeout_secs);
         let trusted = self.config.analysis.trust_repo.resolve(false);
         let work = async {
             let scan = async {
-                let checkout = git::clone(
-                    clone_url,
-                    self.config.github.token.as_deref(),
-                    self.config.analysis.history,
-                )
-                .await
-                .map_err(|e| (format!("could not download the repository: {e}"), e))?;
-                let dir = self
-                    .scan_dir(&checkout.path, trusted, Some(full_name))
+                let fetched = self
+                    .fetch(owner, name, clone_url, branch)
+                    .await
+                    .map_err(|e| (format!("could not download the repository: {e}"), e))?;
+                let mut dir = self
+                    .scan_dir(fetched.path(), trusted, Some(full_name), fetched.source())
                     .await
                     .map_err(|e| (e.to_string(), e))?;
-                Ok::<_, (String, Error)>((checkout.commit.clone(), dir))
+                if let Fetched::Archive(snapshot) = &fetched {
+                    self.add_unwritten(&mut dir, snapshot);
+                }
+                Ok::<_, (String, Error)>((fetched.commit(), dir))
             };
             let (scan, (status, audit)) = tokio::join!(
                 scan,
@@ -508,15 +584,66 @@ impl Scanner {
             })
     }
 
+    /// Get a repository's files the configured way.
+    async fn fetch(
+        &self,
+        owner: &str,
+        name: &str,
+        clone_url: &str,
+        branch: Option<&str>,
+    ) -> Result<Fetched> {
+        match self.config.github.fetch {
+            FetchMethod::Git => git::clone(
+                clone_url,
+                self.config.github.token.as_deref(),
+                self.config.analysis.history,
+            )
+            .await
+            .map(Fetched::Clone),
+            FetchMethod::Archive => {
+                let a = &self.config.analysis;
+                let opts = snapshot::FetchOptions {
+                    limits: snapshot::Limits::default(),
+                    max_file_size: a.max_file_size,
+                    exclude: a.exclude.clone(),
+                    // osv-scanner reads lockfiles of any size, in any directory.
+                    write_all: self.sca.is_some(),
+                };
+                snapshot::fetch(&self.github, owner, name, branch, &opts)
+                    .await
+                    .map(Fetched::Archive)
+            }
+        }
+    }
+
+    /// List the files of a downloaded commit that are not on disk, as discovery lists
+    /// the files it does not read.
+    fn add_unwritten(&self, dir: &mut DirScan, snapshot: &snapshot::Snapshot) {
+        let max_file_size = self.config.analysis.max_file_size;
+        let skipped = snapshot.skipped.iter().map(|(path, why)| SkippedFile {
+            repository: None,
+            path: path.clone(),
+            reason: why.clone(),
+        });
+        let too_large = snapshot.too_large.iter().map(|(path, size)| SkippedFile {
+            repository: None,
+            path: path.clone(),
+            reason: format!("{size} bytes, over max_file_size ({max_file_size})"),
+        });
+        dir.skipped.extend(skipped.chain(too_large));
+        dir.skipped.sort_by(|a, b| a.path.cmp(&b.path));
+    }
+
     /// Results for a repository whose files could not be scanned: every file analyzer
     /// that would have run failed with `why`; the others are skipped as usual. Each
     /// status is reported as progress, as `scan_dir` would have.
     fn unscanned(&self, why: &str, label: Option<&str>) -> DirScan {
+        let archive = self.config.github.fetch == FetchMethod::Archive;
         let analyzers = ANALYZERS
             .iter()
             .filter(|name| **name != "settings")
             .map(|name| {
-                self.off_status(name)
+                self.off_status(name, archive)
                     .unwrap_or_else(|| AnalyzerStatus::failed(name, why))
             })
             .collect::<Vec<_>>();
@@ -530,12 +657,13 @@ impl Scanner {
     }
 
     /// The status of an analyzer that does not run in this scan, with the reason; `None`
-    /// for one that runs.
-    fn off_status(&self, analyzer: &str) -> Option<AnalyzerStatus> {
+    /// for one that runs. `archive`: the files are a downloaded archive.
+    fn off_status(&self, analyzer: &str, archive: bool) -> Option<AnalyzerStatus> {
         let a = &self.config.analysis;
         let off = |why: &str| Some(AnalyzerStatus::skipped(analyzer, why));
         match analyzer {
             "history" if !a.history => off("disabled (enable with --history)"),
+            "history" if archive => off(HISTORY_NEEDS_CLONE),
             "history" if !self.tools.git => off(HISTORY_NEEDS_GIT),
             "ai" if !a.ai => off("disabled (enable with --ai)"),
             _ if !self.enabled(analyzer) => off(self.disabled_reason(analyzer)),
@@ -634,8 +762,15 @@ impl Scanner {
 
     /// Scan one directory with every enabled analyzer. `trusted` decides whether the
     /// tree's own ignore files, suppressions and osv-scanner config are honored;
-    /// `label` names the scanned repository in progress events.
-    async fn scan_dir(&self, root: &Path, trusted: bool, label: Option<&str>) -> Result<DirScan> {
+    /// `label` names the scanned repository in progress events; `source` says where
+    /// the files came from.
+    async fn scan_dir(
+        &self,
+        root: &Path,
+        trusted: bool,
+        label: Option<&str>,
+        source: Source<'_>,
+    ) -> Result<DirScan> {
         let cancel = Arc::new(AtomicBool::new(false));
         let _cancel_on_drop = CancelOnDrop(Arc::clone(&cancel));
         let max_file_size = self.config.analysis.max_file_size;
@@ -667,7 +802,7 @@ impl Scanner {
             async move {
                 let local = task.await;
                 if local.is_ok() {
-                    for status in self.local_statuses() {
+                    for status in self.local_statuses(source) {
                         self.analyzer_finished(label, &status);
                     }
                 }
@@ -688,6 +823,7 @@ impl Scanner {
                 }
                 Some(Err(e)) => AnalyzerStatus::failed("sca", e.clone()),
             };
+            let status = source.vouch(status);
             self.analyzer_finished(label, &status);
             (result, status)
         };
@@ -696,7 +832,7 @@ impl Scanner {
             let cancel = Arc::clone(&cancel);
             let root = root.to_path_buf();
             let exclude = self.config.analysis.exclude.clone();
-            let off = self.off_status("history");
+            let off = self.off_status("history", source.is_archive());
             async move {
                 let (result, status) = match off {
                     Some(off) => (None, off),
@@ -753,7 +889,7 @@ impl Scanner {
                 }),
         );
         dir.skipped.sort_by(|a, b| a.path.cmp(&b.path));
-        let [sast, secrets, workflows, agents] = self.local_statuses();
+        let [sast, secrets, workflows, agents] = self.local_statuses(source);
         dir.analyzers.push(sast);
         dir.analyzers.push(secrets);
         match history {
@@ -780,7 +916,7 @@ impl Scanner {
         dir.analyzers.push(agents);
         let ai = match &self.ai {
             None => AnalyzerStatus::skipped("ai", "disabled (enable with --ai)"),
-            Some(ai) => self.run_ai(ai, &files, trusted, &mut dir).await,
+            Some(ai) => source.vouch(self.run_ai(ai, &files, trusted, &mut dir).await),
         };
         self.analyzer_finished(label, &ai);
         dir.analyzers.push(ai);
@@ -789,13 +925,14 @@ impl Scanner {
     }
 
     /// Statuses of the analyzers that run in the per-file pass.
-    fn local_statuses(&self) -> [AnalyzerStatus; 4] {
+    fn local_statuses(&self, source: Source) -> [AnalyzerStatus; 4] {
         [
             status("sast", self.local.sast.is_some()),
             status("secrets", self.local.secrets.is_some()),
             status("workflows", self.local.workflows),
             status("agents", self.local.agents),
         ]
+        .map(|s| source.vouch(s))
     }
 
     async fn run_ai(
@@ -1585,6 +1722,132 @@ mod tests {
         assert!(!report.is_complete());
     }
 
+    /// The promise that a repository cannot hide files: a workflow its `.gitattributes`
+    /// leaves out of GitHub's archive is still audited.
+    #[tokio::test]
+    async fn archive_scans_see_files_left_out_of_the_archive() {
+        use crate::snapshot::tests::{SHA, github_archive, serve_repo, tree_json};
+        let workflow: &[u8] = b"on: pull_request_target\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n        with:\n          ref: ${{ github.event.pull_request.head.sha }}\n      - run: make test\n";
+        let attributes: &[u8] = b"/.github/ export-ignore\n";
+        let commit: Vec<(&str, &[u8])> = vec![
+            (".gitattributes", attributes),
+            (".github/workflows/ci.yml", workflow),
+            ("app.py", b"import os\nos.system(cmd)\n"),
+        ];
+        let archived: Vec<(&str, &[u8])> = vec![
+            (".gitattributes", attributes),
+            ("app.py", b"import os\nos.system(cmd)\n"),
+        ];
+        let archive = github_archive(SHA, &archived);
+        let config = |api: String| {
+            let mut config = Config::default();
+            config.github.api_url = api;
+            config.github.fetch = FetchMethod::Archive;
+            config.analysis.history = true;
+            config.analysis.sca = false;
+            config
+        };
+        let target = Target::Repo {
+            owner: "acme".into(),
+            name: "app".into(),
+        };
+        let (api, _) = serve_repo(
+            Some(archive.clone()),
+            tree_json(&commit, false),
+            vec![workflow.to_vec()],
+        )
+        .await;
+        let report = Scanner::new(config(api.clone()))
+            .unwrap()
+            .scan(&target)
+            .await
+            .unwrap();
+        assert_eq!(report.commit.as_deref(), Some(SHA));
+        let found = |report: &ScanReport, rule: &str, path: &str| {
+            report
+                .findings
+                .iter()
+                .any(|f| f.rule_id == rule && f.location.path == path)
+        };
+        assert!(
+            found(
+                &report,
+                "gha/untrusted-checkout",
+                ".github/workflows/ci.yml"
+            ),
+            "{:#?}",
+            report.findings
+        );
+        assert!(report.findings.iter().any(|f| f.location.path == "app.py"));
+        let history = report.analyzers.iter().find(|a| a.analyzer == "history");
+        assert_eq!(
+            history,
+            Some(&AnalyzerStatus::skipped("history", HISTORY_NEEDS_CLONE))
+        );
+        assert!(report.is_complete(), "{:?}", report.failures());
+
+        // A multi-repository scan uses the listing's default branch.
+        let (api, log) = serve_repo(
+            Some(archive.clone()),
+            tree_json(&commit, false),
+            vec![workflow.to_vec()],
+        )
+        .await;
+        let scanner = Scanner::new(config(api)).unwrap();
+        let mut report = ScanReport::new("user:acme");
+        let repo = RepoInfo {
+            full_name: "acme/app".into(),
+            clone_url: "unused".into(),
+            archived: false,
+            fork: false,
+            private: false,
+            default_branch: Some("main".into()),
+        };
+        scanner.scan_many(&mut report, vec![repo]).await;
+        assert_eq!(report.repositories[0].commit.as_deref(), Some(SHA));
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.rule_id == "gha/untrusted-checkout")
+        );
+        let log = log.lock().unwrap().clone();
+        assert!(
+            !log.iter().any(|l| l.starts_with("GET /repos/acme/app ")),
+            "{log:?}"
+        );
+
+        // Files that cannot all be checked: what was found is kept, but the file
+        // analyzers fail, so the report does not pass for a complete scan.
+        let (api, _) = serve_repo(
+            Some(archive),
+            tree_json(&commit, true),
+            vec![workflow.to_vec()],
+        )
+        .await;
+        let report = Scanner::new(config(api))
+            .unwrap()
+            .scan(&target)
+            .await
+            .unwrap();
+        assert!(found(
+            &report,
+            "gha/untrusted-checkout",
+            ".github/workflows/ci.yml"
+        ));
+        for name in ["sast", "secrets", "workflows", "agents"] {
+            let status = report
+                .analyzers
+                .iter()
+                .find(|a| a.analyzer == name)
+                .unwrap();
+            assert_eq!(status.state, AnalyzerState::Failed, "{status:?}");
+            let detail = status.detail.as_deref().unwrap_or_default();
+            assert!(detail.starts_with(snapshot::UNCONFIRMED), "{detail}");
+        }
+        assert!(!report.is_complete());
+    }
+
     #[test]
     fn programs_are_found_on_path_without_running_them() {
         let dir = tempfile::tempdir().unwrap();
@@ -1642,7 +1905,7 @@ mod tests {
         assert_eq!(scanner.disabled_reason("sast"), "disabled");
         let mut on = Config::default();
         on.sca.unavailable = Some(why.into());
-        assert_eq!(Scanner::new(on).unwrap().off_status("sca"), None);
+        assert_eq!(Scanner::new(on).unwrap().off_status("sca", false), None);
         let mut report = ScanReport::new("user:acme");
         scanner.scan_many(&mut report, Vec::new()).await;
         let sca = report.analyzers.iter().find(|a| a.analyzer == "sca");

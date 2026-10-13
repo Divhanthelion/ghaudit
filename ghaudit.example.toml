@@ -40,6 +40,10 @@ include_forks = false
 include_archived = false
 concurrency = 4     # repositories cloned and scanned at once
 repo_timeout_secs = 1800   # give up on one repository after this long
+# How repositories are fetched: "git" (git clone; the default) or "archive" (GitHub's
+# archive of the commit, checked file by file against the commit; needs no git, but
+# --history cannot run). "archive" is the default on Android.
+# fetch = "git"
 
 [ai]
 url = "http://localhost:1234/v1/chat/completions"   # any OpenAI-compatible endpoint
