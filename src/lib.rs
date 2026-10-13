@@ -4,6 +4,8 @@
 //!
 //! - [`target`]: what to scan (a directory, `owner/repo`, an org, a search query)
 //! - [`github`] and [`git`]: list repositories and shallow-clone them
+//! - [`snapshot`]: or, without git, download a commit's archive and check it against
+//!   the commit's tree
 //! - [`discovery`]: choose the files to analyze
 //! - [`analyzer`]: the analyzers (code rules, secrets, dependencies via osv-scanner, optional LLM)
 //! - [`scanner`]: runs the analyzers and assembles a [`model::ScanReport`], reporting
@@ -23,6 +25,7 @@ mod process;
 pub mod progress;
 pub mod report;
 pub mod scanner;
+pub mod snapshot;
 pub mod target;
 
 pub use config::Config;

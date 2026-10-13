@@ -33,6 +33,12 @@ repositories) with 0.3.0.
   one. Those findings now say so and have medium confidence.
 - **`js/html-injection`**: markup read from an ALL_CAPS constant (`ICONS[name]`,
   `PATHS.home`) is no longer reported.
+- **Multi-repository scans** (`org`, `user`, `search`): when a repository could not be
+  cloned, the report's analyzer summary still said "completed" for the file analyzers,
+  and the repository's settings audit was thrown away. Its file analyzers are now
+  `failed` ("could not download the repository: ..."), the summary says "failed in 1 of
+  N repositories", and its settings checks and findings are kept. A repository that
+  times out counts as failed for every analyzer. Single-repository scans are unchanged.
 
 ### New
 
@@ -56,6 +62,18 @@ repositories) with 0.3.0.
 - **`agent/auto-approve`** also reports, at low severity, Claude Code allow rules that
   install or run any package (`Bash(npm install:*)`, `Bash(npx:*)`, `Bash(pip install *)`,
   ...): install scripts run without asking.
+- **Scanning without git**: with `fetch = "archive"` under `[github]` (the default on
+  Android), remote repositories are downloaded as GitHub's archive of the default
+  branch's commit instead of cloned. Since `.gitattributes` can leave files out of an
+  archive or change them, every file is checked against the commit's tree, and missing
+  or changed files are fetched one by one (up to 300 files, 20 MiB); when that is not
+  enough, or the tree is truncated, the file analyzers fail with "could not confirm the
+  download is complete". The archive is extracted by ghaudit's own extractor: no
+  symlinks, hard links or special files, nothing outside its folder, and capped sizes.
+  The history search is skipped in this mode. For front ends, `scanner::Tools` says
+  whether git and osv-scanner are installed, `sca.unavailable` gives the reason shown
+  for dependency checks that cannot run, and `git::remove_stale_work_dirs` cleans up
+  temporary folders a killed scan left behind.
 
 ### Changed
 
