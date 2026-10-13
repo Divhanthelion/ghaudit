@@ -800,13 +800,26 @@ impl Scanner {
                 analyze_files(&engines, &files, trusted, &cancel)
             });
             async move {
-                let local = task.await;
-                if local.is_ok() {
-                    for status in self.local_statuses(source) {
-                        self.analyzer_finished(label, &status);
+                // A crash of the per-file pass fails its analyzers but keeps what the
+                // others found, and every analyzer still reports exactly once.
+                let (local, statuses) = match task.await {
+                    Ok(local) => (local, self.local_statuses(source)),
+                    Err(e) => {
+                        let why = format!("analysis crashed: {e}");
+                        let failed = self.local_statuses(source).map(|s| {
+                            if s.state == AnalyzerState::Completed {
+                                AnalyzerStatus::failed(&s.analyzer, &why)
+                            } else {
+                                s
+                            }
+                        });
+                        (LocalResults::default(), failed)
                     }
+                };
+                for status in &statuses {
+                    self.analyzer_finished(label, status);
                 }
-                local
+                (local, statuses)
             }
         };
         let sca = async {
@@ -865,9 +878,8 @@ impl Scanner {
                 (result, status)
             }
         };
-        let (local, (sca, sca_status), (history, history_status)) =
+        let ((local, local_statuses), (sca, sca_status), (history, history_status)) =
             tokio::join!(local, sca, history);
-        let local = local.map_err(|e| Error::Config(format!("analysis crashed: {e}")))?;
 
         let mut dir = DirScan {
             findings: local.findings,
@@ -889,7 +901,7 @@ impl Scanner {
                 }),
         );
         dir.skipped.sort_by(|a, b| a.path.cmp(&b.path));
-        let [sast, secrets, workflows, agents] = self.local_statuses(source);
+        let [sast, secrets, workflows, agents] = local_statuses;
         dir.analyzers.push(sast);
         dir.analyzers.push(secrets);
         match history {
