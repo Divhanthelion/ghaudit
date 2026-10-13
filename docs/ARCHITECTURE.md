@@ -527,16 +527,19 @@ repositories, so a front end must treat them as untrusted text.
 ## The desktop app (`app/`, `ui/`)
 
 The app is a Tauri 2 window showing `ui/`, with the ghaudit library linked into the
-Rust side. The page is display code: it renders reports and calls the app's commands.
-Anything with side effects (file dialogs, reading files, opening links) happens in Rust.
+Rust side, on desktops and on Android phones. The page is display code: it renders
+reports and calls the app's commands. Anything with side effects (file dialogs, reading
+files, opening links, the clipboard) happens in Rust.
 
 | Command | What it does |
 |---|---|
 | `catalog` | App and scanner versions, and every rule's name and severity (settings checks are named only there) |
 | `open_report` | Shows the system's open-file dialog and reads the chosen report (UTF-8 or UTF-16, up to 64 MB, `tool` must be `ghaudit`); returns it with its file name, not its path |
 | `open_link` | Opens an https link to github.com or osv.dev in the browser; refuses anything else (other hosts, ports, credentials in the URL, other schemes) |
-| `environment` | What scans can use: where the GitHub token comes from and whose it is (never the token), whether a token is saved in the keychain, the GitHub CLI, osv-scanner and git with their versions |
-| `save_token`, `forget_token` | Check a pasted token with `GET /user` and keep it in the system keychain; remove it |
+| `environment` | What scans can use: where the GitHub token comes from and whose it is (never the token), whether a token is saved in the keychain, the GitHub CLI, osv-scanner and git with their versions, the platform, whether it is a phone, and `capabilities` (folders, history, dependencies, how repositories are downloaded, whether the token is pasted from the clipboard) |
+| `save_token`, `forget_token` | Check a token typed into the desktop's password field with `GET /user` and keep it in the system keychain; remove it |
+| `open_token_page` | Opens GitHub's new fine-grained token page, filled in with read-only permissions through its URL parameters (`token::NEW_TOKEN_PAGE`) |
+| `paste_token` | Phones: reads the clipboard in Rust, checks the token with GitHub, keeps it in the keystore and clears the clipboard, so the token never passes through the page |
 | `pick_folder` | Shows the folder dialog and remembers the choice: the only folder a scan can target |
 | `start_scan`, `cancel_scan` | Run a scan, streaming `Progress` events through a Tauri channel, and resolve with the report or as cancelled; stop it |
 | `compare_with`, `clear_comparison` | Ask for an earlier report and return the one on screen with `ScanReport::apply_baseline` applied (as `--baseline`), refusing the same report or a later one; forget it |
@@ -570,6 +573,31 @@ winget's install folder, since a running app keeps the `PATH` it started with; g
 the GitHub CLI on `PATH` (and the CLI's default install folders on Windows). They run
 without a console window.
 
+### On Android
+
+The same crate is the Android app: its library is also built as a `cdylib` that Android
+loads (`tauri::mobile_entry_point` on `run`), and `app/gen/android` is the Gradle project
+`cargo tauri android init` generated, with the changes KJV-Interlinear made to it: no
+Android TV entries, backup and device-transfer rules that leave out shared preferences
+(where the token lives, encrypted with a Keystore key that never leaves the phone), a
+`MainActivity` that hands the page the system-bar and keyboard insets, and an adaptive
+launcher icon. What differs at run time:
+
+- **Files.** Android's dialogs return `content://` URIs, not paths. `picked.rs` opens them
+  through tauri-plugin-fs's Rust API (Android only, with no permission granted to the
+  page), and reports are read from and written to the open file. Folders can't be
+  picked.
+- **Token.** Only the keystore (android-native-keyring-store, which needs the NDK context
+  that Tauri 2.12's tao sets up). There is no `GITHUB_TOKEN` or GitHub CLI on a phone; the
+  user creates a token from the pre-filled page and pastes it (`paste_token`).
+- **Scans.** `scan::prepare` with `phone: true` downloads repositories as archives
+  (`github.fetch = "archive"`), two at a time, turns dependency checks off with the reason
+  `scan::PHONE_SCA`, and asks for history whenever secrets are searched, so the report
+  says the archive has no history rather than "disabled". At startup the app points
+  tempfile at its cache folder (Android before 13 has no writable temporary folder),
+  removes download folders a killed scan left there, and limits analysis to four
+  threads. A destroyed activity stops a running scan.
+
 ### Frontend
 
 The frontend is ES modules without a bundler: `app.js` (views and state), `scan.js`
@@ -580,6 +608,14 @@ The frontend is ES modules without a bundler: `app.js` (views and state), `scan.
 `dom.js` (element helpers and icons). A report is prepared once (`report.prepare`):
 each finding gets an id, and counts and failures are worked out. The findings table
 renders 300 rows at a time.
+
+Below 700 px the page switches to its phone layout (`@media (max-width: 699px)`): a
+bottom tab bar, finding cards with a full-screen detail sheet, filters and report actions
+in bottom sheets, per-repository settings cards instead of the grid, and stacked tables.
+Behavior follows `environment().mobile` and `capabilities`, never the user agent.
+`nav.js` makes Android's Back button work: Back in a WebView goes back in history, so
+every sheet, dialog and page pushes a history entry and Back pops it (during a scan it
+asks whether to stop). On the desktop it does nothing.
 
 ### Security model
 

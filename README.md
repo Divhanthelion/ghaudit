@@ -255,6 +255,34 @@ files, the shell or the network. Files and folders are chosen through the system
 dialogs, and links open only to github.com and osv.dev. Like the CLI, the app only
 reads from GitHub.
 
+### On Android phones
+
+The same app runs on Android phones (Android 7 or later), with a phone layout and the
+Back button. A phone has no git and can't run osv-scanner, so there:
+
+- Repositories are downloaded from GitHub as archives and checked file by file against
+  the commit (see [below](#scanning-repositories-you-dont-control)), instead of cloned.
+- Dependency checks and the git history search aren't available. Reports say so ("not
+  available on phones") and never present them as clean; scan from a computer for those.
+- Folders on the phone can't be scanned.
+- GitHub access comes from a token you create on GitHub. "Create a token on GitHub" opens
+  GitHub's page already filled in with read-only permissions; choose "All repositories",
+  generate it, copy it and tap "Paste token". The app reads it from the clipboard,
+  checks it with GitHub, keeps it in the Android Keystore and clears the clipboard; the
+  page never sees it. Backups leave it out, since the key that encrypts it never leaves
+  the phone.
+- Reports open and save through Android's file picker.
+
+To build it and install it on a phone connected over USB with USB debugging on, you need
+Android Studio's SDK with NDK 28 or later, Java 17, the Rust target
+(`rustup target add aarch64-linux-android`) and tauri-cli:
+
+```bash
+cd app
+cargo tauri android build --debug --apk --target aarch64
+adb install -r gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk
+```
+
 ## Scanning repositories you don't control
 
 A cloned repository is treated as untrusted, because its author may have written it to

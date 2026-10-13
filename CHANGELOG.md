@@ -52,6 +52,12 @@ repositories) with 0.3.0.
   kept in the system keychain; osv-scanner is found on `PATH` or where winget installs
   it. See the README. The app is a separate package in a new Cargo workspace; the CLI
   does not depend on it.
+- **The app on Android phones**, with a phone layout and the Back button. Repositories
+  are downloaded as archives (see "Scanning without git"); dependency checks and the
+  history search aren't available there and reports say so. The token is created from
+  GitHub's pre-filled read-only token page, pasted from the clipboard by the app (never
+  through the page) and kept in the Android Keystore. Reports open and save through
+  Android's file picker. CI builds the APK.
 - **Progress events in the library**: `Scanner::with_progress_sink` takes a callback
   that receives a `ghaudit::Progress` for each step of a scan: repositories listed,
   each repository started and finished (findings, duration, error), files discovered,
@@ -83,6 +89,8 @@ repositories) with 0.3.0.
   public.
 - On Windows, git and osv-scanner run without a console window, so a GUI front end
   doesn't flash one per repository.
+- The unused `serde_yaml_ng` dependency is gone, and with it `unsafe-libyaml`, which
+  RustSec now lists as unmaintained (RUSTSEC-2024-0449).
 
 ## 0.3.0
 
