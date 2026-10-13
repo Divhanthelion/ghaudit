@@ -1,6 +1,6 @@
 // The Overview tab: is the scan complete, how bad is it, what kind of problems, where.
 
-import { h, icon, plural, formatDate, formatDuration } from "./dom.js";
+import { h, icon, plural, formatDate, formatDuration, phone, shortRepo, reportOwner } from "./dom.js";
 import { SEVERITIES, CATEGORIES, ANALYZER, analyzerLabel } from "./explain.js";
 import { repositoryRows } from "./report.js";
 
@@ -14,6 +14,19 @@ const CATEGORY_ANALYZERS = {
   settings: ["settings"],
   ai: ["ai"],
 };
+
+/**
+ * Why dependencies weren't checked, when that was not the user's choice (on a phone,
+ * say): a report with no findings must not then look clean. Null if they were checked
+ * or turned off.
+ */
+export function dependenciesNotChecked(raw) {
+  const sca = (raw.analyzers ?? []).find((a) => a.analyzer === "sca");
+  if (!sca || sca.state !== "skipped" || /^disabled/.test(sca.detail ?? "")) return null;
+  const detail = sca.detail ?? "";
+  if (/^not available on phones/i.test(detail)) return "Phones can't run dependency checks. Scan from a computer to check them.";
+  return detail ? `The check didn't run: ${detail}.` : "The check didn't run.";
+}
 
 /**
  * prepared: from report.prepare(); go: { findings(filter), coverage() }
@@ -73,7 +86,23 @@ function statusBanners(prepared, go) {
     );
   }
   const baselined = prepared.raw.stats?.findings_baselined ?? 0;
-  if (total === 0) {
+  const noDependencies = dependenciesNotChecked(prepared.raw);
+  if (total === 0 && !gaps.length && noDependencies) {
+    banners.push(
+      h(
+        "div",
+        { class: "banner", role: "status" },
+        icon("info"),
+        h(
+          "div",
+          { class: "banner-body" },
+          h("h2", {}, "Dependencies weren't checked"),
+          h("p", {}, `The other checks found nothing${baselined ? " new" : ""}, but known vulnerabilities in packages weren't looked for.`),
+          h("p", {}, noDependencies),
+        ),
+      ),
+    );
+  } else if (total === 0) {
     banners.push(
       h(
         "div",
@@ -114,6 +143,7 @@ function statusBanners(prepared, go) {
               : `Start with the ${plural(prepared.bySeverity[worst.id], `${worst.label.toLowerCase()} one`, `${worst.label.toLowerCase()} ones`)}: ${worst.advice.toLowerCase()}.`,
           ),
           baselined ? h("p", { class: "note" }, `${plural(baselined, "problem")} from the earlier report ${baselined === 1 ? "is" : "are"} hidden.`) : null,
+          noDependencies ? h("p", { class: "note" }, `Dependencies weren't checked. ${noDependencies}`) : null,
         ),
       ),
     );
@@ -163,6 +193,7 @@ function categorySection(prepared, go) {
       else note = "None found";
     }
     const fill = h("div", { class: "bar-track", "aria-hidden": "true" });
+    const breakdown = [];
     if (n) {
       for (const s of SEVERITIES) {
         const count = prepared.findings.filter((f) => f.category === c.id && f.severity === s.id).length;
@@ -170,6 +201,7 @@ function categorySection(prepared, go) {
         const seg = h("div", { class: `bar-fill sev-${s.id}`, title: `${count} ${s.label}` });
         seg.style.width = `${(count / max) * 100}%`;
         fill.append(seg);
+        breakdown.push(`${count.toLocaleString()} ${s.label.toLowerCase()}`);
       }
     }
     return h(
@@ -178,6 +210,8 @@ function categorySection(prepared, go) {
       h("span", { class: "name" }, c.label, h("span", { class: "desc" }, c.text)),
       fill,
       h("span", { class: "num" }, n ? n.toLocaleString() : h("span", { class: "muted" }, note)),
+      // Touch screens never show the segments' titles: the counts as text instead.
+      breakdown.length ? h("span", { class: "breakdown phone-only" }, breakdown.join(" · ")) : null,
     );
   });
   return h(
@@ -201,6 +235,7 @@ function sevCounts(bySeverity) {
 function repositorySection(prepared, go) {
   const rows = repositoryRows(prepared);
   const clean = rows.filter((r) => !r.error && Object.keys(r.bySeverity).length === 0).length;
+  const list = phone.matches ? repositoryList(rows, prepared, go) : repositoryTable(rows, go);
   return h(
     "section",
     { class: "section", "aria-labelledby": "repo-head" },
@@ -210,43 +245,77 @@ function repositorySection(prepared, go) {
       h("h2", { id: "repo-head" }, "Repositories"),
       h("p", {}, `${plural(rows.length, "repository", "repositories")} scanned, worst first. ${clean ? `${clean.toLocaleString()} with nothing found.` : ""}`),
     ),
+    list,
+  );
+}
+
+/** Phones: a list of buttons, the owner left out of names where it repeats. */
+function repositoryList(rows, prepared, go) {
+  const owner = reportOwner(prepared.raw.target);
+  return h(
+    "ul",
+    { class: "card repo-list" },
+    rows.map((r) => {
+      const total = Object.values(r.bySeverity).reduce((a, b) => a + b, 0);
+      const status = r.error
+        ? h("span", { class: "state failed" }, icon("xCircle"), "Couldn't be scanned")
+        : total
+          ? sevCounts(r.bySeverity)
+          : h("span", { class: "state ok" }, icon("checkCircle"), "Nothing found");
+      const content = [
+        h("span", { class: "repo-name" }, shortRepo(r.name, owner)),
+        h("span", { class: "repo-total" }, r.error ? "" : total.toLocaleString()),
+        h("span", { class: "repo-status" }, status),
+      ];
+      const action = total ? () => go.findings({ repository: r.name }) : r.error ? () => go.coverage() : null;
+      return h(
+        "li",
+        {},
+        action
+          ? h("button", { type: "button", class: "repo-item", onclick: action }, content, icon("chevronRight", "chev"))
+          : h("div", { class: "repo-item" }, content),
+      );
+    }),
+  );
+}
+
+function repositoryTable(rows, go) {
+  return h(
+    "div",
+    { class: "card table-wrap" },
     h(
-      "div",
-      { class: "card table-wrap" },
+      "table",
+      { class: "data" },
+      h("thead", {}, h("tr", {}, h("th", {}, "Repository"), h("th", {}, "Problems"), h("th", { class: "num" }, "Total"))),
       h(
-        "table",
-        { class: "data" },
-        h("thead", {}, h("tr", {}, h("th", {}, "Repository"), h("th", {}, "Problems"), h("th", { class: "num" }, "Total"))),
-        h(
-          "tbody",
-          {},
-          rows.map((r) => {
-            const total = Object.values(r.bySeverity).reduce((a, b) => a + b, 0);
-            const open = () => go.findings({ repository: r.name });
-            return h(
-              "tr",
-              {
-                class: r.error || total ? "clickable" : null,
-                tabindex: r.error || total ? 0 : null,
-                onclick: total ? open : r.error ? () => go.coverage() : null,
-                onkeydown: (e) => {
-                  if (e.key === "Enter" && (total || r.error)) (total ? open : go.coverage)();
-                },
+        "tbody",
+        {},
+        rows.map((r) => {
+          const total = Object.values(r.bySeverity).reduce((a, b) => a + b, 0);
+          const open = () => go.findings({ repository: r.name });
+          return h(
+            "tr",
+            {
+              class: r.error || total ? "clickable" : null,
+              tabindex: r.error || total ? 0 : null,
+              onclick: total ? open : r.error ? () => go.coverage() : null,
+              onkeydown: (e) => {
+                if (e.key === "Enter" && (total || r.error)) (total ? open : go.coverage)();
               },
-              h("td", {}, h("span", { class: "f-repo" }, r.name)),
-              h(
-                "td",
-                {},
-                r.error
-                  ? h("span", { class: "state failed" }, icon("xCircle"), "Couldn't be scanned")
-                  : total
-                    ? sevCounts(r.bySeverity)
-                    : h("span", { class: "state ok" }, icon("checkCircle"), "Nothing found"),
-              ),
-              h("td", { class: "num" }, r.error ? "—" : total.toLocaleString()),
-            );
-          }),
-        ),
+            },
+            h("td", {}, h("span", { class: "f-repo" }, r.name)),
+            h(
+              "td",
+              {},
+              r.error
+                ? h("span", { class: "state failed" }, icon("xCircle"), "Couldn't be scanned")
+                : total
+                  ? sevCounts(r.bySeverity)
+                  : h("span", { class: "state ok" }, icon("checkCircle"), "Nothing found"),
+            ),
+            h("td", { class: "num" }, r.error ? "—" : total.toLocaleString()),
+          );
+        }),
       ),
     ),
   );
@@ -261,7 +330,7 @@ function factsSection(prepared) {
     prepared.multi ? ["Repositories", prepared.repositories.length.toLocaleString()] : null,
     ["Files checked", (s.files_scanned ?? 0).toLocaleString()],
     ["Lines of code", (s.lines_scanned ?? 0).toLocaleString()],
-    ["Dependencies checked", (s.dependencies_scanned ?? 0).toLocaleString()],
+    ["Dependencies checked", dependenciesNotChecked(r) ? "Not checked" : (s.dependencies_scanned ?? 0).toLocaleString()],
     s.files_skipped ? ["Files not fully checked", `${s.files_skipped.toLocaleString()} (see Coverage)`] : null,
     s.findings_suppressed ? ["Silenced in the code", `${s.findings_suppressed.toLocaleString()} (ghaudit:ignore comments)`] : null,
     r.commit ? ["Commit", r.commit.slice(0, 12)] : null,
