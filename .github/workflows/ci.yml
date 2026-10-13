@@ -90,6 +90,36 @@ jobs:
       - run: cargo test -p ghaudit-desktop --locked
       - run: cargo build -p ghaudit-desktop --locked
 
+  android:
+    name: Android app
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: 17
+      # The runner image has the Android SDK; add the NDK the app is built with. NDK 28
+      # and later align native code for Android 15's 16 KB pages, which Play requires.
+      - name: Android NDK
+        run: |
+          printf 'y\n%.0s' $(seq 10) | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;30.0.16248370" > /dev/null
+          echo "NDK_HOME=$ANDROID_HOME/ndk/30.0.16248370" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
+        with:
+          toolchain: stable
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # A prebuilt Tauri CLI; the Android project calls back into it during the build.
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: tauri-cli@2
+      - name: Debug APK
+        working-directory: app
+        run: cargo tauri android build --debug --apk --target aarch64 --ci
+
   integration:
     name: osv-scanner integration and self-scan
     runs-on: ubuntu-latest
