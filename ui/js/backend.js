@@ -25,13 +25,24 @@ export const openLink = (url) => invoke("open_link", { url });
 
 /**
  * What scans can use: { github: {source, login}, keychain: {available, saved},
- * github_cli, osv_scanner: {path, version} | null, git: {...} | null }.
- * Never the token itself.
+ * github_cli, osv_scanner: {path, version} | null, git: {...} | null, platform,
+ * mobile, capabilities: {folders, history, dependencies, download, paste_token} }.
+ * Never the token itself. Read the capabilities through scan.js's capabilities().
  */
 export const environment = () => invoke("environment");
 
 /** Check a token with GitHub and keep it in the system keychain. Resolves to its login. */
 export const saveToken = (token) => invoke("save_token", { token });
+
+/** Open GitHub's page for a new read-only fine-grained token, filled in, in the browser. */
+export const openTokenPage = () => invoke("open_token_page");
+
+/**
+ * Phones: the backend reads a token from the clipboard, checks it with GitHub, keeps it
+ * in the phone's keystore and clears the clipboard. The token never reaches the page.
+ * Resolves to its login.
+ */
+export const pasteToken = () => invoke("paste_token");
 
 /** Remove the token saved in the system keychain. */
 export const forgetToken = () => invoke("forget_token");
